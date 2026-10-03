@@ -271,6 +271,22 @@ func (handler *Handler) fetchModelDiscovery(
 			endpointID: candidate.Service.ID,
 		}}
 	}
+	// A provider that only answers a recognized client rejects the model listing
+	// too, so discovery carries the same compatibility configuration inference
+	// does. A configuration failure excludes this service from the aggregate
+	// rather than listing it through an identity the operator did not pin.
+	if _, _, rulesErr := handler.applyDiscoveryRequestRules(
+		proxyContext, candidate.Service, authorizationEndpoint.Auth, &headers,
+	); rulesErr != nil {
+		if request.Context().Err() != nil {
+			return discoveryResult{outcome: discoveryOutcomeAborted}
+		}
+		return discoveryResult{outcome: discoveryOutcomeExcluded, failure: executionFailure{
+			kind:       executionFailureConfiguration,
+			err:        rulesErr,
+			endpointID: candidate.Service.ID,
+		}}
+	}
 	baseURL, parseErr := url.Parse(candidate.BaseURL)
 	if parseErr != nil {
 		return discoveryResult{outcome: discoveryOutcomeExcluded, failure: executionFailure{

@@ -3,7 +3,6 @@ package ingress
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -229,9 +228,10 @@ func websocketSkip(candidate endpoint.Resolved, routingModel string) contract.Ro
 	return contract.RoutingSkipWebSocketUnsupported
 }
 func (turn *responsesWSTurn) forward(writer http.ResponseWriter, request *http.Request, target transport.Target, candidate endpoint.Resolved, upstreamModel string) error {
-	// Hash credentials instead of retaining their plaintext as connection identity.
-	headers, _ := json.Marshal(target.RequestHeaders)
-	binding := fmt.Sprintf("%s/%s/%s/%x", candidate.CanonicalService().ID, upstreamModel, target.BaseURL, sha256.Sum256(headers))
+	// Routing identity only. The header half of the binding is added by the
+	// socket itself, which is the only place that knows which headers survive
+	// normalization and actually reach the handshake.
+	binding := fmt.Sprintf("%s/%s/%s", candidate.CanonicalService().ID, upstreamModel, target.BaseURL)
 	err := turn.session.upstream.Forward(writer, request, target, binding, turn.controls)
 	if turn.session.upstream.Connected() {
 		turn.session.serviceID = candidate.CanonicalService().ID

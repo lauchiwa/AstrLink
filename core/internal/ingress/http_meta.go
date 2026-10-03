@@ -152,6 +152,13 @@ func redactURL(requestURL *url.URL) string {
 // Order within a name is preserved; names are emitted in the http.Header
 // canonical form sorted by name for deterministic output.
 func redactHeaders(headers http.Header) []contract.AuditHeader {
+	return redactHeadersProtecting(headers, nil)
+}
+
+// redactHeadersProtecting also masks every name in protected (lowercase). Those
+// values come from operator-only configuration, so they get the same fixed
+// marker as the service document: no length or scheme hint.
+func redactHeadersProtecting(headers http.Header, protected map[string]struct{}) []contract.AuditHeader {
 	if len(headers) == 0 {
 		return []contract.AuditHeader{}
 	}
@@ -164,6 +171,7 @@ func redactHeaders(headers http.Header) []contract.AuditHeader {
 	total := 0
 	omitted := 0
 	for _, name := range names {
+		_, configured := protected[strings.ToLower(name)]
 		sensitive := headerNameSensitive(name)
 		for _, value := range headers[name] {
 			if total >= maxCapturedHeaders {
@@ -171,7 +179,10 @@ func redactHeaders(headers http.Header) []contract.AuditHeader {
 				continue
 			}
 			entry := contract.AuditHeader{Name: strings.ToLower(name)}
-			if sensitive {
+			if configured {
+				entry.Value = contract.RedactedConfiguredValue
+				entry.Redacted = true
+			} else if sensitive {
 				entry.Value = maskHeaderValue(value)
 				entry.Redacted = true
 			} else {
@@ -215,6 +226,10 @@ func RedactRequestMeta(request *http.Request) contract.AuditHTTPMeta {
 // transport has constructed the normalized upstream request. The URL is path
 // and query only — scheme and host are never persisted.
 func RedactUpstreamRequestMeta(request *http.Request) contract.AuditHTTPMeta {
+	return redactUpstreamRequestMeta(request, nil)
+}
+
+func redactUpstreamRequestMeta(request *http.Request, protected map[string]struct{}) contract.AuditHTTPMeta {
 	meta := contract.AuditHTTPMeta{
 		RequestHeaders:  []contract.AuditHeader{},
 		ResponseHeaders: []contract.AuditHeader{},
@@ -225,7 +240,7 @@ func RedactUpstreamRequestMeta(request *http.Request) contract.AuditHTTPMeta {
 	meta.Method = request.Method
 	meta.URL = redactUpstreamURL(request.URL)
 	meta.HTTPVersion = request.Proto
-	meta.RequestHeaders = redactHeaders(request.Header)
+	meta.RequestHeaders = redactHeadersProtecting(request.Header, protected)
 	return meta
 }
 

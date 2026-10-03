@@ -155,6 +155,9 @@ func (handler *Handler) executeCandidatesWithTest(
 	protection := handler.subscriptionProtection(request.Context())
 	// Each official client identity is learned at most once per request.
 	learnedClaude, learnedCodex, learnedGrok := false, false, false
+	// One logical request publishes at most one identity candidate, so retries
+	// and provider switches cannot sample the same client repeatedly.
+	observedIdentity := false
 	repairedTargets := map[string][]byte{}
 	var last executionFailure
 	var lastNetworkFailure executionFailure
@@ -466,6 +469,33 @@ func (handler *Handler) executeCandidatesWithTest(
 		if test != nil && test.observer.Authorization != nil {
 			test.observer.Authorization(headers.Clone())
 		}
+		// Compatibility configuration is selected against the model actually sent
+		// upstream and against the auth effective for this protocol, then applied
+		// on top of the authorizer's overlay. The engine re-checks ownership, so a
+		// stored rule can never reach a credential, framing or session header.
+		// A failure here is a configuration error for this candidate alone: it must
+		// not silently forward the request without the configured identity.
+		rewriteDecision, protectedHeaders, rewriteErr := handler.applyRequestRules(
+			proxyContext, candidate.Service, authorizationEndpoint.Auth, upstreamModel, &headers,
+		)
+		if rewriteErr != nil {
+			finishPrivacy()
+			_ = attemptRequest.Body.Close()
+			if request.Context().Err() != nil {
+				return
+			}
+			last = executionFailure{
+				kind:       executionFailureConfiguration,
+				err:        rewriteErr,
+				endpointID: candidate.Service.ID,
+			}
+			records.noteCandidateRejected(last.endpointID, last.code())
+			if !body.Replayable() {
+				break
+			}
+			continue
+		}
+		recordSessionFromContext(request.Context()).noteRequestRules(rewriteDecision, protectedHeaders)
 		baseURL, parseErr := url.Parse(candidate.BaseURL)
 		if parseErr != nil {
 			finishPrivacy()
@@ -608,6 +638,21 @@ func (handler *Handler) executeCandidatesWithTest(
 				)
 				recordSession.noteConversionDiagnostics(contract.ConversionDiagnosticPhaseRequest, conversion.Diagnostics)
 				recordSession.observeOutboundCapture(outbound)
+			}
+			// Capture reads the ORIGINAL inbound request, not this outbound one:
+			// the snapshot must describe the client, never the gateway's own
+			// rewrite, credentials, or provider normalization. It runs here so a
+			// candidate only appears for a provider the request actually reached.
+			if !observedIdentity && candidate.Service.Kind.IsHTTP() {
+				if _, armed := handler.identityCapture.Armed(candidate.Service.ID); armed {
+					observedIdentity = true
+					handler.captureIdentityCandidate(
+						request.Context(),
+						candidate.Service.ID,
+						request.Header,
+						body.originalBody(identityCaptureBodyLimit),
+					)
+				}
 			}
 			if test != nil && test.observer.Outbound != nil {
 				test.observer.Outbound()
@@ -1161,6 +1206,26 @@ func captureRequestBody(request *http.Request, forceBuffer bool) (*requestBodySo
 
 func (source *requestBodySource) Replayable() bool {
 	return source != nil && source.replayable
+}
+
+// originalBody returns a bounded copy of the inbound bytes, before privacy
+// redaction or any provider rewrite. It is only for reading an inbound signal
+// such as identity recognition; a non-replayable body has no original copy and
+// must not be consumed here.
+func (source *requestBodySource) originalBody(limit int64) []byte {
+	if source == nil || !source.replayable || source.factory == nil {
+		return nil
+	}
+	body, err := source.factory()
+	if err != nil {
+		return nil
+	}
+	defer body.Close()
+	raw, err := io.ReadAll(io.LimitReader(body, limit+1))
+	if err != nil || int64(len(raw)) > limit {
+		return nil
+	}
+	return raw
 }
 
 func (source *requestBodySource) Next(ctx context.Context) (*http.Request, bool, error) {

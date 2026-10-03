@@ -55,6 +55,30 @@ func (handler *Handler) learnClientIdentity(ctx context.Context, provider contra
 	}
 }
 
+// identityCaptureBodyLimit bounds the body read used only for the Claude
+// recognition check. It matches accountauth's own recognition bound, and an
+// oversized body simply fails recognition instead of being partially scanned.
+const identityCaptureBodyLimit = 1 << 20
+
+// captureIdentityCandidate publishes an unconfirmed candidate for a service
+// whose capture window an operator explicitly armed. Capture never changes what
+// is forwarded and never fails the request: a storage failure is only logged.
+// The candidate still requires operator confirmation before any use.
+func (handler *Handler) captureIdentityCandidate(
+	ctx context.Context,
+	serviceID contract.ServiceID,
+	original http.Header,
+	body []byte,
+) {
+	if _, published, err := handler.identityCapture.Observe(ctx, serviceID, original, body); err != nil && !published {
+		logf := handler.recordLogger
+		if logf == nil {
+			logf = log.Printf
+		}
+		logf("identity candidate for service %s was not saved: %v", serviceID, err)
+	}
+}
+
 // subscriptionProtection reuses the settings the request already read. A
 // store without routing settings, or a failed read, keeps every protection
 // on: turning one off is always an explicit choice.

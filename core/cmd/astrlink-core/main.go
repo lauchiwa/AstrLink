@@ -25,6 +25,7 @@ import (
 	"github.com/QuantumNous/astrlink/core/internal/controlapi"
 	"github.com/QuantumNous/astrlink/core/internal/coreapp"
 	"github.com/QuantumNous/astrlink/core/internal/endpoint"
+	"github.com/QuantumNous/astrlink/core/internal/identitycapture"
 	"github.com/QuantumNous/astrlink/core/internal/ingress"
 	"github.com/QuantumNous/astrlink/core/internal/localkey"
 	"github.com/QuantumNous/astrlink/core/internal/networkproxy"
@@ -226,6 +227,14 @@ func main() {
 		if err := identities.Hydrate(ctx); err != nil {
 			logger.Printf("load learned client identities: %v", err)
 		}
+		// Capture windows are explicitly armed per service and deliberately kept
+		// in memory, so consent never survives a restart.
+		identityCapture, err := identitycapture.New(store)
+		if err != nil {
+			_ = store.Close()
+			logger.Printf("configure identity capture: %v", err)
+			os.Exit(1)
+		}
 		subscriptionManager, err := newSubscriptionManager(ctx, store, identities, logger.Printf)
 		if err != nil {
 			_ = store.Close()
@@ -295,6 +304,8 @@ func main() {
 			ResponseStartTimeout:     time.Duration(responseStartTimeoutSeconds) * time.Second,
 			SubscriptionRisk:         subscriptionRiskReporter{manager: subscriptionManager},
 			Identities:               identities,
+			IdentityCapture:          identityCapture,
+			IdentityProfiles:         store,
 		}
 		handler, err := controlapi.NewWithDependencies(config.Version, controlapi.Dependencies{
 			ServiceStore: store,
@@ -311,9 +322,12 @@ func main() {
 			RawVault:           rawVault,
 			LocalData:          store,
 			ClientIdentities:   identities,
+			IdentityCapture:    identityCapture,
 			Subscriptions:      subscriptionManager,
 			CodingPlans:        codingplan.New(store, nil),
-			ServiceModels:      servicemodel.New(store, subscriptionManager, nil),
+			ServiceModels: servicemodel.NewWithDependencies(servicemodel.Dependencies{
+				Secrets: store, Subscriptions: subscriptionManager, IdentityProfiles: store,
+			}),
 			ServiceTester:      servicetest.NewWithDependencies(gatewayDependencies, subscriptionManager.APIBaseURLFor),
 			BuiltinToolTester:  ingress.NewWithDependencies(gatewayDependencies),
 			ControlToken:       controlToken,

@@ -216,6 +216,10 @@ type recordSession struct {
 	upstreamHTTPMetaEnabled  bool
 	upstreamHTTPMetaCaptured bool
 	upstreamHTTPMeta         contract.AuditHTTPMeta
+	// protectedUpstreamHeaders holds the lowercase names request rules or an
+	// identity profile injected for the current attempt. Upstream metadata is
+	// stored shareable, so their values are masked at capture time.
+	protectedUpstreamHeaders map[string]struct{}
 	settings                 contract.AuditSettings
 	sessionID                contract.SessionID
 	previousResponseID       string
@@ -805,7 +809,7 @@ func (session *recordSession) observeOutboundCapture(outbound *http.Request) {
 		return
 	}
 	if session.upstreamHTTPMetaEnabled {
-		session.upstreamHTTPMeta = RedactUpstreamRequestMeta(outbound)
+		session.upstreamHTTPMeta = redactUpstreamRequestMeta(outbound, session.protectedUpstreamHeaders)
 		session.upstreamHTTPMetaCaptured = true
 	}
 	if !session.upstreamRequestCapture.enabled {

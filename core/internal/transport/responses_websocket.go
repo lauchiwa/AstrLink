@@ -3,10 +3,13 @@ package transport
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -53,6 +56,31 @@ func (socket *ResponsesSocket) write(conn *websocket.Conn, data []byte) error {
 	return conn.WriteMessage(websocket.TextMessage, data)
 }
 
+// handshakeDigest fingerprints the headers a turn would hand to the WebSocket
+// handshake. It hashes rather than retains them, because the effective set
+// includes the upstream credential.
+//
+// Names are canonicalized and sorted, and values keep their order within a
+// name, so two turns that would dial identically produce one digest regardless
+// of map iteration order. Lengths are encoded so no pair of adjacent fields can
+// be rearranged into the same byte stream.
+func handshakeDigest(header http.Header) string {
+	names := make([]string, 0, len(header))
+	for name := range header {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	digest := sha256.New()
+	for _, name := range names {
+		canonical := http.CanonicalHeaderKey(name)
+		fmt.Fprintf(digest, "%d:%s", len(canonical), canonical)
+		for _, value := range header[name] {
+			fmt.Fprintf(digest, "%d:%s", len(value), value)
+		}
+	}
+	return fmt.Sprintf("%x", digest.Sum(nil))
+}
+
 // Forward emits exactly one response.create. Once sent, failures are response
 // errors and must never replay the turn on another channel or connection.
 func (socket *ResponsesSocket) Forward(writer http.ResponseWriter, request *http.Request, target Target, binding string, controls <-chan []byte) error {
@@ -80,7 +108,27 @@ func (socket *ResponsesSocket) Forward(writer http.ResponseWriter, request *http
 	for _, name := range []string{"Content-Type", "Content-Length", "Accept-Encoding", "Accept"} {
 		outbound.Header.Del(name)
 	}
+	// The channel identity covers the headers this turn would actually hand to
+	// the handshake, computed after every removal above. Digesting the caller's
+	// prepared configuration instead would be wrong in both directions: a value
+	// stripped before dialing would force a pointless reconnect, and a value the
+	// caller never prepared but the request carries would reuse a channel it does
+	// not belong to.
+	binding += ":" + handshakeDigest(outbound.Header)
+	socket.mu.Lock()
+	conn, closed, previousBinding := socket.conn, socket.closed, socket.binding
+	socket.mu.Unlock()
+	// Admission is decided before the turn is reported as dispatched. A refused
+	// turn never reaches this provider, so observing it would open an attempt
+	// record and arm identity capture for a request that was never sent.
+	if closed {
+		return NewResponseError(errors.New("upstream WebSocket is closed"))
+	}
+	if conn != nil && previousBinding != binding {
+		return NewResponseError(errors.New("upstream WebSocket binding changed; reconnect to use a different channel or credential"))
+	}
 	if target.ObserveOutbound != nil {
+		// Runs before the body is read so an observer can tee it.
 		target.ObserveOutbound(outbound)
 	}
 	body, err := io.ReadAll(outbound.Body)
@@ -98,15 +146,6 @@ func (socket *ResponsesSocket) Forward(writer http.ResponseWriter, request *http
 	payload, err := json.Marshal(event)
 	if err != nil {
 		return &TargetError{err: err}
-	}
-	socket.mu.Lock()
-	conn, closed, previousBinding := socket.conn, socket.closed, socket.binding
-	socket.mu.Unlock()
-	if closed {
-		return NewResponseError(errors.New("upstream WebSocket is closed"))
-	}
-	if conn != nil && previousBinding != binding {
-		return NewResponseError(errors.New("upstream WebSocket binding changed; reconnect to use a different channel or credential"))
 	}
 	if conn == nil {
 		dialer := *websocket.DefaultDialer

@@ -28,6 +28,7 @@ import (
 	"github.com/QuantumNous/astrlink/core/internal/autotext"
 	"github.com/QuantumNous/astrlink/core/internal/builtintools"
 	"github.com/QuantumNous/astrlink/core/internal/endpoint"
+	"github.com/QuantumNous/astrlink/core/internal/identitycapture"
 	"github.com/QuantumNous/astrlink/core/internal/planner"
 	"github.com/QuantumNous/astrlink/core/internal/privacy"
 	"github.com/QuantumNous/astrlink/core/internal/relaykitbridge"
@@ -85,6 +86,14 @@ type Dependencies struct {
 	// Identities is optional. It learns the client identity of recognized
 	// official Claude Code and Codex requests; nil learns nothing.
 	Identities *accountauth.IdentityRegistry
+	// IdentityCapture is optional. It publishes an unconfirmed identity
+	// candidate from a request an operator explicitly armed a window for.
+	// Nil captures nothing, and an unarmed service costs one map lookup.
+	IdentityCapture *identitycapture.Registry
+	// IdentityProfiles is optional. It reads the confirmed snapshots a service
+	// binds for outbound compatibility. Nil means a service that configured a
+	// profile fails its attempt rather than silently forwarding without it.
+	IdentityProfiles IdentityProfileReader
 }
 
 type Classifier interface {
@@ -133,6 +142,8 @@ type Handler struct {
 	classifier               Classifier
 	subscriptionRisk         SubscriptionRiskReporter
 	identities               *accountauth.IdentityRegistry
+	identityCapture          *identitycapture.Registry
+	identityProfiles         IdentityProfileReader
 	sessionFingerprints      sessionFingerprints
 }
 
@@ -246,6 +257,8 @@ func NewWithDependencies(dependencies Dependencies) *Handler {
 		classifier:            dependencies.Classifier,
 		subscriptionRisk:      dependencies.SubscriptionRisk,
 		identities:            dependencies.Identities,
+		identityCapture:       dependencies.IdentityCapture,
+		identityProfiles:      dependencies.IdentityProfiles,
 	}
 }
 
