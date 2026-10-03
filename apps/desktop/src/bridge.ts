@@ -1,4 +1,11 @@
 import {
+  parseIdentityCapture,
+  parseIdentityProfilePage,
+  parseIdentityProfileRecord,
+  type IdentityClient,
+  type IdentityProfileRecord,
+} from "./request-compatibility-model";
+import {
   parseServiceTestResult,
   type ServiceTestInput,
   type ServiceTestResult,
@@ -345,6 +352,117 @@ export async function updateService(
   requireNativeBridge();
   return parseServiceRecord(
     await invoke<unknown>("update_service", { serviceId, etag, patch }),
+  );
+}
+
+export async function listIdentityProfiles(serviceId: string, cursor?: string) {
+  requireNativeBridge();
+  return parseIdentityProfilePage(
+    await invoke("service_identity", {
+      serviceId,
+      input: { operation: "list", ...(cursor ? { cursor } : {}) },
+    }),
+    serviceId,
+  );
+}
+export async function getIdentityProfile(serviceId: string, profileId: string) {
+  requireNativeBridge();
+  const record = parseIdentityProfileRecord(
+    await invoke("service_identity", {
+      serviceId,
+      input: { operation: "get", profile_id: profileId },
+    }),
+    serviceId,
+  );
+  if (record.profile.id !== profileId)
+    throw new Error("Identity profile ID mismatch");
+  return record;
+}
+export async function createIdentityProfile(
+  serviceId: string,
+  client: IdentityClient,
+  source: "builtin" | "subscription_import",
+) {
+  requireNativeBridge();
+  return parseIdentityProfileRecord(
+    await invoke("service_identity", {
+      serviceId,
+      input: { operation: "create", client, source },
+    }),
+    serviceId,
+  );
+}
+export async function confirmIdentityProfile(
+  serviceId: string,
+  record: IdentityProfileRecord,
+) {
+  requireNativeBridge();
+  const confirmed = parseIdentityProfileRecord(
+    await invoke("service_identity", {
+      serviceId,
+      input: {
+        operation: "confirm",
+        profile_id: record.profile.id,
+        etag: record.etag,
+      },
+    }),
+    serviceId,
+  );
+  if (
+    confirmed.profile.id !== record.profile.id ||
+    !confirmed.profile.confirmed_at
+  ) {
+    throw new Error(
+      "Identity confirmation did not confirm the reviewed profile",
+    );
+  }
+  return confirmed;
+}
+export async function discardIdentityProfile(
+  serviceId: string,
+  record: IdentityProfileRecord,
+): Promise<void> {
+  requireNativeBridge();
+  await invoke("service_identity", {
+    serviceId,
+    input: {
+      operation: "discard",
+      profile_id: record.profile.id,
+      etag: record.etag,
+    },
+  });
+}
+export async function getIdentityCapture(serviceId: string) {
+  requireNativeBridge();
+  return parseIdentityCapture(
+    await invoke("service_identity", {
+      serviceId,
+      input: { operation: "status" },
+    }),
+    serviceId,
+  );
+}
+export async function armIdentityCapture(
+  serviceId: string,
+  client: IdentityClient,
+) {
+  requireNativeBridge();
+  return parseIdentityCapture(
+    await invoke("service_identity", {
+      serviceId,
+      input: { operation: "arm", client },
+    }),
+    serviceId,
+  );
+}
+export async function disarmIdentityCapture(serviceId: string) {
+  requireNativeBridge();
+  return parseIdentityCapture(
+    await invoke("service_identity", {
+      serviceId,
+      input: { operation: "disarm" },
+    }),
+    serviceId,
   );
 }
 

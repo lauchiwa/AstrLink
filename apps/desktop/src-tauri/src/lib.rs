@@ -19,6 +19,7 @@ mod raw_access;
 mod raw_approval;
 mod raw_key_pin;
 mod recovery_path;
+mod service_identity;
 mod service_proxy;
 mod sidecar;
 mod startup_window;
@@ -971,6 +972,15 @@ async fn delete_service(
 }
 
 #[tauri::command]
+async fn service_identity(
+    service_id: String,
+    input: service_identity::IdentityOperation,
+    manager: State<'_, Arc<CoreManager>>,
+) -> Result<serde_json::Value, String> {
+    manager.service_identity(&service_id, input).await
+}
+
+#[tauri::command]
 async fn pricing(
     operation: String,
     service_id: Option<String>,
@@ -1907,6 +1917,7 @@ pub fn run() {
             delete_service,
             get_service_usage,
             get_service_reset_credits,
+            service_identity,
             pricing,
             reset_service_usage,
             test_service,

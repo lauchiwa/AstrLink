@@ -5,6 +5,14 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const bridgeMocks = vi.hoisted(() => ({
+  listIdentityProfiles: vi
+    .fn()
+    .mockResolvedValue({ items: [], next_cursor: null }),
+  getIdentityCapture: vi.fn().mockResolvedValue({
+    service_id: "service_gateway",
+    armed: false,
+    rejected: 0,
+  }),
   beginServiceAuthorization: vi.fn(),
   cancelServiceAuthorization: vi.fn(),
   clearServiceRisk: vi.fn(),
@@ -673,7 +681,7 @@ describe("ServiceManager", () => {
   });
 
   async function openEditorTab(
-    tab: "connection" | "models" | "protocols" | "failure",
+    tab: "connection" | "models" | "protocols" | "compatibility" | "failure",
   ): Promise<void> {
     const trigger = container.querySelector<HTMLButtonElement>(
       `[data-testid="service-editor-tab-${tab}"]`,
@@ -4446,6 +4454,110 @@ describe("ServiceManager", () => {
       container.querySelector('[data-testid="service-editor-tab-panel"]')
         ?.className,
     ).toContain("overflow-y-auto");
+  });
+
+  it("preserves compatibility across tabs, validates hidden JSON and sends the same draft to model discovery and save", async () => {
+    const listed: Service = {
+      ...gatewayService,
+      http: {
+        ...gatewayService.http!,
+        extra_headers: { "X-Relay-Client": "fake-default" },
+        identity_profile_id: "identity_saved",
+        model_rules: [
+          { match: "gpt-5", headers: { originator: "codex_exec" }, body: {} },
+        ],
+      },
+    };
+    bridgeMocks.getService.mockResolvedValue({ service: listed, etag });
+    bridgeMocks.updateService.mockResolvedValue({ service: listed, etag });
+    bridgeMocks.probeDraftServiceModels.mockResolvedValue({
+      protocol: "openai.models",
+      model_ids: [],
+    });
+    const dirty = vi.fn();
+    await act(async () =>
+      root.render(
+        <ServiceManager
+          catalogError={null}
+          catalogStatus="ready"
+          isReady
+          services={[listed]}
+          protocols={[]}
+          view={{ kind: "edit", serviceId: listed.id }}
+          onDirtyChange={dirty}
+          onRefresh={() => {}}
+          onServiceRemoved={() => {}}
+          onServiceSaved={() => {}}
+          onViewChange={() => {}}
+        />,
+      ),
+    );
+    await openEditorTab("compatibility");
+    const updateJSON = async (value: string) => {
+      const input = container.querySelector<HTMLTextAreaElement>(
+        'textarea[aria-label="模型规则 JSON"]',
+      )!;
+      await act(async () => {
+        Object.getOwnPropertyDescriptor(
+          HTMLTextAreaElement.prototype,
+          "value",
+        )!.set!.call(input, value);
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+    };
+    expect(
+      container.querySelector<HTMLTextAreaElement>("textarea")!.value,
+    ).toContain("codex_exec");
+    await updateJSON("[");
+    expect(dirty).toHaveBeenLastCalledWith(true);
+    await openEditorTab("connection");
+    await act(async () =>
+      container
+        .querySelector("form")!
+        .dispatchEvent(
+          new Event("submit", { bubbles: true, cancelable: true }),
+        ),
+    );
+    expect(bridgeMocks.updateService).not.toHaveBeenCalled();
+    expect(container.textContent).toContain("http.model_rules JSON");
+    await openEditorTab("compatibility");
+    expect(
+      container.querySelector<HTMLTextAreaElement>("textarea")!.value,
+    ).toBe("[");
+    await updateJSON("[]");
+    await openEditorTab("models");
+    const fetch = [...container.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes("获取模型"),
+    )!;
+    await act(async () => fetch.click());
+    expect(bridgeMocks.probeDraftServiceModels).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        http: expect.objectContaining({
+          extra_headers: { "X-Relay-Client": "fake-default" },
+          identity_profile_id: "identity_saved",
+          model_rules: [],
+        }),
+      }),
+    );
+    // Saving validates even when the JSON editor is unmounted.
+    await act(async () =>
+      container
+        .querySelector("form")!
+        .dispatchEvent(
+          new Event("submit", { bubbles: true, cancelable: true }),
+        ),
+    );
+    expect(bridgeMocks.updateService).toHaveBeenCalledWith(
+      listed.id,
+      etag,
+      expect.objectContaining({
+        http: expect.objectContaining({
+          extra_headers: { "X-Relay-Client": "fake-default" },
+          identity_profile_id: "identity_saved",
+          model_rules: [],
+        }),
+      }),
+    );
   });
 
   it("limits Codex subscription conversions to Responses egress", async () => {

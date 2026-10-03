@@ -1,3 +1,9 @@
+import { ServiceRequestCompatibility } from "./ServiceRequestCompatibility";
+import {
+  compatibilityDraft,
+  compatibilityInput,
+  type CompatibilityDraft,
+} from "./request-compatibility-model";
 import { useWorkspaceSnapshot } from "./workspace-snapshots";
 import { ServiceProxyFields } from "./components/ServiceProxyFields";
 import {
@@ -198,6 +204,7 @@ export type ServiceEditorTab =
   | "connection"
   | "models"
   | "protocols"
+  | "compatibility"
   | "failure";
 
 export type ServiceManagerView =
@@ -229,6 +236,7 @@ export interface ServiceManagerProps {
 }
 
 type Draft = {
+  compatibility: CompatibilityDraft;
   proxy: ProxyDraft;
   failurePolicy?: FailurePolicy;
   kind: ServiceKind;
@@ -441,6 +449,7 @@ function modelDiscoveryKey(draft: Draft): string {
     draft.baseURL.trim(),
     authForDraft(draft),
     draft.secret,
+    draft.compatibility,
     modelDiscoveryProtocols(draft),
   ]);
 }
@@ -462,6 +471,7 @@ function draftForKind(
       secret: "",
       removeCredential: false,
       proxy: proxyDraft(),
+      compatibility: compatibilityDraft(),
       models: [],
       capabilities: subscriptionNativeCapabilities[kind].map((capability) => ({
         ...capability,
@@ -485,6 +495,7 @@ function draftForKind(
     secret: "",
     removeCredential: false,
     proxy: proxyDraft(),
+    compatibility: compatibilityDraft(),
     models: [...(preset.models ?? [])],
     capabilities: preset.capabilities.map((capability) => ({ ...capability })),
     authorizationFlow: null,
@@ -515,6 +526,7 @@ function draftFromRecord(record: ServiceRecord): Draft {
     failurePolicy: service.failure_policy,
     enabled: service.enabled,
     responsesWebSocket: responsesWebSocketEnabled(service),
+    compatibility: compatibilityDraft(service.http),
     baseURL: service.http.base_url,
     authScheme: service.http.auth.scheme,
     headerName: service.http.auth.header_name ?? "",
@@ -604,6 +616,15 @@ function validateDraft(
   }
   if (draft.capabilities.length === 0) {
     return i18n.t("services.capabilityRequired");
+  }
+  try {
+    compatibilityInput(
+      draft.compatibility,
+      authForDraft(draft),
+      editing?.service.http,
+    );
+  } catch (cause) {
+    return errorMessage(cause, i18n.t("compatibility.failed"));
   }
   return null;
 }
@@ -1378,6 +1399,13 @@ export function ServiceManager({
     setProbingModels(true);
     setError(null);
     try {
+      const compatibility = isSubscriptionKind(draft.kind)
+        ? {}
+        : compatibilityInput(
+            draft.compatibility,
+            authForDraft(draft),
+            editing?.service.http,
+          );
       const attempts = await Promise.allSettled(
         discoveryProtocols.map((protocol) => {
           if (isSubscriptionKind(draft.kind)) {
@@ -1392,6 +1420,7 @@ export function ServiceManager({
             http: {
               base_url: draft.baseURL.trim(),
               auth: authForDraft(draft),
+              ...compatibility,
               ...(draft.secret.trim()
                 ? { credential: { secret: draft.secret } }
                 : {}),
@@ -1434,6 +1463,8 @@ export function ServiceManager({
         missing: draft.models.filter((model) => !upstream.has(model)).sort(),
         warnings,
       });
+    } catch (cause) {
+      setError(errorMessage(cause, t("services.fetchFailed")));
     } finally {
       setProbingModels(false);
     }
@@ -1502,6 +1533,11 @@ export function ServiceManager({
           patch.http = {
             base_url: draft.baseURL.trim(),
             auth: authForDraft(draft),
+            ...compatibilityInput(
+              draft.compatibility,
+              authForDraft(draft),
+              editing.service.http,
+            ),
             ...(draft.secret.trim()
               ? { credential: { secret: draft.secret } }
               : draft.removeCredential
@@ -1554,6 +1590,7 @@ export function ServiceManager({
             http: {
               base_url: draft.baseURL.trim(),
               auth: authForDraft(draft),
+              ...compatibilityInput(draft.compatibility, authForDraft(draft)),
               ...(draft.secret.trim()
                 ? { credential: { secret: draft.secret } }
                 : {}),
@@ -3402,6 +3439,16 @@ export function ServiceManager({
                     })}
                   </Badge>
                 </TabsTrigger>
+                {!isSubscriptionKind(draft.kind) ? (
+                  <TabsTrigger
+                    type="button"
+                    value="compatibility"
+                    data-testid="service-editor-tab-compatibility"
+                    onClick={() => setEditorTab("compatibility")}
+                  >
+                    {t("compatibility.title")}
+                  </TabsTrigger>
+                ) : null}
                 <TabsTrigger
                   data-testid="service-editor-tab-failure"
                   onClick={() => setEditorTab("failure")}
@@ -3434,6 +3481,22 @@ export function ServiceManager({
                 value="protocols"
               >
                 {protocolEditor}
+              </TabsContent>
+              <TabsContent
+                className="min-h-0 min-w-0 flex-1 overflow-hidden pr-4 pb-1"
+                data-testid="service-editor-tab-panel"
+                value="compatibility"
+              >
+                {!isSubscriptionKind(draft.kind) ? (
+                  <ServiceRequestCompatibility
+                    key={editingServiceID ?? "create"}
+                    serviceId={editing?.service.id}
+                    value={draft.compatibility}
+                    onChange={(compatibility) =>
+                      setDraft((current) => ({ ...current, compatibility }))
+                    }
+                  />
+                ) : null}
               </TabsContent>
               <TabsContent
                 className="gutter-scroller min-h-0 min-w-0 flex-1 overflow-y-auto pr-4 pb-1"

@@ -1,3 +1,7 @@
+import {
+  parseRequestCompatibility,
+  type RequestCompatibility,
+} from "./request-compatibility-model";
 import type { ConversionEngineSnapshot } from "./service-presets";
 import {
   parseServiceProxy,
@@ -177,7 +181,7 @@ export function hasPlanUsage(service: {
   return codingPlanUsageKinds.has(service.kind) && service.http != null;
 }
 
-export interface HTTPServiceConnection {
+export interface HTTPServiceConnection extends RequestCompatibility {
   base_url: string;
   auth: ServiceAuth;
   credential_ref?: string;
@@ -285,7 +289,7 @@ export type HTTPServiceCreateInput = {
   kind: HTTPServiceKind;
   enabled?: boolean;
   models?: string[];
-  http: {
+  http: RequestCompatibility & {
     base_url: string;
     auth: ServiceAuth;
     credential?: { secret: string };
@@ -308,6 +312,9 @@ export type ServicePatchInput = {
     base_url?: string;
     auth?: ServiceAuth;
     credential?: { secret: string } | null;
+    extra_headers?: RequestCompatibility["extra_headers"] | null;
+    model_rules?: RequestCompatibility["model_rules"] | null;
+    identity_profile_id?: string | null;
   };
   capabilities?: ServiceCapability[];
 };
@@ -512,7 +519,13 @@ function parseHTTPConnection(
   keysAt(
     connection,
     ["base_url", "auth"],
-    ["credential_ref", "credential_hint"],
+    [
+      "credential_ref",
+      "credential_hint",
+      "extra_headers",
+      "model_rules",
+      "identity_profile_id",
+    ],
     path,
   );
   const baseURL = stringAt(connection.base_url, `${path}.base_url`, 1, 2048);
@@ -558,6 +571,10 @@ function parseHTTPConnection(
   return {
     base_url: baseURL,
     auth: parseAuth(connection.auth, `${path}.auth`),
+    ...parseRequestCompatibility(
+      connection,
+      parseAuth(connection.auth, `${path}.auth`),
+    ),
     ...(credentialRef ? { credential_ref: credentialRef } : {}),
     ...(credentialHint ? { credential_hint: credentialHint } : {}),
   };

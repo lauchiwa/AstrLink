@@ -2005,6 +2005,33 @@ impl CoreManager {
         Ok(())
     }
 
+    pub(crate) async fn service_identity(
+        &self,
+        service_id: &str,
+        operation: crate::service_identity::IdentityOperation,
+    ) -> Result<serde_json::Value, String> {
+        let request = operation.prepare(service_id)?;
+        let (etag, body) = self
+            .authenticated_control(
+                request.method,
+                &request.path,
+                request.body,
+                request.etag.as_deref(),
+            )
+            .await?;
+        if request.empty {
+            return Ok(serde_json::Value::Null);
+        }
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|_| "identity operation returned invalid JSON")?;
+        if request.record {
+            let etag = etag.ok_or("identity profile response omitted ETag")?;
+            validate_etag(&etag)?;
+            return Ok(serde_json::json!({"profile": value, "etag": etag}));
+        }
+        Ok(value)
+    }
+
     pub async fn pricing(
         &self,
         operation: &str,
@@ -4493,7 +4520,7 @@ fn service_risk_events_path(service_id: &str, limit: Option<u32>) -> Result<Stri
     }
 }
 
-fn validate_resource_id(value: &str) -> Result<(), String> {
+pub(crate) fn validate_resource_id(value: &str) -> Result<(), String> {
     if !(3..=96).contains(&value.len())
         || !value.bytes().enumerate().all(|(index, byte)| match byte {
             b'a'..=b'z' => true,
@@ -5112,7 +5139,7 @@ fn validate_audit_settings_patch(patch: &serde_json::Value) -> Result<(), String
     Ok(())
 }
 
-fn validate_etag(value: &str) -> Result<(), String> {
+pub(crate) fn validate_etag(value: &str) -> Result<(), String> {
     if value.len() < 3 || value.len() > 128 || !value.starts_with('"') || !value.ends_with('"') {
         return Err("resource ETag is invalid".to_string());
     }
