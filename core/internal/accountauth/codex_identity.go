@@ -123,10 +123,7 @@ func recognizedCodexClient(clientHeaders http.Header) (ua, name, version string,
 	if !found {
 		return "", "", "", false
 	}
-	switch name {
-	case "codex-tui", "codex_cli_rs", "codex_vscode", "codex_vscode_copilot",
-		"codex_app", "codex_chatgpt_desktop", "codex_atlas", "codex_exec", "codex_sdk_ts":
-	default:
+	if !contract.IsCodexIdentityProduct(name) {
 		return "", "", "", false
 	}
 	version, _, _ = strings.Cut(rest, " ")

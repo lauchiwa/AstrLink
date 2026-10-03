@@ -556,6 +556,14 @@ func (store *Store) UpdateEndpoint(ctx context.Context, endpoint contract.Endpoi
 	service.ResponsesWebSocketEnabled = current.Service.ResponsesWebSocketEnabled
 	service.FailurePolicy = current.Service.FailurePolicy
 	service.CreatedAt = current.Service.CreatedAt
+	// The legacy endpoint view cannot express request rules, so an update made
+	// through it must preserve them instead of silently clearing a provider's
+	// compatibility configuration.
+	if service.HTTP != nil && current.Service.HTTP != nil {
+		service.HTTP.ExtraHeaders = current.Service.HTTP.ExtraHeaders
+		service.HTTP.ModelRules = current.Service.HTTP.ModelRules
+		service.HTTP.IdentityProfileID = current.Service.HTTP.IdentityProfileID
+	}
 	updated, err := store.UpdateService(ctx, service, credential, expectedETag)
 	if err != nil {
 		return record, err

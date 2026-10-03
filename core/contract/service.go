@@ -86,11 +86,30 @@ type HTTPConnection struct {
 	BaseURL       string      `json:"base_url"`
 	Auth          ServiceAuth `json:"auth"`
 	CredentialRef string      `json:"credential_ref,omitempty"`
+	// ExtraHeaders applies to every model this service forwards, unless a
+	// ModelRules entry matches. A nil map keeps the current behavior; an empty
+	// map clears the configuration.
+	ExtraHeaders map[string]string `json:"extra_headers,omitempty"`
+	// ModelRules replace ExtraHeaders for a matching upstream model, matching
+	// the model actually sent upstream. Exact matches win over "*"; within one
+	// specificity the first listed rule wins.
+	ModelRules []ModelRule `json:"model_rules,omitempty"`
+	// IdentityProfileID pins a confirmed snapshot used for every model without
+	// a matching rule. Empty keeps the gateway's existing behavior.
+	IdentityProfileID IdentityProfileID `json:"identity_profile_id,omitempty"`
 }
 
 func (connection HTTPConnection) Validate(serviceID ServiceID) error {
 	if err := connection.Auth.Validate(); err != nil {
 		return fmt.Errorf("auth: %w", err)
+	}
+	if err := ValidateRequestRules(connection.ExtraHeaders, connection.ModelRules, connection.Auth); err != nil {
+		return err
+	}
+	if connection.IdentityProfileID != "" {
+		if err := connection.IdentityProfileID.Validate(); err != nil {
+			return fmt.Errorf("identity_profile_id: %w", err)
+		}
 	}
 	if len(connection.BaseURL) > 2048 {
 		return fmt.Errorf("base_url exceeds 2048 characters")
