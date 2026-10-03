@@ -18,6 +18,7 @@ import (
 	"github.com/QuantumNous/astrlink/core/internal/accountauth"
 	"github.com/QuantumNous/astrlink/core/internal/networkproxy"
 	"github.com/QuantumNous/astrlink/core/internal/providerapi"
+	"github.com/QuantumNous/astrlink/core/internal/requestrewrite"
 	"github.com/QuantumNous/astrlink/core/internal/secretstore"
 	"github.com/QuantumNous/astrlink/core/internal/subscription"
 	"github.com/QuantumNous/astrlink/core/internal/transport"
@@ -33,18 +34,32 @@ const (
 
 var (
 	ErrUnsupported           = errors.New("model discovery protocol is unsupported")
+	ErrConfiguration         = errors.New("model discovery compatibility configuration is invalid")
 	ErrCredentialUnavailable = errors.New("model discovery credential is unavailable")
 	ErrNotConnected          = errors.New("subscription service is not connected")
 	ErrUpstream              = errors.New("upstream model discovery failed")
 )
 
 type Prober struct {
-	secrets       secretstore.SecretStore
-	subscriptions *subscription.Manager
-	client        *http.Client
+	secrets          secretstore.SecretStore
+	subscriptions    *subscription.Manager
+	client           *http.Client
+	identityProfiles accountauth.IdentityProfileReader
+}
+
+type Dependencies struct {
+	Secrets          secretstore.SecretStore
+	Subscriptions    *subscription.Manager
+	Client           *http.Client
+	IdentityProfiles accountauth.IdentityProfileReader
 }
 
 func New(secrets secretstore.SecretStore, subscriptions *subscription.Manager, client *http.Client) *Prober {
+	return NewWithDependencies(Dependencies{Secrets: secrets, Subscriptions: subscriptions, Client: client})
+}
+
+func NewWithDependencies(dependencies Dependencies) *Prober {
+	client := dependencies.Client
 	if client == nil {
 		transportCopy := http.DefaultTransport
 		if defaults, ok := networkproxy.BaseTransport(http.DefaultTransport); ok {
@@ -55,7 +70,66 @@ func New(secrets secretstore.SecretStore, subscriptions *subscription.Manager, c
 		}
 		client = &http.Client{Transport: transportCopy}
 	}
-	return &Prober{secrets: secrets, subscriptions: subscriptions, client: networkproxy.WrapClient(client)}
+	probeClient := networkproxy.WrapClient(client)
+	// Discovery sends the service credential as an ordinary request header, and
+	// Go's client only withholds Authorization and Cookie when a redirect leaves
+	// the original domain. Provider API-key schemes and a custom auth header are
+	// not covered by that rule, so every redirect is checked here instead.
+	probeClient.CheckRedirect = checkProbeRedirect
+	return &Prober{
+		secrets: dependencies.Secrets, subscriptions: dependencies.Subscriptions,
+		client: probeClient, identityProfiles: dependencies.IdentityProfiles,
+	}
+}
+
+// maxProbeRedirects bounds a single discovery request. Same-origin relays use
+// one or two hops; a longer chain is a misconfiguration, not a relay layout.
+const maxProbeRedirects = 3
+
+// checkProbeRedirect confines model discovery to the origin the operator
+// configured. It refuses any change of scheme, host or port, which also refuses
+// an HTTPS to HTTP downgrade that a host-only comparison would accept.
+//
+// Stripping the credential and continuing is not an option: the probe would
+// then report another origin's model list as this service's, so the request
+// fails instead.
+func checkProbeRedirect(request *http.Request, via []*http.Request) error {
+	if request == nil || request.URL == nil || len(via) == 0 {
+		return fmt.Errorf("%w: malformed redirect", ErrUpstream)
+	}
+	if len(via) > maxProbeRedirects {
+		return fmt.Errorf("%w: too many redirects", ErrUpstream)
+	}
+	// via[0] is the request this probe issued, so comparison stays anchored to
+	// the configured origin rather than to the previous hop.
+	origin := via[0].URL
+	if origin == nil || !sameProbeOrigin(origin, request.URL) {
+		return fmt.Errorf("%w: redirect leaves the configured origin", ErrUpstream)
+	}
+	return nil
+}
+
+func sameProbeOrigin(origin, target *url.URL) bool {
+	if origin.Scheme != target.Scheme {
+		return false
+	}
+	// Port() is compared through Host so a default port written explicitly does
+	// not read as a different origin.
+	return canonicalProbeHost(origin) == canonicalProbeHost(target)
+}
+
+func canonicalProbeHost(target *url.URL) string {
+	host := strings.ToLower(target.Hostname())
+	port := target.Port()
+	if port == "" {
+		switch target.Scheme {
+		case "http":
+			port = "80"
+		case "https":
+			port = "443"
+		}
+	}
+	return host + ":" + port
 }
 
 func (prober *Prober) ProbeService(
@@ -114,12 +188,32 @@ func (prober *Prober) ProbeHTTP(
 			return nil, fmt.Errorf("%w: %v", ErrCredentialUnavailable, err)
 		}
 	}
-	headers, err := authorizationHeaders(providerapi.Auth(kind, protocol, connection.Auth), secret)
+	auth := providerapi.Auth(kind, protocol, connection.Auth)
+	headers, err := authorizationHeaders(auth, secret)
 	if err != nil {
 		return nil, err
 	}
 	if kind == contract.ServiceKindAnthropic || kind == contract.ServiceKindKimiCoding || kind == contract.ServiceKindMiniMaxCoding || kind == contract.ServiceKindGLMCoding {
 		headers.Set("Anthropic-Version", "2023-06-01")
+	}
+	plan, err := requestrewrite.Compile(connection, auth)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrConfiguration, err)
+	}
+	// Discovery has no upstream model. Use only service defaults, not even the
+	// catch-all model rule, and resolve the profile once for the entire probe.
+	decision := plan.DecideDefault()
+	var identity http.Header
+	if decision.IdentityProfile != "" {
+		identity, err = accountauth.LoadIdentityProfileHeaders(
+			probeContext, prober.identityProfiles, serviceID, decision.IdentityProfile, auth,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrConfiguration, err)
+		}
+	}
+	if err := plan.Apply(headers, decision, identity); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrConfiguration, err)
 	}
 	baseURL, err := url.Parse(connection.BaseURL)
 	if err != nil {

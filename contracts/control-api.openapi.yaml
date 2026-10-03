@@ -72,6 +72,14 @@ x-astrlink-implementation:
     - GET /control/v1/services/{service_id}
     - PATCH /control/v1/services/{service_id}
     - DELETE /control/v1/services/{service_id}
+    - GET /control/v1/services/{service_id}/identity-capture
+    - PUT /control/v1/services/{service_id}/identity-capture
+    - DELETE /control/v1/services/{service_id}/identity-capture
+    - GET /control/v1/services/{service_id}/identity-profiles
+    - POST /control/v1/services/{service_id}/identity-profiles
+    - GET /control/v1/services/{service_id}/identity-profiles/{profile_id}
+    - DELETE /control/v1/services/{service_id}/identity-profiles/{profile_id}
+    - POST /control/v1/services/{service_id}/identity-profiles/{profile_id}/confirm
     - POST /control/v1/services/{service_id}/authorization
     - GET /control/v1/services/{service_id}/authorization
     - DELETE /control/v1/services/{service_id}/authorization
@@ -639,6 +647,8 @@ paths:
           $ref: "#/components/responses/PreconditionFailed"
         "422":
           $ref: "#/components/responses/UnprocessableEntity"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
     delete:
       x-astrlink-role: operator
       tags: [Services]
@@ -657,6 +667,250 @@ paths:
           $ref: "#/components/responses/Conflict"
         "412":
           $ref: "#/components/responses/PreconditionFailed"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /control/v1/services/{service_id}/identity-capture:
+    x-astrlink-implementation-status: implemented
+    parameters:
+      - $ref: "#/components/parameters/ServiceId"
+    get:
+      x-astrlink-role: operator
+      tags: [Services]
+      operationId: getServiceIdentityCapture
+      summary: Read whether a capture window is open for this HTTP service.
+      description: |
+        Reading never arms a window. State is in-memory, so a restart reports
+        an unarmed service.
+      responses:
+        "200":
+          $ref: "#/components/responses/IdentityCaptureStatus"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    put:
+      x-astrlink-role: operator
+      tags: [Services]
+      operationId: armServiceIdentityCapture
+      summary: Arm one bounded, single-shot capture window for a selected client.
+      description: |
+        Records consent only. Arming never changes what is forwarded, never
+        grants official-client treatment, and never exempts a request from
+        privacy policy. The window is service-scoped, expires on its own, and
+        closes after publishing one unconfirmed candidate, so retries and
+        provider switches cannot resample. Capture reads the original inbound
+        request shape; matching a client's shape is a format check, never
+        authentication of a client binary. Fingerprints, headers and
+        confirmation fields are not accepted here. The published candidate
+        still requires explicit confirmation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IdentityCaptureArm"
+      responses:
+        "200":
+          $ref: "#/components/responses/IdentityCaptureStatus"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "415":
+          description: Content-Type must be application/json.
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    delete:
+      x-astrlink-role: operator
+      tags: [Services]
+      operationId: disarmServiceIdentityCapture
+      summary: Close the capture window, keeping any candidate it already published.
+      responses:
+        "200":
+          $ref: "#/components/responses/IdentityCaptureStatus"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /control/v1/services/{service_id}/identity-profiles:
+    x-astrlink-implementation-status: implemented
+    parameters:
+      - $ref: "#/components/parameters/ServiceId"
+    get:
+      x-astrlink-role: operator
+      tags: [Services]
+      operationId: listServiceIdentityProfiles
+      summary: List full identity snapshots for an HTTP service, including candidates.
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Service-scoped snapshots ordered by ID. Values are operator-only.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdentityProfilePage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    post:
+      x-astrlink-role: operator
+      tags: [Services]
+      operationId: createServiceIdentityCandidate
+      summary: Copy a built-in or learned identity into a new unconfirmed snapshot.
+      description: |
+        Does not enable forwarding. Raw fingerprints, request captures, timestamps
+        and confirmation fields are not accepted. subscription_import copies the
+        learned fingerprint without Routing version floors; missing learning is
+        a conflict, never an implicit built-in fallback. Request capture will use
+        a separate admission-controlled workflow and cannot be uploaded here.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IdentityProfileCreate"
+      responses:
+        "201":
+          $ref: "#/components/responses/IdentityProfile"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /control/v1/services/{service_id}/identity-profiles/{profile_id}:
+    x-astrlink-implementation-status: implemented
+    parameters:
+      - $ref: "#/components/parameters/ServiceId"
+      - $ref: "#/components/parameters/IdentityProfileId"
+    get:
+      x-astrlink-role: operator
+      tags: [Services]
+      operationId: getServiceIdentityProfile
+      summary: Read the exact candidate or confirmed snapshot and its strong ETag.
+      responses:
+        "200":
+          $ref: "#/components/responses/IdentityProfile"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    delete:
+      x-astrlink-role: operator
+      tags: [Services]
+      operationId: discardServiceIdentityCandidate
+      summary: Discard an unconfirmed candidate; confirmed snapshots cannot be deleted here.
+      parameters:
+        - $ref: "#/components/parameters/IfMatch"
+      responses:
+        "204":
+          description: Candidate discarded.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /control/v1/services/{service_id}/identity-profiles/{profile_id}/confirm:
+    x-astrlink-implementation-status: implemented
+    parameters:
+      - $ref: "#/components/parameters/ServiceId"
+      - $ref: "#/components/parameters/IdentityProfileId"
+    post:
+      x-astrlink-role: operator
+      tags: [Services]
+      operationId: confirmServiceIdentityCandidate
+      summary: Confirm the exact reviewed snapshot without activating a service binding.
+      description: |
+        Requires the candidate ETag. Changes only confirmed_at; never resamples
+        learning or replaces the fingerprint. Repeating with the confirmed ETag
+        is idempotent. A stale ETag fails with 412. The body must be {}.
+      parameters:
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+      responses:
+        "200":
+          $ref: "#/components/responses/IdentityProfile"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
   /control/v1/services/{service_id}/authorization:
@@ -3253,6 +3507,12 @@ components:
       required: true
       schema:
         $ref: ./protocol-capabilities.schema.json#/$defs/ResourceId
+    IdentityProfileId:
+      name: profile_id
+      in: path
+      required: true
+      schema:
+        $ref: ./protocol-capabilities.schema.json#/$defs/ResourceId
     AccessTokenId:
       name: token_id
       in: path
@@ -3308,6 +3568,30 @@ components:
       schema:
         type: string
   responses:
+    IdentityCaptureStatus:
+      description: |
+        Operator-only window state. Arming records consent only; it never changes
+        forwarding and never activates an identity.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/NoStore"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/IdentityCaptureStatus"
+    IdentityProfile:
+      description: Operator-only snapshot; confirmation does not activate forwarding.
+      headers:
+        ETag:
+          $ref: "#/components/headers/ETag"
+        Location:
+          $ref: "#/components/headers/Location"
+        Cache-Control:
+          $ref: "#/components/headers/NoStore"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/IdentityProfile"
     BadRequest:
       description: Malformed request, query, or cursor.
       headers:
@@ -4328,6 +4612,96 @@ components:
             Last four characters of the saved API key, prefixed with an ellipsis.
             Returned only on the operator's single-service read and never persisted;
             keys shorter than twelve characters have no hint.
+        extra_headers:
+          $ref: "#/components/schemas/ConfiguredHeaders"
+          description: |
+            Outbound compatibility headers applied to every model this service
+            forwards, unless a model_rules entry matches. Omitting the field keeps
+            the stored value; an empty object clears it.
+        model_rules:
+          type: array
+          maxItems: 200
+          description: |
+            Per-model overrides matched against the model actually sent upstream,
+            after routing and model rewriting. An exact match wins over "*"; within
+            one specificity the first listed rule wins. A matching rule REPLACES
+            extra_headers rather than layering onto it. Omitting the field keeps the
+            stored value; an empty array clears it.
+          items:
+            $ref: "#/components/schemas/ModelRule"
+        identity_profile_id:
+          allOf:
+            - $ref: ./protocol-capabilities.schema.json#/$defs/ResourceId
+          description: |
+            Default confirmed identity profile, also inherited by matching rules
+            without their own identity_profile. Saving requires an existing,
+            confirmed profile belonging to this service and compatible with its
+            authentication header. Create the service first, then confirm and bind
+            a service-scoped profile. A request that cannot render it fails for this
+            provider instead of being forwarded without the pinned identity.
+      additionalProperties: false
+    ConfiguredHeaders:
+      type: object
+      maxProperties: 32
+      description: |
+        Outbound headers an operator may configure. Only overridable headers are
+        accepted: credential headers (including the service's own resolved custom
+        auth header), transport framing and negotiation, per-session and
+        per-request binding markers, and the reserved X-AstrLink-* namespace are
+        refused at save time and again before forwarding.
+
+        Values are operator-only. Below the operator role every value is replaced
+        with "<redacted>" while names stay visible, because a compatibility value
+        is chosen precisely because it makes an upstream accept a request.
+      propertyNames:
+        type: string
+        minLength: 1
+        maxLength: 128
+        pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+      additionalProperties:
+        type: string
+        minLength: 1
+        maxLength: 1024
+        description: Printable ASCII without leading or trailing whitespace.
+    ModelRule:
+      type: object
+      required: [match]
+      description: |
+        One per-model override. This version rewrites headers only: body must be
+        absent or an empty object, and any field in it is refused rather than
+        silently ignored.
+      properties:
+        match:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: >
+            Exact upstream model id, or "*" for every model. No other wildcard
+            syntax is accepted; a pattern containing ? or [ ] is refused rather than
+            matched literally.
+        headers:
+          $ref: "#/components/schemas/ConfiguredHeaders"
+        body:
+          type: object
+          maxProperties: 0
+          description: >
+            Reserved for a later version. Only an empty object is accepted, so a
+            configuration migrated from a tool that stored "body": {} still loads.
+          additionalProperties: false
+        identity_profile:
+          allOf:
+            - $ref: ./protocol-capabilities.schema.json#/$defs/ResourceId
+          description: >
+            Confirmed profile for the matched models. Omitted inherits the service's
+            identity_profile_id. References are checked at save time even for disabled
+            rules; the profile must belong to this service and be compatible with its
+            authentication header.
+        enabled:
+          type: boolean
+          default: true
+          description: >
+            Omitted means enabled, so an older stored rule keeps working. A disabled
+            rule never matches and the service default applies instead.
       additionalProperties: false
     SubscriptionServiceConnection:
       type: object
@@ -7079,6 +7453,147 @@ components:
         deleted_audit_blobs:
           type: integer
           minimum: 0
+      additionalProperties: false
+    IdentityClient:
+      type: string
+      enum: [codex_cli, claude_code, grok_cli]
+      description: Explicit outbound identity selection, not authenticated caller identity.
+    IdentityCaptureArm:
+      type: object
+      required: [client]
+      properties:
+        client:
+          $ref: "#/components/schemas/IdentityClient"
+        ttl_seconds:
+          type: integer
+          minimum: 0
+          description: |
+            Optional. Zero, omitted or above the server maximum selects the
+            default window; a window is never unbounded.
+      additionalProperties: false
+    IdentityCaptureStatus:
+      type: object
+      required: [service_id, armed]
+      description: |
+        In-memory consent state for one service. It is not restored after a
+        restart, and an expired or already-published window reports armed=false
+        while still reporting the candidate it published.
+      properties:
+        service_id:
+          $ref: ./protocol-capabilities.schema.json#/$defs/ResourceId
+        armed:
+          type: boolean
+        client:
+          $ref: "#/components/schemas/IdentityClient"
+        armed_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        captured_profile:
+          allOf:
+            - $ref: ./protocol-capabilities.schema.json#/$defs/ResourceId
+          description: The unconfirmed candidate this window published, if any.
+        rejected:
+          type: integer
+          minimum: 0
+          description: |
+            Requests seen in this window that did not match the selected
+            client. Enough rejections close the window instead of sampling
+            until it expires.
+      additionalProperties: false
+    IdentityProfileCreate:
+      type: object
+      required: [client, source]
+      properties:
+        client:
+          $ref: "#/components/schemas/IdentityClient"
+        source:
+          type: string
+          enum: [builtin, subscription_import]
+      additionalProperties: false
+    IdentityFingerprint:
+      type: object
+      required: [user_agent, version]
+      description: |
+        Frozen printable-ASCII fingerprint with no gateway branding. Core also
+        validates client product, UA/version agreement and client-specific header
+        constraints. Codex stores only Originator; Claude stores approved SDK
+        fields; Grok has no stored companion headers and learns only its version.
+        Authentication, feature betas, sessions and request controls are excluded.
+      properties:
+        user_agent:
+          type: string
+          minLength: 1
+          maxLength: 1024
+        version:
+          type: string
+          minLength: 1
+          maxLength: 64
+        headers:
+          type: object
+          maxProperties: 16
+          propertyNames:
+            enum:
+              [
+                Originator,
+                X-App,
+                X-Stainless-Lang,
+                X-Stainless-Package-Version,
+                X-Stainless-Os,
+                X-Stainless-Arch,
+                X-Stainless-Runtime,
+                X-Stainless-Runtime-Version,
+              ]
+          additionalProperties:
+            type: string
+            minLength: 1
+            maxLength: 256
+      additionalProperties: false
+    IdentityProfile:
+      type: object
+      required: [id, service_id, client, source, fingerprint, created_at]
+      description: |
+        A service-scoped snapshot. A replacement has a new ID. Absence of
+        confirmed_at means a candidate, not eligible for forwarding. Creation
+        and confirmation timestamps are server-owned. Observation time is not
+        invented when importing subscription learning. Stored profiles are not
+        links to mutable subscription identities and do not apply version floors.
+      properties:
+        id:
+          $ref: ./protocol-capabilities.schema.json#/$defs/ResourceId
+        service_id:
+          $ref: ./protocol-capabilities.schema.json#/$defs/ResourceId
+        client:
+          $ref: "#/components/schemas/IdentityClient"
+        source:
+          type: string
+          enum: [builtin, subscription_import, request_capture]
+        fingerprint:
+          $ref: "#/components/schemas/IdentityFingerprint"
+        created_at:
+          type: string
+          format: date-time
+        observed_at:
+          type: string
+          format: date-time
+        confirmed_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+    IdentityProfilePage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          maxItems: 200
+          items:
+            $ref: "#/components/schemas/IdentityProfile"
+        next_cursor:
+          type: [string, "null"]
+          maxLength: 512
       additionalProperties: false
     ServicePage:
       type: object

@@ -46,6 +46,13 @@ type serviceHTTPInput struct {
 	BaseURL    string          `json:"base_url"`
 	Auth       json.RawMessage `json:"auth"`
 	Credential json.RawMessage `json:"credential,omitempty"`
+	// ExtraHeaders and ModelRules are optional. Omitted keeps the saved value on
+	// patch and stays unset on create; an explicit empty object or array clears
+	// the configuration. contract.ValidateRequestRules refuses any header the
+	// gateway owns, so a rejected rule is never persisted.
+	ExtraHeaders      map[string]string          `json:"extra_headers,omitempty"`
+	ModelRules        []contract.ModelRule       `json:"model_rules,omitempty"`
+	IdentityProfileID contract.IdentityProfileID `json:"identity_profile_id,omitempty"`
 }
 
 type servicePageResponse struct {
@@ -53,7 +60,19 @@ type servicePageResponse struct {
 	NextCursor *string            `json:"next_cursor"`
 }
 
-func (handler *Handler) publicService(service contract.Service) contract.Service {
+// publicService projects a stored service for the caller behind request.
+//
+// Outbound compatibility configuration is operator-only: a configured header
+// value is chosen precisely because it makes an upstream accept a request, so
+// it is as sensitive as a credential hint. Below operator the names, matches
+// and bound profile id stay visible and the values are replaced, which keeps
+// an observer able to see THAT a service rewrites requests without learning
+// what it sends.
+func (handler *Handler) publicService(request *http.Request, service contract.Service) contract.Service {
+	if service.HTTP != nil && requestRole(request) < RoleOperator {
+		connection := service.HTTP.WithoutConfiguredValues()
+		service.HTTP = &connection
+	}
 	if handler.subscriptions == nil || !service.Kind.IsSubscription() || service.Subscription == nil {
 		return service
 	}
@@ -77,7 +96,7 @@ type serviceHTTPDetail struct {
 }
 
 func (handler *Handler) serviceDetail(request *http.Request, service contract.Service) any {
-	service = handler.publicService(service)
+	service = handler.publicService(request, service)
 	if requestRole(request) < RoleOperator || service.HTTP == nil || service.HTTP.CredentialRef == "" {
 		return service
 	}
@@ -130,6 +149,12 @@ func (handler *Handler) registerServiceRoutes() {
 // events. The OAuth authorization session carries device codes and sign-in
 // URLs, so every method on it is operator-only, like all writes.
 func serviceItemRole(request *http.Request) Role {
+	parts := strings.Split(strings.TrimPrefix(request.URL.Path, ServicesPath+"/"), "/")
+	if len(parts) >= 2 && (parts[1] == "identity-profiles" || parts[1] == "identity-capture") {
+		// Full candidate fingerprints are operator-only, including list/read, and
+		// arming a capture window is consent, so it is never an observer action.
+		return RoleOperator
+	}
 	if isSafeMethod(request.Method) && !strings.HasSuffix(request.URL.Path, "/authorization") {
 		return RoleObserver
 	}
@@ -157,6 +182,14 @@ func (handler *Handler) serviceItem(writer http.ResponseWriter, request *http.Re
 	}
 	id, ok := parseServiceID(writer, parts[0])
 	if !ok {
+		return
+	}
+	if len(parts) >= 2 && parts[1] == "identity-profiles" {
+		handler.serviceIdentityProfiles(writer, request, id, parts[2:])
+		return
+	}
+	if len(parts) == 2 && parts[1] == "identity-capture" {
+		handler.serviceIdentityCapture(writer, request, id)
 		return
 	}
 	if len(parts) == 3 {
@@ -262,7 +295,7 @@ func (handler *Handler) listServices(writer http.ResponseWriter, request *http.R
 	}
 	response := servicePageResponse{Items: make([]contract.Service, 0, len(page.Items))}
 	for _, item := range page.Items {
-		response.Items = append(response.Items, handler.publicService(item.Service))
+		response.Items = append(response.Items, handler.publicService(request, item.Service))
 	}
 	if page.NextCursor != "" {
 		response.NextCursor = &page.NextCursor
@@ -364,6 +397,9 @@ func (handler *Handler) createService(writer http.ResponseWriter, request *http.
 		writeError(writer, http.StatusUnprocessableEntity, "invalid_service_proxy", err.Error())
 		return
 	}
+	if !handler.requireServiceIdentityBindings(writer, request, service) {
+		return
+	}
 	record, err := handler.serviceStore.CreateService(request.Context(), service, credential)
 	if err != nil {
 		handler.writeStoreError(writer, err)
@@ -371,7 +407,7 @@ func (handler *Handler) createService(writer http.ResponseWriter, request *http.
 	}
 	writer.Header().Set("Location", ServicesPath+"/"+string(record.Service.ID))
 	writer.Header().Set("ETag", record.ETag)
-	writeJSON(writer, http.StatusCreated, handler.publicService(record.Service))
+	writeJSON(writer, http.StatusCreated, handler.publicService(request, record.Service))
 }
 
 func (handler *Handler) getService(writer http.ResponseWriter, request *http.Request, id contract.ServiceID) {
@@ -407,6 +443,7 @@ func (handler *Handler) patchService(writer http.ResponseWriter, request *http.R
 		return
 	}
 	service, credential, err := applyServicePatch(current.Service, patch)
+	defer clear(credential.Secret)
 	if err != nil {
 		writeError(writer, http.StatusUnprocessableEntity, "invalid_service_patch", "service patch violates the contract")
 		return
@@ -415,14 +452,16 @@ func (handler *Handler) patchService(writer http.ResponseWriter, request *http.R
 		writeError(writer, http.StatusUnprocessableEntity, "invalid_service_patch", err.Error())
 		return
 	}
-	defer clear(credential.Secret)
+	if !handler.requireServiceIdentityBindings(writer, request, service) {
+		return
+	}
 	record, err := handler.serviceStore.UpdateService(request.Context(), service, credential, expectedETag)
 	if err != nil {
 		handler.writeStoreError(writer, err)
 		return
 	}
 	writer.Header().Set("ETag", record.ETag)
-	writeJSON(writer, http.StatusOK, handler.publicService(record.Service))
+	writeJSON(writer, http.StatusOK, handler.publicService(request, record.Service))
 }
 
 func (handler *Handler) deleteService(writer http.ResponseWriter, request *http.Request, id contract.ServiceID) {
@@ -635,7 +674,7 @@ func (handler *Handler) logoutService(writer http.ResponseWriter, request *http.
 	}
 	_ = account
 	writer.Header().Set("ETag", record.ETag)
-	writeJSON(writer, http.StatusOK, handler.publicService(record.Service))
+	writeJSON(writer, http.StatusOK, handler.publicService(request, record.Service))
 }
 
 type serviceModelProbeResponse struct {
@@ -725,7 +764,17 @@ func (handler *Handler) probeDraftServiceModels(writer http.ResponseWriter, requ
 	}
 	serviceID := contract.ServiceID("service_model_probe")
 	proxyService := contract.Service{ID: serviceID}
-	connection := contract.HTTPConnection{BaseURL: httpInput.BaseURL, Auth: auth}
+	// The draft probe carries the same rules a saved service would, so model
+	// discovery in the editor matches discovery after saving.
+	connection := contract.HTTPConnection{
+		BaseURL: httpInput.BaseURL, Auth: auth,
+		ExtraHeaders: httpInput.ExtraHeaders, ModelRules: httpInput.ModelRules,
+		IdentityProfileID: httpInput.IdentityProfileID,
+	}
+	if err := contract.ValidateRequestRules(connection.ExtraHeaders, connection.ModelRules, auth); err != nil {
+		writeError(writer, http.StatusUnprocessableEntity, "invalid_model_probe", err.Error())
+		return
+	}
 	var secret []byte
 	if httpInput.Credential != nil {
 		if isJSONNull(httpInput.Credential) {
@@ -787,6 +836,8 @@ func writeServiceModelProbeError(writer http.ResponseWriter, err error) {
 		writeError(writer, http.StatusGatewayTimeout, "upstream_model_discovery_timeout", "upstream model discovery timed out")
 	case errors.Is(err, servicemodel.ErrUnsupported):
 		writeError(writer, http.StatusUnprocessableEntity, "model_discovery_unsupported", "service does not support this model discovery protocol")
+	case errors.Is(err, servicemodel.ErrConfiguration):
+		writeError(writer, http.StatusUnprocessableEntity, "invalid_model_probe", "service request compatibility configuration is invalid or its identity profile is unavailable")
 	case errors.Is(err, servicemodel.ErrCredentialUnavailable):
 		writeError(writer, http.StatusConflict, "credential_unavailable", "service credential is unavailable")
 	case errors.Is(err, servicemodel.ErrNotConnected):
@@ -933,7 +984,7 @@ func (handler *Handler) clearServiceRisk(writer http.ResponseWriter, request *ht
 		return
 	}
 	writer.Header().Set("ETag", record.ETag)
-	writeJSON(writer, http.StatusOK, handler.publicService(record.Service))
+	writeJSON(writer, http.StatusOK, handler.publicService(request, record.Service))
 }
 
 func (handler *Handler) listServiceRiskEvents(writer http.ResponseWriter, request *http.Request, id contract.ServiceID) {
@@ -1071,7 +1122,11 @@ func decodeServiceHTTP(
 	if err != nil {
 		return connection, nil, mutation, err
 	}
-	connection = contract.HTTPConnection{BaseURL: input.BaseURL, Auth: auth}
+	connection = contract.HTTPConnection{
+		BaseURL: input.BaseURL, Auth: auth,
+		ExtraHeaders: input.ExtraHeaders, ModelRules: input.ModelRules,
+		IdentityProfileID: input.IdentityProfileID,
+	}
 	if input.Credential != nil {
 		if isJSONNull(input.Credential) {
 			return connection, nil, mutation, fmt.Errorf("credential must be an object")
@@ -1151,8 +1206,42 @@ func applyServicePatch(
 			return service, credential, fmt.Errorf("invalid http patch")
 		}
 		for name := range fields {
-			if name != "base_url" && name != "auth" && name != "credential" {
+			switch name {
+			case "base_url", "auth", "credential", "extra_headers", "model_rules", "identity_profile_id":
+			default:
 				return service, credential, fmt.Errorf("unknown http field %q", name)
+			}
+		}
+		// An omitted field keeps the saved value; explicit null and an explicit
+		// empty value both clear it, so the UI can remove every rule.
+		if value, ok := fields["extra_headers"]; ok {
+			service.HTTP.ExtraHeaders = nil
+			if !isJSONNull(value) {
+				var headers map[string]string
+				if strictUnmarshal(value, &headers) != nil {
+					return service, credential, fmt.Errorf("invalid extra_headers")
+				}
+				service.HTTP.ExtraHeaders = headers
+			}
+		}
+		if value, ok := fields["model_rules"]; ok {
+			service.HTTP.ModelRules = nil
+			if !isJSONNull(value) {
+				var rules []contract.ModelRule
+				if strictUnmarshal(value, &rules) != nil {
+					return service, credential, fmt.Errorf("invalid model_rules")
+				}
+				service.HTTP.ModelRules = rules
+			}
+		}
+		if value, ok := fields["identity_profile_id"]; ok {
+			service.HTTP.IdentityProfileID = ""
+			if !isJSONNull(value) {
+				var id contract.IdentityProfileID
+				if strictUnmarshal(value, &id) != nil {
+					return service, credential, fmt.Errorf("invalid identity_profile_id")
+				}
+				service.HTTP.IdentityProfileID = id
 			}
 		}
 		if value, ok := fields["base_url"]; ok {

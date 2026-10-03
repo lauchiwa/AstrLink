@@ -63,7 +63,10 @@ type Dependencies struct {
 	LocalData storage.LocalDataStore
 	// ClientIdentities reports learned client identity versions. Optional.
 	ClientIdentities ClientIdentityReporter
-	Subscriptions    *subscription.Manager
+	// IdentityCapture arms service-scoped identity capture windows. Optional;
+	// nil reports capture as unavailable instead of silently never capturing.
+	IdentityCapture IdentityCaptureController
+	Subscriptions   *subscription.Manager
 	// CodingPlans reads first-party plan quotas for API-key coding plan
 	// services (Kimi, GLM, MiniMax, OpenCode Go). Optional.
 	CodingPlans      CodingPlanUsage
@@ -127,6 +130,7 @@ type Handler struct {
 	rawGrants         *rawGrantManager
 	localData         storage.LocalDataStore
 	clientIdentities  ClientIdentityReporter
+	identityCapture   IdentityCaptureController
 	subscriptions     *subscription.Manager
 	codingPlans       CodingPlanUsage
 	serviceModels     ServiceModelProber
@@ -177,6 +181,7 @@ func newHandler(version contract.VersionResponse, dependencies Dependencies) (*H
 	handler := &Handler{
 		builtinToolTester: dependencies.BuiltinToolTester,
 		clientIdentities:  dependencies.ClientIdentities,
+		identityCapture:   dependencies.IdentityCapture,
 		pricingStore:      dependencies.PricingStore, pricingManager: dependencies.PricingManager,
 		routingSettings: routingSettings,
 		version:         version,
