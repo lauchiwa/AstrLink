@@ -328,12 +328,12 @@ func main() {
 			ServiceModels: servicemodel.NewWithDependencies(servicemodel.Dependencies{
 				Secrets: store, Subscriptions: subscriptionManager, IdentityProfiles: store,
 			}),
-			ServiceTester:      servicetest.NewWithDependencies(gatewayDependencies, subscriptionManager.APIBaseURLFor),
-			BuiltinToolTester:  ingress.NewWithDependencies(gatewayDependencies),
-			ControlToken:       controlToken,
-			ObserverToken:      tokens.observer,
-			ConversionEngine:   conversionEngine,
-			Shutdown:           stopSignals,
+			ServiceTester:     servicetest.NewWithDependencies(gatewayDependencies, subscriptionManager.APIBaseURLFor),
+			BuiltinToolTester: ingress.NewWithDependencies(gatewayDependencies),
+			ControlToken:      controlToken,
+			ObserverToken:     tokens.observer,
+			ConversionEngine:  conversionEngine,
+			Shutdown:          stopSignals,
 		})
 		if err != nil {
 			_ = store.Close()

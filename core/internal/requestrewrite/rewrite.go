@@ -124,7 +124,7 @@ func Compile(connection contract.HTTPConnection, auth contract.ServiceAuth) (*Pl
 		if !rule.Active() {
 			continue
 		}
-		position := len(plan.rules) - 1;
+		position := len(plan.rules) - 1
 		if rule.MatchesAll() {
 			if plan.catchAll < 0 {
 				plan.catchAll = position
