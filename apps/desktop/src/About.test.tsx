@@ -16,6 +16,7 @@ vi.mock("./LocalClientUpdates", () => ({
   LocalClientUpdates: () => <div data-slot="local-clients" />,
 }));
 import { About } from "./About";
+import { openExternalURL } from "./bridge";
 
 describe("About updates", () => {
   let container: HTMLDivElement, root: Root;
@@ -31,7 +32,7 @@ describe("About updates", () => {
       version: "1.1.0",
       notes: "New release",
       published_at: null,
-      url: "https://github.com/Calcium-Ion/AstrLink/releases/tag/v1.1.0",
+      url: `https://github.com/${browserUpdateSnapshot().repository}/releases/tag/v1.1.0`,
     },
   };
   beforeEach(() => {
@@ -61,6 +62,27 @@ describe("About updates", () => {
       .reverse()
       .find((b) => b.textContent === label)!;
   }
+  it.each(["lauchiwa/AstrLink", "Calcium-Ion/AstrLink"])(
+    "opens the configured project and manual release links for %s",
+    async (repository) => {
+      const url = `https://github.com/${repository}/releases/tag/v1.1.0`;
+      await render({
+        ...ready,
+        repository,
+        configured: false,
+        phase: "manual",
+        release: { ...ready.release!, url },
+      });
+      await act(async () => button("项目主页").click());
+      expect(openExternalURL).toHaveBeenCalledWith(
+        `https://github.com/${repository}`,
+      );
+      await act(async () => button("查看版本与下载").click());
+      expect(openExternalURL).toHaveBeenCalledWith(url);
+      expect(mocks.installAppUpdate).not.toHaveBeenCalled();
+    },
+  );
+
   it("requires in-app confirmation before installation and supports cancellation", async () => {
     await render();
     await act(async () => button("安装并重启").click());

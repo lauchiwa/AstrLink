@@ -1,3 +1,5 @@
+import releaseConfiguration from "../release-repository.json";
+
 export type UpdateChannel = "stable" | "preview";
 export interface UpdatePreferences {
   auto_check: boolean;
@@ -31,6 +33,7 @@ export interface UpdateRelease {
 export interface UpdateSnapshot {
   revision: number;
   current_version: string;
+  repository: string;
   latest_version: string | null;
   platform: string;
   arch: string;
@@ -68,6 +71,14 @@ export function parseUpdateSnapshot(value: unknown): UpdateSnapshot {
     throw new Error("Invalid update phase");
   for (const key of ["current_version", "platform", "arch"])
     if (typeof v[key] !== "string") throw new Error(`Invalid update ${key}`);
+  if (
+    typeof v.repository !== "string" ||
+    !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9_.-]{1,100}$/.test(
+      v.repository,
+    ) ||
+    [".", ".."].includes(v.repository.split("/")[1])
+  )
+    throw new Error("Invalid update repository");
   for (const key of ["install_supported", "configured", "development"])
     if (typeof v[key] !== "boolean") throw new Error(`Invalid update ${key}`);
   for (const key of ["revision", "downloaded_bytes", "total_bytes"]) {
@@ -93,9 +104,18 @@ export function parseUpdateSnapshot(value: unknown): UpdateSnapshot {
     if (r.published_at !== null && typeof r.published_at !== "string")
       throw new Error("Invalid update release date");
     const url = new URL(String(r.url));
+    const prefix = `/${v.repository}/releases/tag/`;
+    const tag = decodeURIComponent(url.pathname.slice(prefix.length));
     if (
       url.origin !== "https://github.com" ||
-      !url.pathname.startsWith("/Calcium-Ion/AstrLink/releases/tag/")
+      url.username ||
+      url.password ||
+      url.search ||
+      url.hash ||
+      !url.pathname.startsWith(prefix) ||
+      !tag ||
+      tag.includes("/") ||
+      (tag !== r.version && tag !== `v${r.version}`)
     )
       throw new Error("Invalid update release URL");
   }
@@ -107,6 +127,11 @@ export function parseUpdateSnapshot(value: unknown): UpdateSnapshot {
 export const browserUpdateSnapshot = (): UpdateSnapshot => ({
   revision: 0,
   current_version: "—",
+  repository: (
+    process.env.ASTRLINK_RELEASE_REPOSITORY ??
+    process.env.GITHUB_REPOSITORY ??
+    releaseConfiguration.repository
+  ).trim(),
   latest_version: null,
   platform: "browser",
   arch: "—",

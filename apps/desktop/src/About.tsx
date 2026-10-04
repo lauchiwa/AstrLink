@@ -182,7 +182,7 @@ export function About({
                     variant="ghost"
                     size="sm"
                     onClick={() =>
-                      void open("https://github.com/Calcium-Ion/AstrLink")
+                      void open(`https://github.com/${snapshot.repository}`)
                     }
                   >
                     {t("about.project")}

@@ -1,6 +1,7 @@
 import { defineConfig } from "@rsbuild/core";
 import { pluginReact } from "@rsbuild/plugin-react";
 import tailwindcss from "@tailwindcss/postcss";
+import { releaseRepository } from "./scripts/release-updates.mjs";
 
 import {
   BuildGeneration,
@@ -14,6 +15,10 @@ const buildGeneration = new BuildGeneration();
 export default defineConfig({
   plugins: [pluginReact(), createTauriDevReloadPlugin(buildGeneration)],
   source: {
+    define: {
+      "process.env.ASTRLINK_RELEASE_REPOSITORY":
+        JSON.stringify(releaseRepository()),
+    },
     entry: {
       index: "./src/main.tsx",
     },

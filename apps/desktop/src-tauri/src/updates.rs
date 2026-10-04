@@ -16,8 +16,12 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::{i18n, preferences::PreferencesStore, sidecar::CoreManager};
 
-const REPOSITORY: &str = "https://github.com/Calcium-Ion/AstrLink";
-const RELEASE_API: &str = "https://api.github.com/repos/Calcium-Ion/AstrLink/releases";
+#[cfg(test)]
+#[path = "../release_repository.rs"]
+mod release_repository;
+
+const REPOSITORY: &str = env!("ASTRLINK_RELEASE_REPOSITORY");
+const RELEASE_API: &str = env!("ASTRLINK_RELEASE_API");
 const EVENT: &str = "app-update-status";
 const PUBLIC_KEY: &str = env!("TAURI_UPDATER_PUBLIC_KEY");
 const INTERVAL: Duration = Duration::from_secs(3 * 60 * 60);
@@ -60,6 +64,7 @@ pub struct ReleaseInfo {
 pub struct UpdateSnapshot {
     revision: u64,
     current_version: String,
+    repository: String,
     latest_version: Option<String>,
     platform: String,
     arch: String,
@@ -166,6 +171,10 @@ fn notify_unattended(app: &AppHandle, kind: &str, version: &str) {
 }
 
 fn github_asset(url: &str, tag: &str) -> bool {
+    github_asset_for_repository(url, tag, REPOSITORY)
+}
+
+fn github_asset_for_repository(url: &str, tag: &str, repository: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
     };
@@ -174,11 +183,18 @@ fn github_asset(url: &str, tag: &str) -> bool {
         && parsed.username().is_empty()
         && parsed.password().is_none()
         && parsed.port().is_none()
+        && parsed.query().is_none()
+        && parsed.fragment().is_none()
         && parsed
             .path()
             .replace("%2B", "+")
             .replace("%2b", "+")
-            .starts_with(&format!("/Calcium-Ion/AstrLink/releases/download/{tag}/"))
+            .strip_prefix(&format!("/{repository}/releases/download/{tag}/"))
+            .is_some_and(|file| {
+                !file.is_empty()
+                    && !file.contains('/')
+                    && !file.to_ascii_lowercase().contains("%2f")
+            })
 }
 
 pub fn verify_package(bytes: &[u8], signature: &str, key: &str) -> Result<(), String> {
@@ -264,6 +280,7 @@ impl UpdateManager {
                 snapshot: UpdateSnapshot {
                     revision: 0,
                     current_version: app.package_info().version.to_string(),
+                    repository: REPOSITORY.to_owned(),
                     latest_version: None,
                     platform: std::env::consts::OS.into(),
                     arch: std::env::consts::ARCH.into(),
@@ -507,7 +524,10 @@ impl UpdateManager {
             version: selected_version.to_string(),
             notes: release.body.clone().unwrap_or_default(),
             published_at: release.published_at.clone(),
-            url: format!("{REPOSITORY}/releases/tag/{}", release.tag_name),
+            url: format!(
+                "https://github.com/{REPOSITORY}/releases/tag/{}",
+                release.tag_name
+            ),
         };
         self.publish(app, |i| {
             if i.generation == generation {
@@ -930,16 +950,63 @@ mod tests {
     #[test]
     fn asset_urls_must_belong_to_selected_release() {
         assert!(github_asset(
-            "https://github.com/Calcium-Ion/AstrLink/releases/download/v1.0.0/latest.json",
+            &format!("https://github.com/{REPOSITORY}/releases/download/v1.0.0/latest.json"),
             "v1.0.0"
         ));
-        for url in [
-            "http://github.com/Calcium-Ion/AstrLink/releases/download/v1.0.0/a",
-            "https://example.org/a",
-            "https://github.com/Calcium-Ion/AstrLink/releases/download/v0.1.0/a",
-            "https://github.com.evil/Calcium-Ion/AstrLink/releases/download/v1.0.0/a",
-        ] {
-            assert!(!github_asset(url, "v1.0.0"));
+        assert_eq!(
+            RELEASE_API,
+            format!("https://api.github.com/repos/{REPOSITORY}/releases")
+        );
+        for repository in ["Calcium-Ion/AstrLink", "lauchiwa/AstrLink"] {
+            let base = format!("https://github.com/{repository}/releases/download/v1.0.0");
+            assert!(github_asset_for_repository(
+                &format!("{base}/latest.json"),
+                "v1.0.0",
+                repository
+            ));
+            assert!(github_asset_for_repository(
+                &format!("{base}+build.1/a"),
+                "v1.0.0+build.1",
+                repository
+            ));
+            assert!(github_asset_for_repository(
+                &format!("{base}%2Bbuild.1/a"),
+                "v1.0.0+build.1",
+                repository
+            ));
+            for url in [
+                base.replace("https:", "http:") + "/a",
+                base.replace("github.com", "github.com.evil") + "/a",
+                base.replace(repository, "another-owner/AstrLink") + "/a",
+                base.replace("v1.0.0", "v0.1.0") + "/a",
+                base.clone() + "/",
+                base.clone() + "/a/b",
+                base.clone() + "/a%2Fb",
+                base.clone() + "/a?download=1",
+                base.clone() + "/a#fragment",
+            ] {
+                assert!(
+                    !github_asset_for_repository(&url, "v1.0.0", repository),
+                    "accepted {url}"
+                );
+            }
+            let mut credentialed = reqwest::Url::parse(&format!("{base}/a")).unwrap();
+            credentialed.set_username("test-user").unwrap();
+            assert!(!github_asset_for_repository(
+                credentialed.as_str(),
+                "v1.0.0",
+                repository
+            ));
+            let other = if repository == "lauchiwa/AstrLink" {
+                "Calcium-Ion/AstrLink"
+            } else {
+                "lauchiwa/AstrLink"
+            };
+            assert!(!github_asset_for_repository(
+                &format!("{base}/a"),
+                "v1.0.0",
+                other
+            ));
         }
     }
     #[test]

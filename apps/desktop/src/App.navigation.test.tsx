@@ -562,7 +562,7 @@ describe("App workspace navigation", () => {
         version: "1.1.0",
         notes: "New release",
         published_at: null,
-        url: "https://github.com/Calcium-Ion/AstrLink/releases/tag/v1.1.0",
+        url: `https://github.com/${browserUpdateSnapshot().repository}/releases/tag/v1.1.0`,
       },
     };
     await act(async () => listener!(ready));
@@ -591,7 +591,7 @@ describe("App workspace navigation", () => {
       version: "1.1.0",
       notes: "New release",
       published_at: null,
-      url: "https://github.com/Calcium-Ion/AstrLink/releases/tag/v1.1.0",
+      url: `https://github.com/${browserUpdateSnapshot().repository}/releases/tag/v1.1.0`,
     };
     const base = browserUpdateSnapshot();
     // Automatic download moves on to "ready" by itself; nothing to announce yet.
@@ -623,7 +623,11 @@ describe("App workspace navigation", () => {
         ...base,
         revision: 5,
         phase: "manual",
-        release: { ...release, version: "1.2.0" },
+        release: {
+          ...release,
+          version: "1.2.0",
+          url: `https://github.com/${base.repository}/releases/tag/v1.2.0`,
+        },
       }),
     );
     expect(updateMocks.info).toHaveBeenCalledTimes(2);
@@ -651,7 +655,7 @@ describe("App workspace navigation", () => {
         version: "1.1.0",
         notes: "New release",
         published_at: null,
-        url: "https://github.com/Calcium-Ion/AstrLink/releases/tag/v1.1.0",
+        url: `https://github.com/${browserUpdateSnapshot().repository}/releases/tag/v1.1.0`,
       },
     };
     await act(async () => listener!(ready));

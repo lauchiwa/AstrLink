@@ -14,6 +14,8 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   collectRelease,
+  publishingRepository,
+  releaseRepository,
   releaseVersion,
   signingEnvironment,
   stampVersion,
@@ -62,6 +64,103 @@ afterEach(() => {
 });
 
 describe("release updates", () => {
+  it("resolves the explicit repository before Actions and local configuration", () => {
+    const configured = JSON.parse(
+      readFileSync(
+        new URL("../release-repository.json", import.meta.url),
+        "utf8",
+      ),
+    ).repository;
+    expect(releaseRepository({})).toBe(configured);
+    expect(releaseRepository({ GITHUB_REPOSITORY: "actions/desktop" })).toBe(
+      "actions/desktop",
+    );
+    expect(
+      releaseRepository({
+        GITHUB_REPOSITORY: "actions/desktop",
+        ASTRLINK_RELEASE_REPOSITORY: " fork/desktop ",
+      }),
+    ).toBe("fork/desktop");
+    for (const slug of [
+      "",
+      " ",
+      "https://github.com/fork/desktop",
+      "fork/desktop/extra",
+      "../desktop",
+      "fork/..",
+      "fork/.",
+      "-fork/desktop",
+      "fork-/desktop",
+      "fork_name/desktop",
+      "fork/desktop?tag=v1",
+      "fork/desktop#fragment",
+      "fork/desk%2Ftop",
+      "fork/desk\ntop",
+      "fork/桌面",
+      `${"a".repeat(40)}/desktop`,
+      `fork/${"a".repeat(101)}`,
+    ]) {
+      expect(() =>
+        releaseRepository({
+          GITHUB_REPOSITORY: "upstream/desktop",
+          ASTRLINK_RELEASE_REPOSITORY: slug,
+        }),
+      ).toThrow("owner/repository");
+    }
+    for (const slug of [
+      "lauchiwa/AstrLink",
+      "Calcium-Ion/AstrLink",
+      "a/.github",
+      "a/repo_name-1.2",
+    ])
+      expect(releaseRepository({ ASTRLINK_RELEASE_REPOSITORY: slug })).toBe(
+        slug,
+      );
+  });
+
+  it("allows publishing only to the current Actions repository", () => {
+    for (const repository of ["lauchiwa/AstrLink", "Calcium-Ion/AstrLink"]) {
+      expect(publishingRepository({ GITHUB_REPOSITORY: repository })).toBe(
+        repository,
+      );
+      expect(
+        publishingRepository({
+          GITHUB_REPOSITORY: repository,
+          ASTRLINK_RELEASE_REPOSITORY: repository,
+        }),
+      ).toBe(repository);
+    }
+    expect(() => publishingRepository({})).toThrow(
+      "current Actions repository",
+    );
+    expect(() =>
+      publishingRepository({
+        GITHUB_REPOSITORY: "lauchiwa/AstrLink",
+        ASTRLINK_RELEASE_REPOSITORY: "Calcium-Ion/AstrLink",
+      }),
+    ).toThrow("current Actions repository");
+  });
+
+  it("binds every packaging workflow and publication to its own repository", () => {
+    for (const file of [
+      "release",
+      "macos-package",
+      "windows-package",
+      "linux-package",
+    ]) {
+      const workflow = readFileSync(
+        new URL(`../../../.github/workflows/${file}.yml`, import.meta.url),
+        "utf8",
+      );
+      expect(workflow).toContain(
+        "ASTRLINK_RELEASE_REPOSITORY: ${{ github.repository }}",
+      );
+      expect(workflow).not.toContain(
+        "if: github.repository == 'Calcium-Ion/AstrLink'",
+      );
+    }
+  });
+
   it("round-trips real Tauri CLI signatures through all four platform manifests", () => {
     const root = directory();
     mkdirSync(path.join(root, "src-tauri"));
@@ -229,6 +328,7 @@ describe("release updates", () => {
         path.join(dir, `${target}.json`),
         JSON.stringify({
           target,
+          repository: releaseRepository(),
           tag: "v1.0.0",
           version: "1.0.0",
           file: filename,
@@ -254,6 +354,46 @@ describe("release updates", () => {
     expect(manifest.platforms[targets[0]].url).toContain(
       "/releases/download/v1.0.0/",
     );
+    for (const repository of ["lauchiwa/AstrLink", "Calcium-Ion/AstrLink"]) {
+      for (const target of targets) {
+        const file = path.join(input, target, `${target}.json`);
+        const fragment = JSON.parse(readFileSync(file, "utf8"));
+        fragment.repository = repository;
+        writeFileSync(file, JSON.stringify(fragment));
+      }
+      const forkManifest = collectRelease(
+        input,
+        path.join(directory(), "release"),
+        "v1.0.0",
+        keys.publicKey,
+        "",
+        new Date(),
+        repository,
+      );
+      for (const target of targets)
+        expect(forkManifest.platforms[target].url).toContain(
+          `https://github.com/${repository}/releases/download/v1.0.0/`,
+        );
+      const wrongOutput = path.join(directory(), "wrong-repository");
+      expect(() =>
+        collectRelease(
+          input,
+          wrongOutput,
+          "v1.0.0",
+          keys.publicKey,
+          "",
+          new Date(),
+          "another-owner/AstrLink",
+        ),
+      ).toThrow("Repository mismatch");
+      expect(existsSync(wrongOutput)).toBe(false);
+    }
+    for (const target of targets) {
+      const file = path.join(input, target, `${target}.json`);
+      const fragment = JSON.parse(readFileSync(file, "utf8"));
+      fragment.repository = releaseRepository();
+      writeFileSync(file, JSON.stringify(fragment));
+    }
     expect(() =>
       collectRelease(
         input,

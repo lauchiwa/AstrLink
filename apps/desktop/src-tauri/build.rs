@@ -1,4 +1,25 @@
+mod release_repository;
+
 fn main() {
+    println!("cargo:rerun-if-changed=../release-repository.json");
+    println!("cargo:rerun-if-changed=release_repository.rs");
+    println!("cargo:rerun-if-env-changed=ASTRLINK_RELEASE_REPOSITORY");
+    println!("cargo:rerun-if-env-changed=GITHUB_REPOSITORY");
+    let configuration: serde_json::Value =
+        serde_json::from_str(include_str!("../release-repository.json"))
+            .expect("invalid release repository configuration");
+    let repository = release_repository::release_repository(
+        std::env::var("ASTRLINK_RELEASE_REPOSITORY").ok().as_deref(),
+        std::env::var("GITHUB_REPOSITORY").ok().as_deref(),
+        configuration["repository"]
+            .as_str()
+            .expect("release repository configuration requires a repository slug"),
+    )
+    .expect("invalid release repository");
+    println!("cargo:rustc-env=ASTRLINK_RELEASE_REPOSITORY={repository}");
+    println!(
+        "cargo:rustc-env=ASTRLINK_RELEASE_API=https://api.github.com/repos/{repository}/releases"
+    );
     println!("cargo:rerun-if-env-changed=TAURI_UPDATER_PUBLIC_KEY");
     let update_key = std::env::var("TAURI_UPDATER_PUBLIC_KEY").unwrap_or_default();
     assert!(

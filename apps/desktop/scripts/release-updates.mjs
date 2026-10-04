@@ -12,7 +12,30 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const desktop = fileURLToPath(new URL("..", import.meta.url));
-const repository = "Calcium-Ion/AstrLink";
+export function releaseRepository(env = process.env) {
+  const repository =
+    env.ASTRLINK_RELEASE_REPOSITORY ??
+    env.GITHUB_REPOSITORY ??
+    readJSON(path.join(desktop, "release-repository.json")).repository;
+  requireValue(
+    typeof repository === "string" &&
+      /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9_.-]{1,100}$/.test(
+        repository.trim(),
+      ) &&
+      ![".", ".."].includes(repository.trim().split("/")[1]),
+    "Release repository must be a GitHub owner/repository slug",
+  );
+  return repository.trim();
+}
+
+export function publishingRepository(env = process.env) {
+  const repository = releaseRepository(env);
+  requireValue(
+    env.GITHUB_REPOSITORY === repository,
+    "Release publishing is restricted to the current Actions repository",
+  );
+  return repository;
+}
 export const targets = [
   "darwin-aarch64",
   "darwin-x86_64",
@@ -122,6 +145,7 @@ export function verifyUpdateSignature(bytes, signature, publicKey) {
 }
 
 export function signingEnvironment(env = process.env) {
+  releaseRepository(env);
   requireValue(
     env.TAURI_UPDATER_PUBLIC_KEY?.trim(),
     "Missing Actions variable TAURI_UPDATER_PUBLIC_KEY",
@@ -183,6 +207,7 @@ export function stageUpdate(root, target, tag, env = process.env) {
     tag,
     version,
     target,
+    repository: releaseRepository(env),
     file: path.basename(file),
     signature,
     sha256: sha256(bytes),
@@ -204,7 +229,9 @@ export function collectRelease(
   publicKey,
   notes = "",
   now = new Date(),
+  repository = releaseRepository(),
 ) {
+  repository = releaseRepository({ ASTRLINK_RELEASE_REPOSITORY: repository });
   const { version } = releaseVersion(tag),
     files = filesIn(input);
   const platforms = {},
@@ -218,6 +245,10 @@ export function collectRelease(
       `Missing or duplicate platform: ${target}`,
     );
     const fragment = readJSON(fragments[0]);
+    requireValue(
+      fragment.repository === repository,
+      `Repository mismatch: ${target}`,
+    );
     requireValue(
       fragment.version === version &&
         fragment.tag === tag &&
@@ -276,10 +307,7 @@ function gh(args) {
   });
 }
 export function publishRelease(input, output, tag, env = process.env) {
-  requireValue(
-    env.GITHUB_REPOSITORY === repository,
-    "Release publishing is restricted to the project repository",
-  );
+  const repository = publishingRepository(env);
   const { prerelease } = releaseVersion(tag);
   const notes = JSON.parse(
     gh([
@@ -297,6 +325,8 @@ export function publishRelease(input, output, tag, env = process.env) {
     tag,
     requireValue(env.TAURI_UPDATER_PUBLIC_KEY, "Missing update public key"),
     notes,
+    new Date(),
+    repository,
   );
   const notesFile = path.join(output, "release-notes.txt");
   writeFileSync(notesFile, notes);
