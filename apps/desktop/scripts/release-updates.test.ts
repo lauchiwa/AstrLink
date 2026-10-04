@@ -181,6 +181,31 @@ describe("release updates", () => {
     }
   });
 
+  it("retries an existing release tag without building a moving branch", () => {
+    const workflow = (name: string) =>
+      readFileSync(
+        new URL(`../../../.github/workflows/${name}.yml`, import.meta.url),
+        "utf8",
+      );
+    const release = workflow("release");
+    expect(release).toContain("workflow_dispatch:");
+    expect(release).toContain(
+      "RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}",
+    );
+    expect(
+      release.match(
+        /ref: refs\/tags\/\$\{\{ inputs.release_tag \|\| github.ref_name \}\}/g,
+      ),
+    ).toHaveLength(2);
+    for (const name of ["macos-package", "linux-package", "windows-package"]) {
+      expect(
+        workflow(name).match(
+          /ref: \$\{\{ inputs.release_tag && format\('refs\/tags\/\{0\}', inputs.release_tag\) \|\| github.ref \}\}/g,
+        ),
+      ).toHaveLength(name === "windows-package" ? 2 : 1);
+    }
+  });
+
   it("round-trips real Tauri CLI signatures through all four platform manifests", () => {
     const root = directory();
     mkdirSync(path.join(root, "src-tauri"));
