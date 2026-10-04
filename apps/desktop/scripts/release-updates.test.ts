@@ -181,6 +181,15 @@ describe("release updates", () => {
     }
   });
 
+  it("does not force Finder layout on headless macOS runners", () => {
+    const workflow = readFileSync(
+      new URL("../../../.github/workflows/macos-package.yml", import.meta.url),
+      "utf8",
+    );
+    expect(workflow).not.toContain('TAURI_BUNDLER_DMG_IGNORE_CI: "true"');
+    expect(workflow).toContain("tauri build --verbose --ci --bundles app,dmg");
+  });
+
   it("retries an existing release tag without building a moving branch", () => {
     const workflow = (name: string) =>
       readFileSync(
