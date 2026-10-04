@@ -288,6 +288,13 @@ func TestReArmingResetsConsentAndStorageFailureNeverPublishes(t *testing.T) {
 		if _, armed := registry.Armed(fixtureService); !armed {
 			t.Fatal("a storage failure closed the window")
 		}
+		profiles.failWith = nil
+		if _, published, err := registry.Observe(ctx, fixtureService, codexRequest(), nil); !published || err != nil {
+			t.Fatalf("retry after storage recovery = %t, %v", published, err)
+		}
+		if len(profiles.snapshot()) != 1 {
+			t.Fatal("storage recovery did not save exactly one candidate")
+		}
 	})
 
 	t.Run("invalid arm input", func(t *testing.T) {
@@ -299,6 +306,130 @@ func TestReArmingResetsConsentAndStorageFailureNeverPublishes(t *testing.T) {
 			t.Fatal("an invalid service id was armed")
 		}
 	})
+}
+
+// blockingProfiles makes the publication race deterministic without holding
+// the registry mutex or blocking another service's independent capture.
+type blockingProfiles struct {
+	memoryProfiles
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (profiles *blockingProfiles) CreateIdentityProfile(ctx context.Context, candidate contract.IdentityProfile) (storage.IdentityProfileRecord, error) {
+	if candidate.ServiceID == fixtureService {
+		profiles.once.Do(func() { close(profiles.started) })
+		<-profiles.release
+	}
+	return profiles.memoryProfiles.CreateIdentityProfile(ctx, candidate)
+}
+
+func TestCaptureReservationIsScopedToTheConsentWindow(t *testing.T) {
+	for _, replacement := range []string{"same client", "different client", "disarm"} {
+		t.Run(replacement, func(t *testing.T) {
+			profiles := &blockingProfiles{started: make(chan struct{}), release: make(chan struct{})}
+			registry, _ := testRegistry(t, profiles)
+			ctx := context.Background()
+			if _, err := registry.Arm(fixtureService, contract.IdentityClientCodexCLI, 0); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() {
+				_, published, err := registry.Observe(ctx, fixtureService, codexRequest(), nil)
+				if err == nil && !published {
+					err = errors.New("reserved observation did not publish")
+				}
+				done <- err
+			}()
+			<-profiles.started
+			var release sync.Once
+			defer release.Do(func() { close(profiles.release) })
+
+			// While publication is in flight, status remains armed for UI polling,
+			// but the inference gate must not admit another observation.
+			if status := registry.Status(fixtureService); !status.Armed || status.CapturedProfile != "" {
+				t.Fatalf("in-flight status = %+v", status)
+			}
+			if _, armed := registry.Armed(fixtureService); armed {
+				t.Fatal("a reserved window admitted another observation")
+			}
+			if _, published, err := registry.Observe(ctx, fixtureService, codexRequest(), nil); published || err != nil {
+				t.Fatalf("concurrent observation = %t, %v", published, err)
+			}
+			// Storage for one service must not block another service's capture.
+			if _, err := registry.Arm(otherService, contract.IdentityClientCodexCLI, 0); err != nil {
+				t.Fatal(err)
+			}
+			if _, published, err := registry.Observe(ctx, otherService, codexRequest(), nil); !published || err != nil {
+				t.Fatalf("other service capture = %t, %v", published, err)
+			}
+
+			client := contract.IdentityClientCodexCLI
+			if replacement == "disarm" {
+				registry.Disarm(fixtureService)
+			} else {
+				if replacement == "different client" {
+					client = contract.IdentityClientClaudeCode
+				}
+				if _, err := registry.Arm(fixtureService, client, 0); err != nil {
+					t.Fatal(err)
+				}
+			}
+			release.Do(func() { close(profiles.release) })
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			status := registry.Status(fixtureService)
+			if status.CapturedProfile != "" || status.Rejected != 0 {
+				t.Fatalf("old publication altered a replacement window: %+v", status)
+			}
+			if replacement == "disarm" {
+				if status.Armed || status.Client != "" {
+					t.Fatalf("old publication restored revoked consent: %+v", status)
+				}
+			} else if !status.Armed || status.Client != client {
+				t.Fatalf("old publication closed new consent: %+v", status)
+			}
+		})
+	}
+}
+
+func TestConsentIsRecheckedBeforePublishing(t *testing.T) {
+	for _, change := range []string{"same client", "different client", "disarm", "expiry"} {
+		t.Run(change, func(t *testing.T) {
+			profiles := &memoryProfiles{}
+			registry, now := testRegistry(t, profiles)
+			if _, err := registry.Arm(fixtureService, contract.IdentityClientCodexCLI, 0); err != nil {
+				t.Fatal(err)
+			}
+			// ID minting follows recognition but precedes the storage reservation.
+			registry.newID = func() (contract.IdentityProfileID, error) {
+				switch change {
+				case "same client", "different client":
+					client := contract.IdentityClientCodexCLI
+					if change == "different client" {
+						client = contract.IdentityClientClaudeCode
+					}
+					if _, err := registry.Arm(fixtureService, client, 0); err != nil {
+						return "", err
+					}
+				case "disarm":
+					registry.Disarm(fixtureService)
+				case "expiry":
+					*now = now.Add(DefaultWindow)
+				}
+				return "identity_abandoned", nil
+			}
+			id, published, err := registry.Observe(context.Background(), fixtureService, codexRequest(), nil)
+			if id != "" || published || err != nil || len(profiles.snapshot()) != 0 {
+				t.Fatalf("stale consent published = %q, %t, %v; saved %d", id, published, err, len(profiles.snapshot()))
+			}
+			if status := registry.Status(fixtureService); status.CapturedProfile != "" {
+				t.Fatalf("stale consent changed window status: %+v", status)
+			}
+		})
+	}
 }
 
 func TestConcurrentObservationsPublishAtMostOneCandidate(t *testing.T) {
@@ -326,10 +457,8 @@ func TestConcurrentObservationsPublishAtMostOneCandidate(t *testing.T) {
 	}
 	start.Done()
 	done.Wait()
-	// Extraction runs outside the lock, so concurrent callers may both reach
-	// storage; the window must still converge on one captured reference.
-	if publishedCount < 1 {
-		t.Fatal("no concurrent observation published")
+	if publishedCount != 1 || len(profiles.snapshot()) != 1 {
+		t.Fatalf("one window published %d observations and saved %d candidates", publishedCount, len(profiles.snapshot()))
 	}
 	if status := registry.Status(fixtureService); status.Armed || status.CapturedProfile == "" {
 		t.Fatalf("status after concurrent observations = %+v", status)

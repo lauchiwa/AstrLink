@@ -52,6 +52,7 @@ type window struct {
 	armedAt    time.Time
 	expiresAt  time.Time
 	captured   contract.IdentityProfileID
+	publishing bool
 	rejections int
 }
 
@@ -133,7 +134,7 @@ func (registry *Registry) Armed(serviceID contract.ServiceID) (contract.Identity
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
 	open := registry.openLocked(serviceID)
-	if open == nil {
+	if open == nil || open.publishing {
 		return "", false
 	}
 	return open.client, true
@@ -158,7 +159,7 @@ func (registry *Registry) Observe(
 	}
 	registry.mu.Lock()
 	open := registry.openLocked(serviceID)
-	if open == nil {
+	if open == nil || open.publishing {
 		registry.mu.Unlock()
 		return "", false, nil
 	}
@@ -171,7 +172,7 @@ func (registry *Registry) Observe(
 		defer registry.mu.Unlock()
 		// Re-read the window: it may have been disarmed or replaced while the
 		// extraction ran, and a replaced window must not inherit rejections.
-		if current := registry.openLocked(serviceID); current != nil && current.client == client {
+		if current := registry.openLocked(serviceID); current == open && !current.publishing {
 			current.rejections++
 			if current.rejections >= MaxRejections {
 				current.expiresAt = registry.now().UTC()
@@ -184,25 +185,35 @@ func (registry *Registry) Observe(
 	if err != nil {
 		return "", false, err
 	}
+	// Reserve this exact consent window before storage I/O. Extraction can run
+	// concurrently, but only one observation may publish. A replaced, expired
+	// or disarmed window cannot authorize a write that has not started yet.
+	registry.mu.Lock()
+	if current := registry.openLocked(serviceID); current != open || open.publishing {
+		registry.mu.Unlock()
+		return "", false, nil
+	}
+	open.publishing = true
 	observed := registry.now().UTC()
+	registry.mu.Unlock()
+
 	record, err := registry.profiles.CreateIdentityProfile(ctx, contract.IdentityProfile{
 		ID: id, ServiceID: serviceID, Client: client,
 		Source: contract.IdentityProfileRequestCapture, Fingerprint: fingerprint,
 		ObservedAt: &observed,
 	})
-	if err != nil {
-		return "", false, err
-	}
-
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
-	// Close the window even if it was replaced meanwhile: a published candidate
-	// means this request was already sampled, and one request must not publish
-	// twice across retries.
-	if current, exists := registry.windows[serviceID]; exists {
-		current.captured = record.Profile.ID
-		current.expiresAt = registry.now().UTC()
+	open.publishing = false
+	if err != nil {
+		// Release the reservation so a still-open window can retry. A newer
+		// window is independent and must not inherit this observation's state.
+		return "", false, err
 	}
+	// Once storage starts, this observation may finish its reserved write, but
+	// it must never close or overwrite consent granted to a newer window.
+	open.captured = record.Profile.ID
+	open.expiresAt = registry.now().UTC()
 	return record.Profile.ID, true, nil
 }
 
