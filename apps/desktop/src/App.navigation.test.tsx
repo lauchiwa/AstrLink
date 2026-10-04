@@ -28,6 +28,7 @@ const bridgeMocks = vi.hoisted(() => ({
     .mockRejectedValue(new Error("tray unavailable in tests")),
   trayAction: vi.fn().mockRejectedValue(new Error("tray unavailable in tests")),
   getRoutingSettings: vi.fn(),
+  updateRoutingSettings: vi.fn(),
   getServiceOrder: vi
     .fn()
     .mockResolvedValue({ service_ids: [], etag: '"order"' }),
@@ -110,6 +111,7 @@ import { defaultTrayPreferences } from "./preferences-model";
 import { defaultFailurePolicy } from "./failure-policy-model";
 import { defaultPrivacyKindRules } from "./privacy-policy-model";
 import { ONBOARDING_STORAGE_KEY } from "./use-onboarding";
+import { routingAutosaveDelay } from "./RoutingSettingsPanel";
 
 const readySnapshot: AppSnapshot = {
   app_version: "0.1.0",
@@ -311,6 +313,10 @@ describe("App workspace navigation", () => {
       strategy: "retry_first",
       max_attempts: 6,
     });
+    bridgeMocks.updateRoutingSettings.mockImplementation(async (patch) => ({
+      ...(await bridgeMocks.getRoutingSettings()),
+      ...patch,
+    }));
     bridgeMocks.getCoreStatus.mockResolvedValue(readySnapshot);
     bridgeMocks.listServices.mockResolvedValue({
       items: [
@@ -1737,7 +1743,38 @@ describe("App workspace navigation", () => {
     expect(document.querySelector('[role="alertdialog"]')).toBeNull();
     expect(workspaceHeading().textContent).toBe("路由");
   });
+  it("settles routing autosave before allowing navigation", async () => {
+    vi.useFakeTimers();
+    await renderApp();
+    await act(async () => button("路由").click());
+    await act(async () => button("恢复与重试").click());
+    const input = [...container.querySelectorAll("label")]
+      .find(
+        (item) =>
+          item.querySelector(":scope > span")?.textContent === "最多重试几次",
+      )
+      ?.querySelector("input");
+    if (!input) throw new Error("Missing routing retry input");
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(
+        HTMLInputElement.prototype,
+        "value",
+      )!.set!.call(input, "4");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(routingAutosaveDelay);
+    });
+    expect(bridgeMocks.updateRoutingSettings).toHaveBeenCalledOnce();
+    expect(input.value).toBe("4");
+    await act(async () => button("概览").click());
+    expect(document.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(workspaceHeading().textContent).toBe("运行概览");
+  });
+
   it("protects default-policy drafts when leaving routing", async () => {
+    // Keep the autosave deadline from depending on the CI runner's speed.
+    vi.useFakeTimers();
     await renderApp();
     await act(async () => button("路由").click());
     await act(async () => button("恢复与重试").click());
@@ -1760,6 +1797,7 @@ describe("App workspace navigation", () => {
     expect(workspaceHeading().textContent).toBe("路由");
     await act(async () => button("继续编辑").click());
     expect(input.value).toBe("4");
+    expect(bridgeMocks.updateRoutingSettings).not.toHaveBeenCalled();
     await act(async () => button("概览").click());
     await act(async () => button("放弃修改并离开").click());
     expect(workspaceHeading().textContent).toBe("运行概览");
