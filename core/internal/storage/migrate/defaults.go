@@ -794,13 +794,18 @@ CHECK(sealed IN (0, 1) AND (sealed = 0 OR length(credential_value) >= 30))`,
 		{Version: 47, Name: "request_conversion_diagnostics", Statements: []string{
 			`ALTER TABLE request_records ADD COLUMN conversion_diagnostics_json TEXT`,
 		}},
-		{Version: 48, Name: "service_identity_profiles", Statements: []string{
-			`CREATE TABLE service_identity_profiles (
+		{Version: 48, Name: "request_first_answer_timing", Statements: []string{
+			`ALTER TABLE request_records ADD COLUMN first_answer_ms INTEGER CHECK(first_answer_ms IS NULL OR first_answer_ms >= 0)`,
+		}},
+		// IF NOT EXISTS preserves profiles from the fork's original migration 48.
+		// Up reconciles that specific legacy history before applying this step.
+		{Version: 49, Name: "service_identity_profiles", Statements: []string{
+			`CREATE TABLE IF NOT EXISTS service_identity_profiles (
     id TEXT PRIMARY KEY,
     service_id TEXT NOT NULL REFERENCES services(id) ON DELETE CASCADE,
     document_json TEXT NOT NULL
 )`,
-			`CREATE INDEX idx_service_identity_profiles_service_id ON service_identity_profiles(service_id, id)`,
+			`CREATE INDEX IF NOT EXISTS idx_service_identity_profiles_service_id ON service_identity_profiles(service_id, id)`,
 		}},
 	}
 }

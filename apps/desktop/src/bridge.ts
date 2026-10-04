@@ -928,8 +928,8 @@ export interface ClientConfigTarget {
 }
 
 /**
- * What AstrLink wrote to Claude Code and Codex. Outside the desktop there are
- * no local clients to configure.
+ * What AstrLink wrote to Claude Code, Codex, and Pi. Outside the desktop there
+ * are no local clients to configure.
  */
 export async function getClientConfigStatus(
   inferenceUrl: string | null,

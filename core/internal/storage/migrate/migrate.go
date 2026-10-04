@@ -145,6 +145,11 @@ func (runner *Runner) Up(ctx context.Context) (err error) {
 	if currentVersion > latestVersion {
 		return fmt.Errorf("%w: database=%d core=%d", ErrDatabaseNewer, currentVersion, latestVersion)
 	}
+	if currentVersion >= 48 {
+		if err = runner.reconcileIdentityProfileHistory(ctx, transaction); err != nil {
+			return err
+		}
+	}
 	if err = runner.verifyHistory(ctx, transaction, currentVersion); err != nil {
 		return err
 	}
