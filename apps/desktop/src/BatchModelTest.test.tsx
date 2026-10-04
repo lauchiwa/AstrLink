@@ -109,7 +109,7 @@ it("runs selected models, shows original failures and retries only failed items"
     "alpha",
     "beta",
   ]);
-  expect(modelRow("alpha").textContent).toContain("成功0.23 s1.25 s");
+  expect(modelRow("alpha").textContent).toContain("完成0.23 s1.25 s");
   expect(modelRow("beta").textContent).toContain("失败—1.25 s");
   await act(async () =>
     modelRow("beta")
@@ -130,11 +130,39 @@ it("runs selected models, shows original failures and retries only failed items"
     "beta",
     "beta",
   ]);
-  expect(batch().textContent).toContain("成功 2");
-  expect(modelRow("alpha").textContent).toContain("成功");
+  expect(batch().textContent).toContain("请求完成 2");
+  expect(modelRow("alpha").textContent).toContain("完成");
   await act(async () => button("单模型").click());
   await act(async () => button("批量模型").click());
-  expect(modelRow("beta").textContent).toContain("成功");
+  expect(modelRow("beta").textContent).toContain("完成");
+});
+
+it("counts a valid HTTP 200 restriction reply as completed, not model availability", async () => {
+  const output = "This model requires an authorized client.";
+  mocks.testService.mockImplementation(
+    async (_id: string, input: ServiceTestInput) => ({
+      ...result(input.model),
+      output,
+      raw_response: JSON.stringify({ output }),
+      response_content_type: "application/json",
+    }),
+  );
+  await open(["alpha"]);
+  await act(async () => button("测试 1 个模型").click());
+  expect(batch().textContent).toContain("请求完成 1");
+  expect(modelRow("alpha").textContent).toContain("完成");
+  expect(
+    modelRow("alpha").querySelector("[data-tone]")?.getAttribute("data-tone"),
+  ).toBe("neutral");
+  await act(async () => button("结果说明").click());
+  expect(document.body.textContent).toContain("不代表模型可用");
+  await act(async () => button("结果说明").click());
+  await act(async () => button("查看 alpha 的测试响应").click());
+  await act(async () => {
+    await vi.dynamicImportSettled();
+  });
+  expect(batch().textContent).toContain(output);
+  expect(batch().textContent).not.toContain("测试成功");
 });
 
 it("blocks mode switches and close until active tests finish, and stops pending models", async () => {

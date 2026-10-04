@@ -68,17 +68,22 @@ export function ServiceTestResultView({
               tone={
                 running
                   ? "pending"
-                  : result?.ok
-                    ? "positive"
-                    : result || error
-                      ? "negative"
-                      : "neutral"
+                  : result || error
+                    ? result?.ok
+                      ? "neutral"
+                      : "negative"
+                    : "neutral"
               }
             >
               {status}
             </StatusBadge>
             {result && result.status_code > 0 ? (
               <Badge variant="outline">HTTP {result.status_code}</Badge>
+            ) : null}
+            {result?.ok && !running ? (
+              <HelpPopover label={t("serviceTest.resultHelp")} inDialog>
+                <p>{t("serviceTest.completionHint")}</p>
+              </HelpPopover>
             ) : null}
           </div>
         </ActionGroup>

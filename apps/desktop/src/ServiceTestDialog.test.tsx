@@ -434,7 +434,7 @@ it("contains parser failures within the response, preserves raw text, and allows
   );
   expect(dialog.querySelector("script")).toBeNull();
   expect(document.body.textContent).not.toContain("AstrLink 界面遇到问题");
-  expect(dialog.textContent).toContain("测试成功");
+  expect(dialog.textContent).toContain("请求完成");
   expect(button("开始测试").disabled).toBe(false);
   expect(button("关闭").disabled).toBe(false);
 
@@ -456,6 +456,58 @@ it("contains parser failures within the response, preserves raw text, and allows
   await act(async () => button("关闭").click());
   expect(onClose).toHaveBeenCalledOnce();
 });
+
+it.each([
+  "OK",
+  "本站该模型仅限指定客户端使用，当前客户端未被识别为授权客户端。",
+  "Quota exceeded. Please try again later.",
+])(
+  "reports protocol completion without judging reply content: %s",
+  async (output) => {
+    mocks.testService.mockResolvedValue({
+      service_id: service.id,
+      protocol: "openai.chat",
+      model: "test-model",
+      stream: true,
+      ok: true,
+      status_code: 200,
+      duration_ms: 100,
+      output,
+      raw_response: JSON.stringify({ output }),
+      response_content_type: "application/json",
+    });
+    await act(async () =>
+      root.render(<ServiceTestDialog service={service} onClose={() => {}} />),
+    );
+    const dialog = document.querySelector('[role="dialog"]')!;
+    expect(dialog.textContent).toContain("暂无回复内容");
+    expect(dialog.textContent).not.toContain("serviceTest.empty");
+    await act(async () => button("开始测试").click());
+    await act(async () => {
+      await vi.dynamicImportSettled();
+    });
+    expect(dialog.textContent).toContain("请求完成");
+    expect(dialog.textContent).toContain("HTTP 200");
+    expect(dialog.textContent).toContain(output);
+    expect(dialog.textContent).not.toContain("测试成功");
+    expect(
+      dialog
+        .querySelector('[role="status"] [data-tone]')
+        ?.getAttribute("data-tone"),
+    ).toBe("neutral");
+    await act(async () =>
+      document
+        .querySelector<HTMLButtonElement>('button[aria-label="结果说明"]')!
+        .click(),
+    );
+    expect(document.body.textContent).toContain("不代表模型可用");
+    expect(document.body.textContent).toContain("限额或客户端限制提示");
+    await act(async () => button("原文").click());
+    expect(dialog.querySelector("pre")?.textContent).toBe(
+      JSON.stringify({ output }),
+    );
+  },
+);
 
 it("shows the failure reason alongside partial output from an interrupted stream", async () => {
   mocks.testService.mockResolvedValue({
@@ -480,4 +532,15 @@ it("shows the failure reason alongside partial output from an interrupted stream
   const dialog = document.querySelector('[role="dialog"]')!;
   expect(dialog.textContent).toContain("Partial reply");
   expect(dialog.textContent).toContain("Provider response was interrupted.");
+  expect(dialog.textContent).toContain("测试失败");
+  expect(dialog.textContent).toContain("HTTP 200");
+  expect(dialog.textContent).not.toContain("请求完成");
+  expect(
+    dialog
+      .querySelector('[role="status"] [data-tone]')
+      ?.getAttribute("data-tone"),
+  ).toBe("negative");
+  expect(
+    dialog.querySelector('[role="status"] button[aria-label="结果说明"]'),
+  ).toBeNull();
 });

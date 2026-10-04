@@ -437,7 +437,7 @@ describe("ServiceManager", () => {
         output: "**OK**",
       }),
     );
-    expect(dialog.textContent).toContain("测试成功");
+    expect(dialog.textContent).toContain("请求完成");
     expect(dialog.textContent).toContain("0.12 s");
     expect(dialog.textContent).toContain("HTTP 200");
     await act(async () => {

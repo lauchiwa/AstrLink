@@ -14,6 +14,7 @@ import { ServiceTestResultView } from "./ServiceTestResultView";
 import { EmptyState } from "./components/EmptyState";
 import { FilterSelect } from "./components/FilterSelect";
 import { FormMessage } from "./components/FormMessage";
+import { HelpPopover } from "./components/HelpPopover";
 import { ListToolbar } from "./components/ListToolbar";
 import { Panel } from "./components/Panel";
 import { StatusBadge } from "./components/StatusBadge";
@@ -294,7 +295,7 @@ export function BatchModelTest({
                       { done: completed.length, total: entries.length },
                     )}
                   </span>
-                  <span className="text-success-foreground">
+                  <span className="text-muted-foreground">
                     {t("batchTest.successCount", { count: succeeded })}
                   </span>
                   <span className="text-danger-foreground">
@@ -346,7 +347,17 @@ export function BatchModelTest({
                         />
                       </TableHead>
                       <TableHead>{t("serviceTest.model")}</TableHead>
-                      <TableHead>{t("batchTest.status")}</TableHead>
+                      <TableHead>
+                        <div className="flex items-center gap-1">
+                          {t("batchTest.status")}
+                          <HelpPopover
+                            label={t("serviceTest.resultHelp")}
+                            inDialog
+                          >
+                            <p>{t("serviceTest.completionHint")}</p>
+                          </HelpPopover>
+                        </div>
+                      </TableHead>
                       <TableHead>{t("serviceTest.firstToken")}</TableHead>
                       <TableHead>{t("serviceTest.total")}</TableHead>
                       <TableHead className="w-16">
@@ -360,13 +371,11 @@ export function BatchModelTest({
                         ? rows[model]
                         : undefined;
                       const tone =
-                        row?.state === "success"
-                          ? "positive"
-                          : row?.state === "failed"
-                            ? "negative"
-                            : row?.state === "running"
-                              ? "pending"
-                              : "neutral";
+                        row?.state === "failed"
+                          ? "negative"
+                          : row?.state === "running"
+                            ? "pending"
+                            : "neutral";
                       return (
                         <TableRow key={model}>
                           <TableCell>
