@@ -9,6 +9,7 @@ permissions:
 
 env:
   ASTRLINK_RELEASE_REPOSITORY: ${{ github.repository }}
+  MACOS_SIGNING_MODE: ${{ vars.MACOS_SIGNING_MODE }}
 
 concurrency:
   group: release-${{ github.ref }}

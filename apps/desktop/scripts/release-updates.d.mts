@@ -1,3 +1,6 @@
+export type MacOSSigningMode = "adhoc" | "developer-id";
+export function macOSSigningMode(env?: NodeJS.ProcessEnv): MacOSSigningMode;
+
 export type UpdateTarget =
   | "darwin-aarch64"
   | "darwin-x86_64"
@@ -45,6 +48,7 @@ export function collectRelease(
   notes?: string,
   now?: Date,
   repository?: string,
+  macosSigningMode?: MacOSSigningMode,
 ): ReleaseManifest;
 export function publishRelease(
   input: string,

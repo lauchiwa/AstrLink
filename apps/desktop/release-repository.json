@@ -1,3 +1,4 @@
 {
-  "repository": "lauchiwa/AstrLink"
+  "repository": "lauchiwa/AstrLink",
+  "macos_signing_mode": "adhoc"
 }

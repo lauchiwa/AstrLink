@@ -36,6 +36,26 @@ export function publishingRepository(env = process.env) {
   );
   return repository;
 }
+export function macOSSigningMode(env = process.env) {
+  const configured = env.MACOS_SIGNING_MODE;
+  const mode =
+    configured === undefined || configured === ""
+      ? readJSON(path.join(desktop, "release-repository.json"))
+          .macos_signing_mode
+      : configured.trim();
+  requireValue(
+    mode === "adhoc" || mode === "developer-id",
+    "MACOS_SIGNING_MODE must be adhoc or developer-id",
+  );
+  return mode;
+}
+
+const adhocNotice = [
+  "## macOS installation notice: not notarized",
+  "The macOS downloads are ad-hoc signed, not Developer ID signed or notarized by Apple. Apple has not performed a notarization malware scan. Update packages still require independent Tauri signatures and checksum verification.",
+  "Only install downloads you trust. After attempting to open the app, use System Settings > Privacy & Security > Open Anyway if macOS blocks it. Managed Macs may prohibit this exception. Do not disable Gatekeeper system-wide. Updates may require approval again.",
+].join("\n\n");
+
 export const targets = [
   "darwin-aarch64",
   "darwin-x86_64",
@@ -146,6 +166,7 @@ export function verifyUpdateSignature(bytes, signature, publicKey) {
 
 export function signingEnvironment(env = process.env) {
   releaseRepository(env);
+  macOSSigningMode(env);
   requireValue(
     env.TAURI_UPDATER_PUBLIC_KEY?.trim(),
     "Missing Actions variable TAURI_UPDATER_PUBLIC_KEY",
@@ -170,7 +191,7 @@ export function stageUpdate(root, target, tag, env = process.env) {
   let file;
   if (target.startsWith("darwin-")) {
     const arch = target === "darwin-aarch64" ? "arm64" : "x86_64";
-    // Created by the macOS workflow only AFTER notarization and stapling.
+    // Created only after the selected signing policy and package checks pass.
     file = path.join(output, `AstrLink-macOS-${arch}.app.tar.gz`);
   } else {
     const windows = target.startsWith("windows-");
@@ -208,6 +229,9 @@ export function stageUpdate(root, target, tag, env = process.env) {
     version,
     target,
     repository: releaseRepository(env),
+    ...(target.startsWith("darwin-")
+      ? { macos_signing_mode: macOSSigningMode(env) }
+      : {}),
     file: path.basename(file),
     signature,
     sha256: sha256(bytes),
@@ -230,8 +254,10 @@ export function collectRelease(
   notes = "",
   now = new Date(),
   repository = releaseRepository(),
+  macosSigningMode = macOSSigningMode(),
 ) {
   repository = releaseRepository({ ASTRLINK_RELEASE_REPOSITORY: repository });
+  macosSigningMode = macOSSigningMode({ MACOS_SIGNING_MODE: macosSigningMode });
   const { version } = releaseVersion(tag),
     files = filesIn(input);
   const platforms = {},
@@ -245,6 +271,11 @@ export function collectRelease(
       `Missing or duplicate platform: ${target}`,
     );
     const fragment = readJSON(fragments[0]);
+    if (target.startsWith("darwin-"))
+      requireValue(
+        fragment.macos_signing_mode === macosSigningMode,
+        `macOS signing mode mismatch: ${target}`,
+      );
     requireValue(
       fragment.repository === repository,
       `Repository mismatch: ${target}`,
@@ -286,7 +317,15 @@ export function collectRelease(
   }
   mkdirSync(output, { recursive: true });
   for (const [name, file] of assets) cpSync(file, path.join(output, name));
-  const manifest = { version, notes, pub_date: now.toISOString(), platforms };
+  const manifest = {
+    version,
+    notes:
+      macosSigningMode === "adhoc"
+        ? `${adhocNotice}\n\n${notes}`.trim()
+        : notes,
+    pub_date: now.toISOString(),
+    platforms,
+  };
   writeJSON(path.join(output, "latest.json"), manifest);
   writeFileSync(
     path.join(output, "SHA256SUMS"),
@@ -319,7 +358,7 @@ export function publishRelease(input, output, tag, env = process.env) {
       `target_commitish=${env.GITHUB_SHA}`,
     ]),
   ).body;
-  collectRelease(
+  const manifest = collectRelease(
     input,
     output,
     tag,
@@ -327,9 +366,10 @@ export function publishRelease(input, output, tag, env = process.env) {
     notes,
     new Date(),
     repository,
+    macOSSigningMode(env),
   );
   const notesFile = path.join(output, "release-notes.txt");
-  writeFileSync(notesFile, notes);
+  writeFileSync(notesFile, manifest.notes);
   const releases = JSON.parse(
     gh(["api", `repos/${repository}/releases`, "--paginate", "--slurp"]),
   ).flat();

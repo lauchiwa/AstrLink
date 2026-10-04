@@ -14,6 +14,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   collectRelease,
+  macOSSigningMode,
   publishingRepository,
   releaseRepository,
   releaseVersion,
@@ -118,6 +119,22 @@ describe("release updates", () => {
       );
   });
 
+  it("uses the explicit macOS signing policy without credential-based fallback", () => {
+    expect(macOSSigningMode({})).toBe("adhoc");
+    expect(macOSSigningMode({ MACOS_SIGNING_MODE: "" })).toBe("adhoc");
+    expect(macOSSigningMode({ MACOS_SIGNING_MODE: "developer-id" })).toBe(
+      "developer-id",
+    );
+    expect(macOSSigningMode({ MACOS_SIGNING_MODE: " adhoc " })).toBe("adhoc");
+    for (const mode of ["auto", "unsigned", "developer", "adhoc\nINJECTED=1"])
+      expect(() => macOSSigningMode({ MACOS_SIGNING_MODE: mode })).toThrow(
+        "MACOS_SIGNING_MODE",
+      );
+    expect(() =>
+      signingEnvironment({ MACOS_SIGNING_MODE: "unsigned" }),
+    ).toThrow("MACOS_SIGNING_MODE");
+  });
+
   it("allows publishing only to the current Actions repository", () => {
     for (const repository of ["lauchiwa/AstrLink", "Calcium-Ion/AstrLink"]) {
       expect(publishingRepository({ GITHUB_REPOSITORY: repository })).toBe(
@@ -154,6 +171,9 @@ describe("release updates", () => {
       );
       expect(workflow).toContain(
         "ASTRLINK_RELEASE_REPOSITORY: ${{ github.repository }}",
+      );
+      expect(workflow).toContain(
+        "MACOS_SIGNING_MODE: ${{ vars.MACOS_SIGNING_MODE }}",
       );
       expect(workflow).not.toContain(
         "if: github.repository == 'Calcium-Ion/AstrLink'",
@@ -329,6 +349,9 @@ describe("release updates", () => {
         JSON.stringify({
           target,
           repository: releaseRepository(),
+          ...(target.startsWith("darwin-")
+            ? { macos_signing_mode: macOSSigningMode() }
+            : {}),
           tag: "v1.0.0",
           version: "1.0.0",
           file: filename,
@@ -351,6 +374,68 @@ describe("release updates", () => {
       "Release notes",
     );
     expect(Object.keys(manifest.platforms)).toEqual(targets);
+    for (const mode of ["adhoc", "developer-id"] as const) {
+      for (const target of targets.filter((target) =>
+        target.startsWith("darwin-"),
+      )) {
+        const file = path.join(input, target, `${target}.json`);
+        const fragment = JSON.parse(readFileSync(file, "utf8"));
+        fragment.macos_signing_mode = mode;
+        writeFileSync(file, JSON.stringify(fragment));
+      }
+      const collected = collectRelease(
+        input,
+        path.join(directory(), "release"),
+        "v1.0.0",
+        keys.publicKey,
+        "Release notes",
+        new Date(),
+        releaseRepository(),
+        mode,
+      );
+      if (mode === "adhoc") {
+        expect(collected.notes).toContain("not notarized");
+        expect(collected.notes).toContain("Open Anyway");
+        expect(collected.notes).toContain("Release notes");
+        expect(collected.notes).toContain("Do not disable Gatekeeper");
+      } else expect(collected.notes).toBe("Release notes");
+      const wrongOutput = path.join(directory(), "wrong-mode");
+      expect(() =>
+        collectRelease(
+          input,
+          wrongOutput,
+          "v1.0.0",
+          keys.publicKey,
+          "",
+          new Date(),
+          releaseRepository(),
+          mode === "adhoc" ? "developer-id" : "adhoc",
+        ),
+      ).toThrow("signing mode mismatch");
+      expect(existsSync(wrongOutput)).toBe(false);
+    }
+    for (const target of targets.filter((target) =>
+      target.startsWith("darwin-"),
+    )) {
+      const file = path.join(input, target, `${target}.json`);
+      const fragment = JSON.parse(readFileSync(file, "utf8"));
+      fragment.macos_signing_mode = macOSSigningMode();
+      writeFileSync(file, JSON.stringify(fragment));
+    }
+    const mixed = path.join(input, targets[1], `${targets[1]}.json`);
+    const original = readFileSync(mixed, "utf8");
+    const fragment = JSON.parse(original);
+    delete fragment.macos_signing_mode;
+    writeFileSync(mixed, JSON.stringify(fragment));
+    expect(() =>
+      collectRelease(
+        input,
+        path.join(directory(), "missing-mode"),
+        "v1.0.0",
+        keys.publicKey,
+      ),
+    ).toThrow("signing mode mismatch");
+    writeFileSync(mixed, original);
     expect(manifest.platforms[targets[0]].url).toContain(
       "/releases/download/v1.0.0/",
     );
