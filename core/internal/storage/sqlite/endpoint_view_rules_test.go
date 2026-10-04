@@ -39,7 +39,13 @@ func TestLegacyEndpointViewPreservesRequestRules(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "rules.db")
 	store := openTestStore(t, path)
-	defer store.Close()
+	// Capture the variable, not the initial receiver: the restart below replaces
+	// the store, and Windows cannot remove its database until it is closed.
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 
 	want := ruleConnection()
 	service := contract.ServiceFromEndpoint(testEndpoint("service_rules"))
@@ -104,7 +110,9 @@ func TestLegacyEndpointViewPreservesRequestRules(t *testing.T) {
 	}
 
 	// Restarting proves the configuration is persisted, not just cached.
-	store.Close()
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
 	store = openTestStore(t, path)
 	reopened, err := store.GetService(ctx, service.ID)
 	if err != nil {
