@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/guides/upstream-sync-thinking-guide.md", "reason": "校验基线是否仍把上游钉住，以及例外是否就地注明"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "校验 gofmt/vet 与测试约定"}
