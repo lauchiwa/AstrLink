@@ -356,19 +356,11 @@ func (store *Store) CreateAccessToken(ctx context.Context, candidate storagecont
 	if err := validateNewAccessToken(candidate); err != nil {
 		return record, fmt.Errorf("%w: %v", storagecontract.ErrInvalidArgument, err)
 	}
-	transaction, err := store.db.BeginTx(ctx, nil)
-	if err != nil {
-		return record, fmt.Errorf("begin access token create: %w", err)
-	}
-	defer rollbackOnError(transaction, &err)
-	record, err = store.insertAccessTokenTx(ctx, transaction, candidate, store.now().UTC())
-	if err != nil {
-		return storagecontract.AccessTokenMetadata{}, err
-	}
-	if err = transaction.Commit(); err != nil {
-		return storagecontract.AccessTokenMetadata{}, fmt.Errorf("commit access token create: %w", err)
-	}
-	return record, nil
+	// The limit check reads before inserting, so concurrent writers can make
+	// the upgrade fail with SQLITE_BUSY(_SNAPSHOT); retry recounts from scratch.
+	return retryConfigWrite(ctx, store.db, func(ctx context.Context, transaction *sql.Tx) (storagecontract.AccessTokenMetadata, error) {
+		return store.insertAccessTokenTx(ctx, transaction, candidate, store.now().UTC())
+	})
 }
 
 func (store *Store) ListAccessTokens(ctx context.Context) ([]storagecontract.AccessTokenMetadata, error) {
@@ -738,6 +730,11 @@ VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		storagecontract.AccessTokenSourceUser,
 		createdAtText,
 	); err != nil {
+		// Only a constraint failure is a conflict. A busy/snapshot error must
+		// surface unchanged: the stale snapshot cannot decide uniqueness.
+		if !isSQLiteConstraint(err) {
+			return storagecontract.AccessTokenMetadata{}, fmt.Errorf("insert access token metadata: %w", err)
+		}
 		var exists int
 		scanErr := transaction.QueryRowContext(ctx, `SELECT EXISTS(
     SELECT 1 FROM local_access_tokens WHERE id = ? OR name_key = ? OR token_hash = ?

@@ -141,66 +141,66 @@ func (store *Store) UpdateService(
 	if expectedETag == "" {
 		return record, fmt.Errorf("%w: expected ETag is required", storagecontract.ErrInvalidArgument)
 	}
-	transaction, err := store.db.BeginTx(ctx, nil)
-	if err != nil {
-		return record, fmt.Errorf("begin service update: %w", err)
-	}
-	defer rollbackOnError(transaction, &err)
-	var currentDocument string
-	if err = transaction.QueryRowContext(ctx, `SELECT document_json FROM services WHERE id = ?`, service.ID).Scan(&currentDocument); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return record, fmt.Errorf("%w: service %q", storagecontract.ErrNotFound, service.ID)
+	return retryConfigWrite(ctx, store.db, func(ctx context.Context, transaction *sql.Tx) (record storagecontract.ServiceRecord, err error) {
+		// Each retry starts from the caller's input, not a previously normalized attempt.
+		service := service
+		if service.HTTP != nil {
+			connection := *service.HTTP
+			service.HTTP = &connection
 		}
-		return record, fmt.Errorf("read service for update: %w", err)
-	}
-	current, decodeErr := decodeServiceRecord(string(service.ID), []byte(currentDocument))
-	if decodeErr != nil {
-		return record, decodeErr
-	}
-	if entityTag([]byte(currentDocument)) != expectedETag {
-		return record, fmt.Errorf("%w: service %q", storagecontract.ErrPrecondition, service.ID)
-	}
-	if current.Service.Kind != service.Kind {
-		return record, fmt.Errorf("%w: service kind is immutable", storagecontract.ErrInvalidArgument)
-	}
-	service.CreatedAt = current.Service.CreatedAt
-	service.UpdatedAt = store.now().UTC()
-	service, err = normalizeServiceModels(service)
-	if err != nil {
-		return record, fmt.Errorf("%w: %v", storagecontract.ErrInvalidArgument, err)
-	}
-	service, err = applyServiceCredentialMutation(service, credential)
-	if err != nil {
-		return record, fmt.Errorf("%w: %v", storagecontract.ErrInvalidArgument, err)
-	}
-	service, err = applyProxyCredentialMutation(service, credential)
-	if err != nil {
-		return record, fmt.Errorf("%w: %v", storagecontract.ErrInvalidArgument, err)
-	}
-	document, err := encodeService(service)
-	if err != nil {
-		return record, fmt.Errorf("%w: %v", storagecontract.ErrInvalidArgument, err)
-	}
-	now := service.UpdatedAt.Format(time.RFC3339Nano)
-	if _, err = transaction.ExecContext(ctx, `UPDATE services SET document_json = ?, updated_at = ? WHERE id = ?`, string(document), now, service.ID); err != nil {
-		return record, fmt.Errorf("update service: %w", err)
-	}
-	if service.Kind.IsHTTP() && credential.Present {
-		if len(credential.Secret) == 0 {
-			if _, err = transaction.ExecContext(ctx, `DELETE FROM service_credentials WHERE service_id = ?`, service.ID); err != nil {
-				return record, fmt.Errorf("delete service credential: %w", err)
+		var currentDocument string
+		if err = transaction.QueryRowContext(ctx, `SELECT document_json FROM services WHERE id = ?`, service.ID).Scan(&currentDocument); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return record, fmt.Errorf("%w: service %q", storagecontract.ErrNotFound, service.ID)
 			}
-		} else if err = store.putServiceCredentialTx(ctx, transaction, service.ID, credential.Secret, now); err != nil {
+			return record, fmt.Errorf("read service for update: %w", err)
+		}
+		current, decodeErr := decodeServiceRecord(string(service.ID), []byte(currentDocument))
+		if decodeErr != nil {
+			return record, decodeErr
+		}
+		if entityTag([]byte(currentDocument)) != expectedETag {
+			return record, fmt.Errorf("%w: service %q", storagecontract.ErrPrecondition, service.ID)
+		}
+		if current.Service.Kind != service.Kind {
+			return record, fmt.Errorf("%w: service kind is immutable", storagecontract.ErrInvalidArgument)
+		}
+		service.CreatedAt = current.Service.CreatedAt
+		service.UpdatedAt = store.now().UTC()
+		service, err = normalizeServiceModels(service)
+		if err != nil {
+			return record, fmt.Errorf("%w: %v", storagecontract.ErrInvalidArgument, err)
+		}
+		service, err = applyServiceCredentialMutation(service, credential)
+		if err != nil {
+			return record, fmt.Errorf("%w: %v", storagecontract.ErrInvalidArgument, err)
+		}
+		service, err = applyProxyCredentialMutation(service, credential)
+		if err != nil {
+			return record, fmt.Errorf("%w: %v", storagecontract.ErrInvalidArgument, err)
+		}
+		document, err := encodeService(service)
+		if err != nil {
+			return record, fmt.Errorf("%w: %v", storagecontract.ErrInvalidArgument, err)
+		}
+		now := service.UpdatedAt.Format(time.RFC3339Nano)
+		if _, err = transaction.ExecContext(ctx, `UPDATE services SET document_json = ?, updated_at = ? WHERE id = ?`, string(document), now, service.ID); err != nil {
+			return record, fmt.Errorf("update service: %w", err)
+		}
+		if service.Kind.IsHTTP() && credential.Present {
+			if len(credential.Secret) == 0 {
+				if _, err = transaction.ExecContext(ctx, `DELETE FROM service_credentials WHERE service_id = ?`, service.ID); err != nil {
+					return record, fmt.Errorf("delete service credential: %w", err)
+				}
+			} else if err = store.putServiceCredentialTx(ctx, transaction, service.ID, credential.Secret, now); err != nil {
+				return record, err
+			}
+		}
+		if err = store.putProxyCredentialTx(ctx, transaction, service, credential); err != nil {
 			return record, err
 		}
-	}
-	if err = store.putProxyCredentialTx(ctx, transaction, service, credential); err != nil {
-		return record, err
-	}
-	if err = transaction.Commit(); err != nil {
-		return record, fmt.Errorf("commit service update: %w", err)
-	}
-	return storagecontract.ServiceRecord{Service: service, ETag: entityTag(document)}, nil
+		return storagecontract.ServiceRecord{Service: service, ETag: entityTag(document)}, nil
+	})
 }
 
 func (store *Store) DeleteService(ctx context.Context, id contract.ServiceID, expectedETag string) (err error) {
@@ -210,31 +210,26 @@ func (store *Store) DeleteService(ctx context.Context, id contract.ServiceID, ex
 	if expectedETag == "" {
 		return fmt.Errorf("%w: expected ETag is required", storagecontract.ErrInvalidArgument)
 	}
-	transaction, err := store.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin service delete: %w", err)
-	}
-	defer rollbackOnError(transaction, &err)
-	var document string
-	if err = transaction.QueryRowContext(ctx, `SELECT document_json FROM services WHERE id = ?`, id).Scan(&document); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("%w: service %q", storagecontract.ErrNotFound, id)
+	_, err = retryConfigWrite(ctx, store.db, func(ctx context.Context, transaction *sql.Tx) (struct{}, error) {
+		var document string
+		if err := transaction.QueryRowContext(ctx, `SELECT document_json FROM services WHERE id = ?`, id).Scan(&document); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return struct{}{}, fmt.Errorf("%w: service %q", storagecontract.ErrNotFound, id)
+			}
+			return struct{}{}, fmt.Errorf("read service for delete: %w", err)
 		}
-		return fmt.Errorf("read service for delete: %w", err)
-	}
-	if _, err = decodeServiceRecord(string(id), []byte(document)); err != nil {
-		return err
-	}
-	if entityTag([]byte(document)) != expectedETag {
-		return fmt.Errorf("%w: service %q", storagecontract.ErrPrecondition, id)
-	}
-	if _, err = transaction.ExecContext(ctx, `DELETE FROM services WHERE id = ?`, id); err != nil {
-		return fmt.Errorf("delete service: %w", err)
-	}
-	if err = transaction.Commit(); err != nil {
-		return fmt.Errorf("commit service delete: %w", err)
-	}
-	return nil
+		if _, err := decodeServiceRecord(string(id), []byte(document)); err != nil {
+			return struct{}{}, err
+		}
+		if entityTag([]byte(document)) != expectedETag {
+			return struct{}{}, fmt.Errorf("%w: service %q", storagecontract.ErrPrecondition, id)
+		}
+		if _, err := transaction.ExecContext(ctx, `DELETE FROM services WHERE id = ?`, id); err != nil {
+			return struct{}{}, fmt.Errorf("delete service: %w", err)
+		}
+		return struct{}{}, nil
+	})
+	return err
 }
 
 func applyServiceCredentialMutation(service contract.Service, credential storagecontract.CredentialMutation) (contract.Service, error) {

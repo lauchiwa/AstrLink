@@ -81,42 +81,36 @@ func (store *Store) UpdatePolicy(
 	if err != nil {
 		return record, fmt.Errorf("encode policy: %w", err)
 	}
-	transaction, err := store.db.BeginTx(ctx, nil)
-	if err != nil {
-		return record, fmt.Errorf("begin policy update: %w", err)
-	}
-	defer rollbackOnError(transaction, &err)
-	var currentDocument string
-	if err = transaction.QueryRowContext(
-		ctx,
-		`SELECT document_json FROM policies WHERE id = ?`,
-		policy.ID,
-	).Scan(&currentDocument); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return record, fmt.Errorf("%w: policy %q", storagecontract.ErrNotFound, policy.ID)
+	return retryConfigWrite(ctx, store.db, func(ctx context.Context, transaction *sql.Tx) (record storagecontract.PolicyRecord, err error) {
+		var currentDocument string
+		if err = transaction.QueryRowContext(
+			ctx,
+			`SELECT document_json FROM policies WHERE id = ?`,
+			policy.ID,
+		).Scan(&currentDocument); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return record, fmt.Errorf("%w: policy %q", storagecontract.ErrNotFound, policy.ID)
+			}
+			return record, fmt.Errorf("read policy for update: %w", err)
 		}
-		return record, fmt.Errorf("read policy for update: %w", err)
-	}
-	if _, err = decodePolicyRecord(string(policy.ID), []byte(currentDocument)); err != nil {
-		return record, err
-	}
-	if entityTag([]byte(currentDocument)) != expectedETag {
-		return record, fmt.Errorf("%w: policy %q", storagecontract.ErrPrecondition, policy.ID)
-	}
-	now := store.now().UTC().Format(time.RFC3339Nano)
-	if _, err = transaction.ExecContext(
-		ctx,
-		`UPDATE policies SET document_json = ?, updated_at = ? WHERE id = ?`,
-		string(document),
-		now,
-		policy.ID,
-	); err != nil {
-		return record, fmt.Errorf("update policy: %w", err)
-	}
-	if err = transaction.Commit(); err != nil {
-		return record, fmt.Errorf("commit policy update: %w", err)
-	}
-	return storagecontract.PolicyRecord{Policy: policy, ETag: entityTag(document)}, nil
+		if _, err = decodePolicyRecord(string(policy.ID), []byte(currentDocument)); err != nil {
+			return record, err
+		}
+		if entityTag([]byte(currentDocument)) != expectedETag {
+			return record, fmt.Errorf("%w: policy %q", storagecontract.ErrPrecondition, policy.ID)
+		}
+		now := store.now().UTC().Format(time.RFC3339Nano)
+		if _, err = transaction.ExecContext(
+			ctx,
+			`UPDATE policies SET document_json = ?, updated_at = ? WHERE id = ?`,
+			string(document),
+			now,
+			policy.ID,
+		); err != nil {
+			return record, fmt.Errorf("update policy: %w", err)
+		}
+		return storagecontract.PolicyRecord{Policy: policy, ETag: entityTag(document)}, nil
+	})
 }
 
 func decodePolicyRecord(rowID string, document []byte) (storagecontract.PolicyRecord, error) {
