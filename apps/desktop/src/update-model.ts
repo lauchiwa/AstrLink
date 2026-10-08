@@ -9,7 +9,9 @@ export interface UpdatePreferences {
 export const defaultUpdatePreferences = (): UpdatePreferences => ({
   auto_check: true,
   auto_download: true,
-  channel: "stable",
+  // Must match UpdateChannel's Rust default: this fork only publishes
+  // X.Y.Z-rc.N prereleases, which the stable channel filters out.
+  channel: "preview",
 });
 export const UPDATE_PHASES = [
   "idle",

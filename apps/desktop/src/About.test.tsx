@@ -132,7 +132,9 @@ describe("About updates", () => {
     expect(mocks.saveUpdatePreferences).toHaveBeenCalledWith({
       auto_check: false,
       auto_download: true,
-      channel: "stable",
+      // Toggling auto-check must pass the channel through untouched, so assert
+      // the loaded value rather than restating whichever default ships today.
+      channel: ready.preferences.channel,
     });
     expect(receive).toHaveBeenCalled();
   });

@@ -574,6 +574,41 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    /// This fork only publishes `X.Y.Z-rc.N` prereleases, which the stable
+    /// channel filters out entirely. A new install must therefore land on
+    /// preview, or it would never see an update.
+    #[test]
+    fn a_new_install_defaults_to_the_preview_channel() {
+        let directory = temporary_directory("new-install-channel");
+        let store = load(&directory);
+        assert_eq!(
+            store.snapshot().values.updates.channel,
+            crate::updates::UpdateChannel::Preview
+        );
+        // The new-install path persists before Core creates its database, so
+        // assert the channel reached disk rather than only the in-memory value.
+        let written = fs::read_to_string(directory.join(FILE_NAME)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(parsed["updates"]["channel"], "preview");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Changing the default must not retarget an operator who chose stable:
+    /// serde only substitutes a default for an absent field.
+    #[test]
+    fn an_explicit_stable_channel_is_not_rewritten_by_the_new_default() {
+        let directory = temporary_directory("explicit-stable-channel");
+        fs::create_dir_all(&directory).unwrap();
+        let mut values = Preferences::default();
+        values.updates.channel = crate::updates::UpdateChannel::Stable;
+        persist_atomic(&directory.join(FILE_NAME), &values).unwrap();
+        assert_eq!(
+            load(&directory).snapshot().values.updates.channel,
+            crate::updates::UpdateChannel::Stable
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn saved_preferences_are_owner_only() {

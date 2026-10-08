@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/guides/upstream-sync-thinking-guide.md", "reason": "校验命名约定是否把上游钉住或引入新的分歧面"}
+{"file": ".trellis/spec/frontend/quality-guidelines.md", "reason": "校验前端默认值与校验逻辑未被破坏"}

@@ -26,6 +26,7 @@ These guides help you **ask the right questions before coding**.
 | [Code Reuse Thinking Guide](./code-reuse-thinking-guide.md)       | Identify patterns and reduce duplication | When you notice repeated patterns            |
 | [Cross-Layer Thinking Guide](./cross-layer-thinking-guide.md)     | Think through data flow across layers    | Features spanning multiple layers            |
 | [Upstream Sync Thinking Guide](./upstream-sync-thinking-guide.md) | Keep the fork cheap to sync              | Resolving a conflict against `upstream/main` |
+| [Version Naming Guide](./version-naming-guide.md)                 | Name a fork release and pick its channel | Tagging or publishing a release              |
 
 ---
 
@@ -63,6 +64,17 @@ These guides help you **ask the right questions before coding**.
 - [ ] You are editing a file to find out later whether upstream owns it
 
 → Read [Upstream Sync Thinking Guide](./upstream-sync-thinking-guide.md)
+
+### When Naming or Publishing a Release
+
+- [ ] You are choosing a tag for a fork build
+- [ ] You just synced upstream and need the new base version
+- [ ] You are tempted to publish a plain `X.Y.Z`, add a fourth version part, or
+      put the revision in build metadata
+- [ ] You are changing the update channel default or the prerelease filter
+- [ ] A tag was published with the wrong base version
+
+→ Read [Version Naming Guide](./version-naming-guide.md)
 
 ### When Verifying AI Cross-Review Results
 

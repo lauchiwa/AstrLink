@@ -30,8 +30,11 @@ const MAX_PACKAGE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum UpdateChannel {
-    #[default]
     Stable,
+    // This fork never publishes a plain X.Y.Z: its releases are X.Y.Z-rc.N, where
+    // X.Y.Z is the synced upstream version. Stable filters every prerelease, so a
+    // Stable default leaves a new install with no releases at all.
+    #[default]
     Preview,
 }
 
@@ -47,7 +50,7 @@ impl Default for UpdatePreferences {
         Self {
             auto_check: true,
             auto_download: true,
-            channel: UpdateChannel::Stable,
+            channel: UpdateChannel::Preview,
         }
     }
 }
@@ -1024,6 +1027,17 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<UpdatePreferences>("{}").unwrap(),
             UpdatePreferences::default()
+        );
+        // Pin the concrete default: comparing against `default()` alone holds for
+        // any channel, so it would not notice a silent switch back to stable.
+        assert_eq!(UpdatePreferences::default().channel, UpdateChannel::Preview);
+        // An absent field takes the default; a present one is honored, which is
+        // what keeps an operator's explicit stable choice intact.
+        assert_eq!(
+            serde_json::from_str::<UpdatePreferences>(r#"{"channel":"stable"}"#)
+                .unwrap()
+                .channel,
+            UpdateChannel::Stable
         );
         assert!(serde_json::from_str::<UpdatePreferences>(r#"{"channel":"nightly"}"#).is_err());
     }

@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/guides/upstream-sync-thinking-guide.md", "reason": "fork 与上游并存的约定来源，命名方案须与同步流程一致"}
+{"file": ".trellis/spec/frontend/quality-guidelines.md", "reason": "前端改动（update-model.ts 默认值）的质量约定"}
