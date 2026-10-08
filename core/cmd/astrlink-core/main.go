@@ -307,6 +307,12 @@ func main() {
 			IdentityCapture:          identityCapture,
 			IdentityProfiles:         store,
 		}
+		checkin, err := newForkCheckinExtension(store, dataDirectory, logger.Printf)
+		if err != nil {
+			_ = store.Close()
+			logger.Printf("configure check-in extension: %v", err)
+			os.Exit(1)
+		}
 		handler, err := controlapi.NewWithDependencies(config.Version, controlapi.Dependencies{
 			ServiceStore: store,
 			PricingStore: store, PricingManager: pricingManager,
@@ -334,6 +340,7 @@ func main() {
 			ObserverToken:     tokens.observer,
 			ConversionEngine:  conversionEngine,
 			Shutdown:          stopSignals,
+			CheckinExtension:  checkin.handler,
 		})
 		if err != nil {
 			_ = store.Close()
@@ -356,12 +363,16 @@ func main() {
 		go func() { defer monitors.Done(); pricingManager.Run(monitorCtx, logger.Printf) }()
 		go func() { defer monitors.Done(); subscriptionManager.RunUsageMonitor(monitorCtx) }()
 		go func() { defer monitors.Done(); rawVault.Run(monitorCtx) }()
+		checkin.start(ctx)
 		closeStore = func() error {
 			// Zero every key an agent grant or the unlock session holds.
 			handler.RevokeRawGrants()
 			rawVault.Lock()
 			stopMonitors()
 			monitors.Wait()
+			// The extension shares the Store and its key: every check-in
+			// worker must have exited before the Store closes.
+			checkin.stop()
 			return store.Close()
 		}
 	}
