@@ -553,7 +553,8 @@ paths:
       operationId: createService
       summary: Create one independently addressable API service.
       description: |
-        `codex_subscription`, `claude_subscription` and `grok_subscription` create a
+        `codex_subscription`, `claude_subscription`, `grok_subscription`,
+        `antigravity_subscription` and `copilot_subscription` create a
         disconnected service that is authorized through its service-scoped OAuth
         operation. HTTP kinds such as `newapi`
         carry an `http` connection and optional write-only credential.
@@ -1286,8 +1287,9 @@ paths:
       summary: Read the live subscription rolling-quota snapshot.
       description: |
         Fetches the official ChatGPT `/wham/usage` snapshot for a connected
-        `codex_subscription` service, Claude's `/api/oauth/usage` windows, or the
-        Grok CLI proxy `/v1/billing?format=credits` snapshot. API-key coding
+        `codex_subscription` service, Claude's `/api/oauth/usage` windows, the
+        Grok CLI proxy `/v1/billing?format=credits` snapshot, or GitHub
+        Copilot's `/copilot_internal/user` quota snapshots. API-key coding
         plans (Kimi, GLM, MiniMax, OpenCode Go) report their plan windows with
         the service key, and a `newapi` service reports its key's prepaid
         `quota` from New API `/api/usage/token/`, valued at the site's
@@ -4563,6 +4565,7 @@ components:
         - claude_subscription
         - grok_subscription
         - antigravity_subscription
+        - copilot_subscription
         - opencode_go
         - opencode_zen
         - kimi_coding
@@ -4709,7 +4712,8 @@ components:
       properties:
         provider:
           type: string
-          enum: [openai_codex, claude_code, xai_grok, antigravity]
+          enum:
+            [openai_codex, claude_code, xai_grok, antigravity, github_copilot]
         status:
           type: string
           enum: [disconnected, authorizing, connected, needs_reauth, error]
@@ -4816,6 +4820,12 @@ components:
         responses_websocket_enabled:
           type: boolean
           description: Per-channel native Responses WebSocket switch. When omitted, defaults to true for codex_subscription and false for other providers. Explicit false overrides the Codex default.
+        model_redirects:
+          type: array
+          maxItems: 200
+          description: This service's own exact-match, single-hop model redirects, applied after the routing-settings redirects. A rule applies only when this service lists its target; routing keeps the requested model, so other services that list it can still serve it. A dated Claude id that no rule or model names exactly (claude-haiku-4-5-20251001) follows the rule for its undated id (claude-haiku-4-5). copilot_subscription also applies built-in rules from Claude Code ids to Copilot's dotted ids (claude-sonnet-4-6 to claude-sonnet-4.6); a stored rule with the same from, enabled or not, replaces the built-in one. Same rule constraints as the routing-settings table. An empty array clears the table.
+          items:
+            $ref: "#/components/schemas/ModelRedirect"
         failure_policy:
           $ref: "#/components/schemas/FailurePolicy"
         id:
@@ -4854,6 +4864,7 @@ components:
                   claude_subscription,
                   grok_subscription,
                   antigravity_subscription,
+                  copilot_subscription,
                 ]
           required: [subscription]
           not:
@@ -4892,6 +4903,12 @@ components:
         responses_websocket_enabled:
           type: boolean
           description: Per-channel native Responses WebSocket switch. When omitted, defaults to true for codex_subscription and false for other providers. Explicit false overrides the Codex default.
+        model_redirects:
+          type: array
+          maxItems: 200
+          description: This service's own exact-match, single-hop model redirects, applied after the routing-settings redirects. A rule applies only when this service lists its target; routing keeps the requested model, so other services that list it can still serve it. A dated Claude id that no rule or model names exactly (claude-haiku-4-5-20251001) follows the rule for its undated id (claude-haiku-4-5). copilot_subscription also applies built-in rules from Claude Code ids to Copilot's dotted ids (claude-sonnet-4-6 to claude-sonnet-4.6); a stored rule with the same from, enabled or not, replaces the built-in one. Same rule constraints as the routing-settings table. An empty array clears the table.
+          items:
+            $ref: "#/components/schemas/ModelRedirect"
         failure_policy:
           $ref: "#/components/schemas/FailurePolicy"
         name:
@@ -4909,7 +4926,7 @@ components:
           $ref: "#/components/schemas/HTTPServiceConnectionInput"
         capabilities:
           type: array
-          description: Required for HTTP services. Subscription services default to the provider's fixed native capabilities; when supplied, the list must keep those unchanged and may only add native-mode local conversions whose convert_to is a protocol the provider serves (openai.responses for Codex, anthropic.messages for Claude, openai.responses or openai.chat for Grok).
+          description: Required for HTTP services. Subscription services default to the provider's fixed native capabilities; when supplied, the list must keep those unchanged and may only add native-mode local conversions whose convert_to is a protocol the provider serves (openai.responses for Codex, anthropic.messages for Claude, openai.responses or openai.chat for Grok, anthropic.messages, openai.responses or openai.chat for GitHub Copilot).
           items:
             $ref: ./protocol-capabilities.schema.json#/$defs/ServiceCapability
       additionalProperties: false
@@ -4922,6 +4939,7 @@ components:
                   claude_subscription,
                   grok_subscription,
                   antigravity_subscription,
+                  copilot_subscription,
                 ]
           not:
             required: [http]
@@ -4960,6 +4978,12 @@ components:
         responses_websocket_enabled:
           type: boolean
           description: Per-channel native Responses WebSocket switch. When omitted, defaults to true for codex_subscription and false for other providers. Explicit false overrides the Codex default.
+        model_redirects:
+          type: array
+          maxItems: 200
+          description: This service's own exact-match, single-hop model redirects, applied after the routing-settings redirects. A rule applies only when this service lists its target; routing keeps the requested model, so other services that list it can still serve it. A dated Claude id that no rule or model names exactly (claude-haiku-4-5-20251001) follows the rule for its undated id (claude-haiku-4-5). copilot_subscription also applies built-in rules from Claude Code ids to Copilot's dotted ids (claude-sonnet-4-6 to claude-sonnet-4.6); a stored rule with the same from, enabled or not, replaces the built-in one. Same rule constraints as the routing-settings table. An empty array clears the table.
+          items:
+            $ref: "#/components/schemas/ModelRedirect"
         failure_policy:
           oneOf:
             - $ref: "#/components/schemas/FailurePolicy"
@@ -5253,10 +5277,10 @@ components:
       description: >
         Per-kind detection switch and placeholder shape. url and ip_address ship
         disabled because they are the dominant false-positive source for coding
-        agents. phone ships with the token style because models regroup its
-        stand-in and its fictional number block is small. common_secret,
-        private_person, private_address, and private_date are rejected with any
-        style other than token.
+        agents. common_secret, payment_card, account, phone, private_person,
+        private_address, and private_date are rejected with any style other
+        than token; models regroup, truncate, or remark on stand-in numbers in
+        ways restoration cannot follow.
     PlaceholderStyle:
       type: string
       enum: [natural, token]
@@ -6115,7 +6139,7 @@ components:
         request_body_max_bytes:
           type: integer
           minimum: 1024
-          maximum: 16777216
+          maximum: 67108864
         response_content_max_bytes:
           type: integer
           minimum: 1024
@@ -7813,7 +7837,7 @@ components:
     AuthorizationFlow:
       type: string
       enum: [browser, device_code, authorization_code]
-      description: Codex supports browser and device_code. Claude Code supports authorization_code with PKCE and a manual code#state callback. Grok (xai_grok) supports device_code only (RFC 8628 against auth.x.ai). Antigravity supports browser authorization with Google OAuth and a loopback callback.
+      description: Codex supports browser and device_code. Claude Code supports authorization_code with PKCE and a manual code#state callback. Grok (xai_grok) supports device_code only (RFC 8628 against auth.x.ai). Antigravity supports browser authorization with Google OAuth and a loopback callback. GitHub Copilot (github_copilot) supports device_code only (RFC 8628 against github.com with the OpenCode OAuth app).
     AuthorizationStartRequest:
       type: object
       required: [flow]
@@ -7851,7 +7875,8 @@ components:
           $ref: ./protocol-capabilities.schema.json#/$defs/ResourceId
         provider:
           type: string
-          enum: [openai_codex, claude_code, xai_grok, antigravity]
+          enum:
+            [openai_codex, claude_code, xai_grok, antigravity, github_copilot]
         status:
           type: string
           enum: [pending, completed, cancelled, expired, failed]

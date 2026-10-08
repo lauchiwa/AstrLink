@@ -128,6 +128,7 @@ func (engine *Engine) Inspect(ctx context.Context, policy Policy, protocol contr
 			Decision:           DecisionBlock,
 			Findings:           accepted,
 			SuppressedFindings: suppressed,
+			Protected:          protectedValues(accepted, segments),
 		}, nil
 	case ActionRedact:
 		if !utf8.Valid(body) || document.duplicateKeys {
@@ -162,6 +163,7 @@ func (engine *Engine) Inspect(ctx context.Context, policy Policy, protocol contr
 			Findings:           markExhaustedKinds(accepted, allocator.exhaustedKinds()),
 			SuppressedFindings: suppressed,
 			Redactions:         outcome.Redactions,
+			Protected:          protectedValues(accepted, segments),
 			NoticeInjected:     outcome.NoticeInjected,
 			SkillListed:        skillListed,
 		}, nil
@@ -218,6 +220,21 @@ func suppressionFor(
 		return SuppressionAllowlisted
 	}
 	return ""
+}
+
+// protectedValues lists the distinct plaintext the findings cover.
+func protectedValues(findings []Finding, segments []Segment) []string {
+	seen := make(map[string]struct{}, len(findings))
+	values := make([]string, 0, len(findings))
+	for _, finding := range findings {
+		value := segments[finding.Segment].Value[finding.Start:finding.End]
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		values = append(values, value)
+	}
+	return values
 }
 
 // markExhaustedKinds annotates accepted findings whose kind ran out of reserved

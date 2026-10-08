@@ -57,8 +57,9 @@ func TestServicePerformanceUsesEligibleWeightedSamples(t *testing.T) {
 	insert("after", func(r *contract.RequestRecord) { r.StartedAt = from.AddDate(0, 0, 1) })
 	insert("incomplete", func(r *contract.RequestRecord) { r.Usage.BillingIncomplete = true })
 	insert("no_usage", func(r *contract.RequestRecord) { r.Usage = nil })
-	// Missing cache reporting, non-streaming, missing timing and zero output must
-	// not dilute either metric. Explicit zero cache reads are still a sample.
+	// Missing cache reporting must not dilute the cache rate, and zero output must
+	// not dilute TPS. Explicit zero cache reads are still a sample. TPS divides
+	// by whole call duration, so calls without first-token timing still count.
 	insert("no_timing", func(r *contract.RequestRecord) { r.FirstTokenMs = nil; r.Usage.CacheReadTokens = nil })
 	insert("non_streaming", func(r *contract.RequestRecord) {
 		r.Streaming = false
@@ -89,9 +90,9 @@ func TestServicePerformanceUsesEligibleWeightedSamples(t *testing.T) {
 		t.Fatalf("token groups=%+v", summary.ByToken)
 	}
 	tokenStats := summary.ByToken[0].Performance
-	if tokenStats == nil || tokenStats.CacheSamples != 3 || tokenStats.SpeedSamples != 3 ||
+	if tokenStats == nil || tokenStats.CacheSamples != 3 || tokenStats.SpeedSamples != 7 ||
 		tokenStats.CacheHitRate == nil || math.Abs(*tokenStats.CacheHitRate-260.0/1100) > 1e-9 ||
-		tokenStats.OutputTokensPerSecond == nil || *tokenStats.OutputTokensPerSecond != 49 {
+		tokenStats.OutputTokensPerSecond == nil || math.Abs(*tokenStats.OutputTokensPerSecond-845.0/15) > 1e-9 {
 		t.Fatalf("token performance across providers=%+v", tokenStats)
 	}
 	groups := map[string]*storage.ServicePerformance{}
@@ -99,16 +100,17 @@ func TestServicePerformanceUsesEligibleWeightedSamples(t *testing.T) {
 		groups[*group.ID] = group.Performance
 	}
 	stats := groups[string(service)]
-	if stats == nil || stats.CacheSamples != 2 || stats.SpeedSamples != 3 || stats.CacheHitRate == nil || math.Abs(*stats.CacheHitRate-0.26) > 1e-9 || stats.OutputTokensPerSecond == nil || *stats.OutputTokensPerSecond != 49 {
+	if stats == nil || stats.CacheSamples != 2 || stats.SpeedSamples != 5 || stats.CacheHitRate == nil || math.Abs(*stats.CacheHitRate-0.26) > 1e-9 || stats.OutputTokensPerSecond == nil || math.Abs(*stats.OutputTokensPerSecond-545.0/11) > 1e-9 {
 		t.Fatalf("unexpected weighted performance: %+v", stats)
 	}
 	zero := groups["service_two"]
-	if zero.CacheHitRate == nil || *zero.CacheHitRate != 0 || zero.CacheSamples != 1 || zero.OutputTokensPerSecond != nil {
+	if zero.CacheHitRate == nil || *zero.CacheHitRate != 0 || zero.CacheSamples != 1 || zero.OutputTokensPerSecond == nil || *zero.OutputTokensPerSecond != 75 {
 		t.Fatalf("explicit zero lost: %+v", zero)
 	}
-	for _, id := range []string{"service_unknown", "service_failed"} {
-		if s := groups[id]; s == nil || s.CacheHitRate != nil || s.OutputTokensPerSecond != nil || s.CacheSamples != 0 || s.SpeedSamples != 0 {
-			t.Fatalf("unknown sample invented: %+v", s)
-		}
+	if s := groups["service_unknown"]; s == nil || s.CacheHitRate != nil || s.CacheSamples != 0 || s.SpeedSamples != 1 {
+		t.Fatalf("unknown cache sample invented: %+v", s)
+	}
+	if s := groups["service_failed"]; s == nil || s.CacheHitRate != nil || s.OutputTokensPerSecond != nil || s.CacheSamples != 0 || s.SpeedSamples != 0 {
+		t.Fatalf("failed sample invented: %+v", s)
 	}
 }

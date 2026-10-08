@@ -231,7 +231,7 @@ func (resolver *StoreResolver) readServices(ctx context.Context, model string) (
 				return nil, nil, fmt.Errorf("persisted endpoint failed validation: %w", err)
 			}
 			if reason := resolver.unschedulableReason(candidate); reason != "" {
-				if model != "" && !containsModel(candidate.Models, model) {
+				if _, served := candidate.UpstreamModelFor(model); model != "" && !served {
 					reason = contract.RoutingSkipModelNotListed
 				}
 				excluded[candidate.ID] = reason
@@ -360,8 +360,14 @@ func rankCandidates(endpoints []contract.Service, request ResolveRequest, subscr
 // planService plans request on the first capability mode of service that can
 // serve it, or reports the furthest check every mode failed.
 func planService(candidate contract.Service, request ResolveRequest, subscriptionBaseURL string, runtime contract.RuntimeProfile) (Resolved, contract.RoutingSkipReason) {
-	if !request.Protocol.IsModelDiscovery() && !containsModel(candidate.Models, request.Model) {
-		return Resolved{}, contract.RoutingSkipModelNotListed
+	// The service's own redirects pick the model it serves; every check below
+	// applies to that model, and only the upstream request carries it.
+	if !request.Protocol.IsModelDiscovery() {
+		served, ok := candidate.UpstreamModelFor(request.Model)
+		if !ok {
+			return Resolved{}, contract.RoutingSkipModelNotListed
+		}
+		request.Model = served
 	}
 	skip := contract.RoutingSkipProtocolUnsupported
 	narrow := func(reason contract.RoutingSkipReason) {
@@ -432,6 +438,9 @@ func baseURLForService(service contract.Service, subscriptionBaseURL string) str
 	}
 	if service.Kind == contract.ServiceKindGrokSubscription {
 		return accountauth.DefaultGrokAPIBaseURL
+	}
+	if service.Kind == contract.ServiceKindCopilotSubscription {
+		return accountauth.DefaultCopilotAPIBaseURL
 	}
 	if service.Kind.IsSubscription() {
 		return subscriptionBaseURL

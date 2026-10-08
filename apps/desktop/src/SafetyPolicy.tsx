@@ -112,6 +112,7 @@ import {
 import { PageHeader } from "./PageHeader";
 import { RawPasswordEntry } from "./RawSealingControls";
 import {
+  privacyDryRunError,
   privacyModelOperationError,
   type PrivacyModelOperationError,
 } from "./privacy-model-errors";
@@ -158,6 +159,8 @@ type PendingModelAction =
 
 export interface SafetyPolicyProps {
   coreSessionKey: string | null;
+  /** Opens on the models tab, as when following a model update reminder. */
+  initialView?: "models";
   isReady: boolean;
   /** Opens the agent tools page to install the placeholder skill. */
   onInstallPlaceholderSkill?: () => void;
@@ -400,9 +403,29 @@ function placeholderStyleLockReason(
       return i18n.t("safety.addressLock");
     case "private_date":
       return i18n.t("safety.dateLock");
+    case "payment_card":
+    case "account":
+    case "phone":
+      return i18n.t("safety.numberLock");
     default:
       return undefined;
   }
+}
+
+/** Locked kinds in canonical order, merged where they share a reason. */
+function lockedKindGroups(): {
+  kinds: CanonicalPrivacyKind[];
+  reason: string;
+}[] {
+  const groups: { kinds: CanonicalPrivacyKind[]; reason: string }[] = [];
+  for (const kind of PRIVACY_KINDS) {
+    const reason = placeholderStyleLockReason(kind);
+    if (!reason) continue;
+    const group = groups.find((item) => item.reason === reason);
+    if (group) group.kinds.push(kind);
+    else groups.push({ kinds: [kind], reason });
+  }
+  return groups;
 }
 
 const ALLOWLIST_TYPES: readonly PrivacyAllowlistType[] = [
@@ -532,6 +555,34 @@ interface LabelMappingDialogProps {
   onConfirm: () => void;
 }
 
+/** An error with its technical details one click away. */
+function OperationErrorMessage({
+  className,
+  error,
+}: {
+  className?: string;
+  error: string | PrivacyModelOperationError;
+}) {
+  const t = useT();
+  return (
+    <FormMessage
+      className={cn("flex items-center gap-2", className)}
+      tone="error"
+    >
+      <span className="min-w-0 flex-1">
+        {typeof error === "string" ? error : error.message}
+      </span>
+      {typeof error !== "string" && error.details ? (
+        <HelpPopover label={t("safety.modelErrorDetails")}>
+          <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-all font-mono text-xs">
+            {error.details}
+          </pre>
+        </HelpPopover>
+      ) : null}
+    </FormMessage>
+  );
+}
+
 function LabelMappingDialog({
   title,
   labels,
@@ -631,6 +682,8 @@ function LabelMappingDialog({
 interface ModelActionDialogProps {
   action: PendingModelAction;
   installation: PrivacyModelInstallation;
+  /** Variant and release, which tell apart installs that share a name. */
+  summary: string;
   onCancel: () => void;
   onConfirm: () => void;
 }
@@ -638,6 +691,7 @@ interface ModelActionDialogProps {
 function ModelActionDialog({
   action,
   installation,
+  summary,
   onCancel,
   onConfirm,
 }: ModelActionDialogProps) {
@@ -670,7 +724,7 @@ function ModelActionDialog({
         {activating
           ? t("safety.useBody", {
               name: installation.name,
-              variant: installation.variant_name,
+              variant: summary,
             })
           : downloading
             ? t("safety.stopBody", {
@@ -679,7 +733,7 @@ function ModelActionDialog({
               })
             : t("safety.deleteBody", {
                 name: installation.name,
-                variant: installation.variant_name,
+                variant: summary,
                 action: transferAction,
               })}
       </p>
@@ -726,6 +780,7 @@ function ModelActionDialog({
 
 function InstalledModelPicker({
   installations,
+  summary,
   currentID,
   saving,
   error,
@@ -734,6 +789,8 @@ function InstalledModelPicker({
   onManage,
 }: {
   installations: PrivacyModelInstallation[];
+  /** Variant and release, which tell apart installs that share a name. */
+  summary: (installation: PrivacyModelInstallation) => string;
   currentID: string | null;
   saving: boolean;
   error: string | null;
@@ -789,7 +846,7 @@ function InstalledModelPicker({
                   description={
                     <>
                       <span className="block">
-                        {item.variant_name}
+                        {summary(item)}
                         {item.id === currentID
                           ? ` · ${t("safety.currentModel")}`
                           : ""}
@@ -1093,6 +1150,7 @@ function PolicySection({
 
 export function SafetyPolicy({
   coreSessionKey,
+  initialView,
   isReady,
   onInstallPlaceholderSkill,
 }: SafetyPolicyProps) {
@@ -1118,7 +1176,8 @@ export function SafetyPolicy({
   const [status, setStatus] = useState<SafetyPolicyStatus>(
     record ? "ready" : "blocked",
   );
-  const [workspace, setWorkspace] = useState<WorkspaceView>("detection");
+  const initialWorkspace: WorkspaceView = initialView ?? "detection";
+  const [workspace, setWorkspace] = useState<WorkspaceView>(initialWorkspace);
   const [allowlistQuery, setAllowlistQuery] = useState("");
   const [view, setView] = useState<ModelView>("catalog");
   const [selectedVariants, setSelectedVariants] = useState<
@@ -1147,7 +1206,9 @@ export function SafetyPolicy({
     useState<PrivacyDryRunProtocol>("openai.chat");
   const [dryRunSample, setDryRunSample] = useState(defaultDryRunSample);
   const [dryRunBusy, setDryRunBusy] = useState(false);
-  const [dryRunError, setDryRunError] = useState<string | null>(null);
+  const [dryRunError, setDryRunError] = useState<
+    string | PrivacyModelOperationError | null
+  >(null);
   const [dryRunResult, setDryRunResult] =
     useState<CompletedPrivacyDryRun | null>(null);
   const [minConfidenceDraft, setMinConfidenceDraft] = useState(
@@ -1242,9 +1303,9 @@ export function SafetyPolicy({
     }
   }, [dryRunResult]);
 
-  const loadReleases = async (generation: number) => {
+  const loadReleases = async (generation: number, refresh: boolean) => {
     try {
-      const next = await getPrivacyModelReleases();
+      const next = await getPrivacyModelReleases(refresh);
       if (generationRef.current !== generation) return;
       setReleases(
         Object.fromEntries(next.items.map((model) => [model.id, model])),
@@ -1254,9 +1315,10 @@ export function SafetyPolicy({
     }
   };
 
-  const load = async (generation: number) => {
+  // Only the operator's refresh skips Core's release cache.
+  const load = async (generation: number, refreshReleases = false) => {
     const version = policyMutationVersion.current;
-    void loadReleases(generation);
+    void loadReleases(generation, refreshReleases);
     try {
       const [nextRecord, nextCatalog, nextInstallations] = await Promise.all([
         getPrivacyPolicy(),
@@ -1316,7 +1378,7 @@ export function SafetyPolicy({
     setModelPickerOpen(false);
     setPendingInstallation(null);
     setStreamingDemoOpen(false);
-    setWorkspace("detection");
+    setWorkspace(initialWorkspace);
     setAllowlistQuery("");
     setProbe(null);
     setProbeView(null);
@@ -1440,7 +1502,7 @@ export function SafetyPolicy({
     setCustomMappingOpen(false);
     setCatalogPreparation(null);
     setPendingModelAction(null);
-    void load(generation);
+    void load(generation, true);
   };
 
   const patchPolicy = async (
@@ -1850,6 +1912,10 @@ export function SafetyPolicy({
       setDryRunError(t("safety.dryRunModelNotReady"));
       return;
     }
+    if (record.policy.detector === "local_model" && !record.policy.enabled) {
+      setDryRunError(t("safety.dryRunNeedsProtection"));
+      return;
+    }
     const generation = generationRef.current;
     const request = dryRunRequestRef.current + 1;
     dryRunRequestRef.current = request;
@@ -1891,8 +1957,7 @@ export function SafetyPolicy({
         return;
       }
       setDryRunResult(null);
-      const message = messageOf(caught, t("safety.dryRunFailed"));
-      setDryRunError(message);
+      setDryRunError(privacyDryRunError(caught));
     } finally {
       if (
         generationRef.current === generation &&
@@ -2399,8 +2464,25 @@ export function SafetyPolicy({
           `${installation.repo_id}\n${installation.revision}`,
         ) ?? null)
       : null;
+  // Installs of one model share a name, so they need their release to tell
+  // apart; the short revision stands in when the catalog has no version.
+  const installationRelease = (installation: PrivacyModelInstallation) => {
+    const version = installationVersion(installation);
+    if (version !== null) return `v${version}`;
+    const revision = installation.revision.slice(0, 8);
+    return installation.name.includes(revision)
+      ? null
+      : t("safety.shortRevision", { revision });
+  };
+  const installationSummary = (installation: PrivacyModelInstallation) => {
+    const release = installationRelease(installation);
+    return release === null
+      ? installation.variant_name
+      : `${installation.variant_name} · ${release}`;
+  };
   // The update check reports the newest compatible release, so every other
-  // catalog revision of that model is older.
+  // catalog revision of that model is older. Once installed, the newer
+  // revision waits for the policy to switch to it.
   const installationUpdate = (installation: PrivacyModelInstallation) => {
     const model = catalog.find(
       (candidate) => candidate.id === installation.catalog_id,
@@ -2421,18 +2503,31 @@ export function SafetyPolicy({
       latest.version === null ||
       latest.repo_id !== installation.repo_id ||
       latest.revision === installation.revision ||
-      variant === undefined ||
-      installations.some(
+      variant === undefined
+    ) {
+      return null;
+    }
+    const downloaded =
+      installations.find(
         (candidate) =>
           candidate.repo_id === latest.repo_id &&
           candidate.revision === latest.revision &&
           candidate.variant_id === variant.id,
-      )
-    ) {
-      return null;
-    }
-    return { model: latest, variant, version: latest.version };
+      ) ?? null;
+    return { model: latest, variant, version: latest.version, downloaded };
   };
+  const selectedUpdate =
+    selectedInstallation === null
+      ? null
+      : installationUpdate(selectedInstallation);
+  // The installed newer revision of the policy's model, ready to switch to.
+  const switchTarget =
+    selectedUpdate?.downloaded?.status === "ready"
+      ? {
+          installation: selectedUpdate.downloaded,
+          version: selectedUpdate.version,
+        }
+      : null;
   const catalogPreparationModel =
     catalogPreparation === null
       ? null
@@ -2531,21 +2626,7 @@ export function SafetyPolicy({
       />
 
       {error ? (
-        <FormMessage
-          className="mb-2.5 flex shrink-0 items-center gap-2"
-          tone="error"
-        >
-          <span className="min-w-0 flex-1">
-            {typeof error === "string" ? error : error.message}
-          </span>
-          {typeof error !== "string" && error.details ? (
-            <HelpPopover label={t("safety.modelErrorDetails")}>
-              <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-all font-mono text-xs">
-                {error.details}
-              </pre>
-            </HelpPopover>
-          ) : null}
-        </FormMessage>
+        <OperationErrorMessage className="mb-2.5" error={error} />
       ) : null}
 
       {status === "loading" && record === null ? (
@@ -2668,7 +2749,7 @@ export function SafetyPolicy({
                       description={
                         selectedInstallation === null
                           ? t("safety.chooseInstalled")
-                          : `${selectedInstallation.name} · ${selectedInstallation.variant_name}`
+                          : `${selectedInstallation.name} · ${installationSummary(selectedInstallation)}`
                       }
                       selected={policy.detector === "local_model"}
                       disabled={saving}
@@ -2852,6 +2933,44 @@ export function SafetyPolicy({
                 ) : null}
 
                 <div className="border-t pt-3">
+                  <Field
+                    htmlFor="privacy-request-action"
+                    label={t("safety.requestAction")}
+                  >
+                    <Select
+                      disabled={saving}
+                      onValueChange={changeAction}
+                      value={policy.request_action}
+                    >
+                      <SelectTrigger
+                        aria-label={t("safety.requestAction")}
+                        className="h-9 w-full px-3 text-sm"
+                        id="privacy-request-action"
+                        size="sm"
+                      >
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {policy.request_action === "allow" ? (
+                          <SelectItem disabled value="allow">
+                            {t("safety.allowCompat")}
+                          </SelectItem>
+                        ) : null}
+                        <SelectItem value="redact">
+                          {actionLabel("redact")}
+                        </SelectItem>
+                        <SelectItem value="block">
+                          {actionLabel("block")}
+                        </SelectItem>
+                        <SelectItem value="warn">
+                          {actionLabel("warn")}
+                        </SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </Field>
+                </div>
+
+                <div className="border-t pt-3">
                   <HelpDisclosure title={t("safety.advancedDetection")} open>
                     <Field
                       htmlFor="privacy-min-confidence"
@@ -2904,43 +3023,6 @@ export function SafetyPolicy({
                   </Button>
                 }
               >
-                <div className="border-b pb-3">
-                  <Field
-                    htmlFor="privacy-request-action"
-                    label={t("safety.requestAction")}
-                  >
-                    <Select
-                      disabled={saving}
-                      onValueChange={changeAction}
-                      value={policy.request_action}
-                    >
-                      <SelectTrigger
-                        aria-label={t("safety.requestAction")}
-                        className="h-9 w-full px-3 text-sm"
-                        id="privacy-request-action"
-                        size="sm"
-                      >
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {policy.request_action === "allow" ? (
-                          <SelectItem disabled value="allow">
-                            {t("safety.allowCompat")}
-                          </SelectItem>
-                        ) : null}
-                        <SelectItem value="redact">
-                          {actionLabel("redact")}
-                        </SelectItem>
-                        <SelectItem value="block">
-                          {actionLabel("block")}
-                        </SelectItem>
-                        <SelectItem value="warn">
-                          {actionLabel("warn")}
-                        </SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </Field>
-                </div>
                 <fieldset className="min-w-0 border-0 p-0" disabled={saving}>
                   <legend className="sr-only">
                     {t("safety.restoreScope")}
@@ -3120,14 +3202,15 @@ export function SafetyPolicy({
                             {t("safety.styleHintTail")}
                           </p>
                           <ul className="grid gap-2">
-                            {PRIVACY_KINDS.filter((kind) =>
-                              PLACEHOLDER_STYLE_LOCKED_KINDS.has(kind),
-                            ).map((kind) => (
-                              <li key={kind}>
+                            {lockedKindGroups().map(({ kinds, reason }) => (
+                              <li key={kinds.join()}>
                                 <strong className="font-medium text-foreground">
-                                  {canonicalKindLabel(kind)}：
+                                  {kinds
+                                    .map(canonicalKindLabel)
+                                    .join(t("safety.listJoin"))}
+                                  ：
                                 </strong>
-                                {placeholderStyleLockReason(kind)}
+                                {reason}
                               </li>
                             ))}
                           </ul>
@@ -3523,7 +3606,7 @@ export function SafetyPolicy({
                           dryRunSample.trim() === "" ||
                           dryRunSampleOverLimit ||
                           (policy.detector === "local_model" &&
-                            !selectedModelReady)
+                            (!selectedModelReady || !policy.enabled))
                         }
                         onClick={() => void runDryRun()}
                         size="sm"
@@ -3660,7 +3743,7 @@ export function SafetyPolicy({
                   data-testid="dry-run-output-scroll"
                 >
                   {dryRunError ? (
-                    <FormMessage tone="error">{dryRunError}</FormMessage>
+                    <OperationErrorMessage error={dryRunError} />
                   ) : null}
                   {dryRunBusy ? (
                     <EmptyState
@@ -3675,7 +3758,7 @@ export function SafetyPolicy({
                       sample={dryRunSample}
                       onLocate={locateDryRunSpan}
                     />
-                  ) : (
+                  ) : dryRunError ? null : (
                     <EmptyState
                       className="flex-1 border-0"
                       title={t(
@@ -3689,7 +3772,10 @@ export function SafetyPolicy({
                           : policy.detector === "local_model" &&
                               !selectedModelReady
                             ? "safety.needReadyModelHint"
-                            : "safety.testEmptyHint",
+                            : policy.detector === "local_model" &&
+                                !policy.enabled
+                              ? "safety.dryRunNeedsProtection"
+                              : "safety.testEmptyHint",
                       )}
                     />
                   )}
@@ -3778,6 +3864,11 @@ export function SafetyPolicy({
                                 candidate.variant.id === variant.id,
                             ) ?? null)
                         : null;
+                    const cardSwitch =
+                      existing !== null &&
+                      switchTarget?.installation.id === existing.id
+                        ? switchTarget
+                        : null;
                     const variantSelectID = `privacy-catalog-variant-${model.id.replace(/[^A-Za-z0-9_-]/g, "-")}`;
                     return (
                       <Panel asChild className="flex flex-col" key={model.id}>
@@ -3820,6 +3911,13 @@ export function SafetyPolicy({
                               <StatusBadge tone="pending">
                                 {t("safety.updateAvailableHint", {
                                   version: update.version,
+                                })}
+                              </StatusBadge>
+                            )}
+                            {cardSwitch === null ? null : (
+                              <StatusBadge tone="pending">
+                                {t("safety.updateDownloadedHint", {
+                                  version: cardSwitch.version,
                                 })}
                               </StatusBadge>
                             )}
@@ -3927,18 +4025,36 @@ export function SafetyPolicy({
                                   </Button>
                                 </>
                               ) : (
-                                <Button
-                                  onClick={() => setView("installed")}
-                                  size="sm"
-                                  type="button"
-                                  variant="outline"
-                                >
-                                  {t("safety.viewStatus", {
-                                    status: installationStatusLabel(
-                                      existing.status,
-                                    ),
-                                  })}
-                                </Button>
+                                <>
+                                  <Button
+                                    onClick={() => setView("installed")}
+                                    size="sm"
+                                    type="button"
+                                    variant="outline"
+                                  >
+                                    {t("safety.viewStatus", {
+                                      status: installationStatusLabel(
+                                        existing.status,
+                                      ),
+                                    })}
+                                  </Button>
+                                  {cardSwitch === null ? null : (
+                                    <Button
+                                      disabled={saving}
+                                      onClick={() =>
+                                        chooseInstallation(
+                                          cardSwitch.installation,
+                                        )
+                                      }
+                                      size="sm"
+                                      type="button"
+                                    >
+                                      {t("safety.switchTo", {
+                                        version: cardSwitch.version,
+                                      })}
+                                    </Button>
+                                  )}
+                                </>
                               )
                             }
                           >
@@ -4002,8 +4118,13 @@ export function SafetyPolicy({
                       installation.languages.length > 0
                         ? installation.languages.join(" / ")
                         : t("safety.languageUnknown");
-                    const version = installationVersion(installation);
+                    const release = installationRelease(installation);
                     const update = installationUpdate(installation);
+                    const download =
+                      update !== null && update.downloaded === null
+                        ? update
+                        : null;
+                    const rowSwitch = selected ? switchTarget : null;
                     return (
                       <Panel
                         asChild
@@ -4024,7 +4145,7 @@ export function SafetyPolicy({
                                 <span className="mt-1 block text-xs leading-snug text-muted-foreground">
                                   {installation.variant_name} ·{" "}
                                   {installation.quantization}
-                                  {version === null ? null : ` · v${version}`}
+                                  {release === null ? null : ` · ${release}`}
                                 </span>
                               </div>
                               <StatusBadge
@@ -4054,10 +4175,17 @@ export function SafetyPolicy({
                                 {installation.repo_id}
                               </p>
                             </div>
-                            {update === null ? null : (
+                            {download === null ? null : (
                               <StatusBadge tone="pending">
                                 {t("safety.updateAvailableHint", {
-                                  version: update.version,
+                                  version: download.version,
+                                })}
+                              </StatusBadge>
+                            )}
+                            {rowSwitch === null ? null : (
+                              <StatusBadge tone="pending">
+                                {t("safety.updateDownloadedHint", {
+                                  version: rowSwitch.version,
                                 })}
                               </StatusBadge>
                             )}
@@ -4152,7 +4280,7 @@ export function SafetyPolicy({
                                       : t("safety.usedByPolicy")}
                                   </Button>
                                 ) : null}
-                                {update === null ? null : (
+                                {download === null ? null : (
                                   <Button
                                     disabled={
                                       operationBusy !== null ||
@@ -4161,19 +4289,34 @@ export function SafetyPolicy({
                                     }
                                     onClick={() =>
                                       void prepareCatalogInstallation(
-                                        update.model,
-                                        update.variant,
+                                        download.model,
+                                        download.variant,
                                       )
                                     }
                                     size="sm"
                                     type="button"
                                     variant="outline"
                                   >
-                                    {catalogProbeBusy === update.model.id
+                                    {catalogProbeBusy === download.model.id
                                       ? t("common.checking")
                                       : t("safety.updateTo", {
-                                          version: update.version,
+                                          version: download.version,
                                         })}
+                                  </Button>
+                                )}
+                                {rowSwitch === null ? null : (
+                                  <Button
+                                    disabled={saving}
+                                    onClick={() =>
+                                      chooseInstallation(rowSwitch.installation)
+                                    }
+                                    size="sm"
+                                    type="button"
+                                    variant="outline"
+                                  >
+                                    {t("safety.switchTo", {
+                                      version: rowSwitch.version,
+                                    })}
                                   </Button>
                                 )}
                                 {installation.source !== "local" &&
@@ -4655,6 +4798,7 @@ export function SafetyPolicy({
       {modelPickerOpen ? (
         <InstalledModelPicker
           installations={installations}
+          summary={installationSummary}
           currentID={record?.policy.local_model_id ?? null}
           saving={saving}
           error={typeof error === "string" ? error : (error?.message ?? null)}
@@ -4698,6 +4842,7 @@ export function SafetyPolicy({
         <ModelActionDialog
           action={pendingModelAction}
           installation={pendingActionInstallation}
+          summary={installationSummary(pendingActionInstallation)}
           onCancel={() => setPendingModelAction(null)}
           onConfirm={confirmPendingModelAction}
         />

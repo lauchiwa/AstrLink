@@ -49,6 +49,8 @@ export interface RequestUsage {
   total_tokens: number;
   cache_read_tokens?: number;
   cache_write_tokens?: number;
+  /** The upstream stream ended before final usage was observed. */
+  billing_incomplete?: boolean;
 }
 
 export interface RequestErrorSummary {
@@ -511,6 +513,12 @@ function parseUsage(value: unknown, path: string): RequestUsage | null {
     result.cache_write_tokens = intAt(
       usage.cache_write_tokens,
       `${path}.cache_write_tokens`,
+    );
+  }
+  if (usage.billing_incomplete !== undefined) {
+    result.billing_incomplete = boolAt(
+      usage.billing_incomplete,
+      `${path}.billing_incomplete`,
     );
   }
   return result;

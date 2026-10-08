@@ -28,6 +28,7 @@ type fakePrivacyModelRegistry struct {
 	lastInstall    contract.PrivacyModelInstallRequest
 	lastLocalProbe contract.PrivacyModelLocalProbeRequest
 	lastDeleted    contract.PrivacyModelID
+	refreshes      []bool
 }
 
 func (registry *fakePrivacyModelRegistry) Catalog() contract.PrivacyModelCatalogResponse {
@@ -35,8 +36,10 @@ func (registry *fakePrivacyModelRegistry) Catalog() contract.PrivacyModelCatalog
 }
 
 func (registry *fakePrivacyModelRegistry) CatalogReleases(
-	context.Context,
+	_ context.Context,
+	refresh bool,
 ) (contract.PrivacyModelCatalogResponse, error) {
+	registry.refreshes = append(registry.refreshes, refresh)
 	return registry.releases, registry.releasesErr
 }
 
@@ -248,6 +251,19 @@ func TestPrivacyModelCollectionRoutesAndSelectedDeleteGuard(t *testing.T) {
 	decode(t, response, &releases)
 	if len(releases.Items) != 1 || releases.Items[0].Version == nil {
 		t.Fatalf("releases=%#v", releases)
+	}
+	response = policyRequest(
+		t,
+		handler,
+		http.MethodGet,
+		PrivacyModelReleasesPath+"?refresh=1",
+		"",
+		"",
+		"",
+	)
+	if response.Code != http.StatusOK ||
+		len(registry.refreshes) != 2 || registry.refreshes[0] || !registry.refreshes[1] {
+		t.Fatalf("refresh status=%d refreshes=%v", response.Code, registry.refreshes)
 	}
 	registry.releasesErr = privacymodel.ErrRemoteMetadata
 	response = policyRequest(

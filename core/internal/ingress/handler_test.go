@@ -1177,7 +1177,8 @@ func (store *memoryRequestRecordStore) FindSessionLink(
 				continue
 			}
 			match := storage.SessionLinkMatch{
-				SessionID: *record.SessionID, TurnIndex: record.TurnIndex, TurnUserMessages: record.TurnUserMessages, Value: value,
+				SessionID: *record.SessionID, TurnIndex: record.TurnIndex, TurnUserMessages: record.TurnUserMessages,
+				Status: record.Status, Value: value,
 			}
 			if record.TurnUserFingerprint != nil {
 				match.TurnUserFingerprint = *record.TurnUserFingerprint

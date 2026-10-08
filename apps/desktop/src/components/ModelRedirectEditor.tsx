@@ -40,19 +40,34 @@ type PendingFocus =
   | { kind: "from" | "to" | "remove"; index: number }
   | { kind: "add" };
 
-/** Edits the exact-match, single-hop model redirect table in routing settings. */
+/**
+ * Edits an exact-match, single-hop model redirect table: the routing-settings
+ * table, or one API provider's own table.
+ */
 export function ModelRedirectEditor({
   value,
   onChange,
   modelOptions,
+  scope = "routing",
+  builtins = scope === "service" ? [] : builtinModelRedirects,
+  emptyMessage,
   disabled = false,
   showAllIssues = false,
   onEditingChange,
 }: {
   value: readonly ModelRedirect[];
   onChange: (value: ModelRedirect[]) => void;
-  /** Models listed by enabled API providers. */
+  /** Models listed by enabled API providers, or by the edited provider. */
   modelOptions: readonly string[];
+  /**
+   * `service` edits one provider's table: rules may only target its models,
+   * and the routing-wide built-in rules and retired auto model do not apply.
+   */
+  scope?: "routing" | "service";
+  /** Rows shown before the user's rules; defaults to the routing-wide built-in rules. */
+  builtins?: readonly BuiltinModelRedirect[];
+  /** Shown in place of rows while the table has none. */
+  emptyMessage?: string;
   disabled?: boolean;
   /** Also report blank fields, when automatic saving validates a committed edit. */
   showAllIssues?: boolean;
@@ -70,12 +85,13 @@ export function ModelRedirectEditor({
     [modelOptions],
   );
   // Clients still configured with the retired auto model can be redirected.
+  // A provider's own sources are the clients' names, which it does not list.
   const sourceOptions = useMemo(
-    () => [...targetOptions, astrlinkAutoModelId],
-    [targetOptions],
+    () => (scope === "service" ? [] : [...targetOptions, astrlinkAutoModelId]),
+    [scope, targetOptions],
   );
   const full = value.length >= maxModelRedirects;
-  const builtinRows = builtinModelRedirects.map((builtin, builtinIndex) => {
+  const builtinRows = builtins.map((builtin, builtinIndex) => {
     const index = value.findIndex((redirect) => redirect.from === builtin.from);
     return {
       builtin,
@@ -83,7 +99,7 @@ export function ModelRedirectEditor({
       redirect: value[index] ?? {
         from: builtin.from,
         to: builtin.defaultTo,
-        enabled: false,
+        enabled: builtin.defaultEnabled ?? false,
       },
     };
   });
@@ -170,7 +186,7 @@ export function ModelRedirectEditor({
   const remove = (index: number) => {
     const next = value.filter((_, current) => current !== index);
     const removable = next.flatMap((redirect, current) =>
-      builtinModelRedirects.some((builtin) => builtin.from === redirect.from)
+      builtins.some((builtin) => builtin.from === redirect.from)
         ? []
         : [current],
     );
@@ -244,6 +260,16 @@ export function ModelRedirectEditor({
           </TableRow>
         </TableHeader>
         <TableBody>
+          {rows.length === 0 && emptyMessage ? (
+            <TableRow className="hover:bg-transparent">
+              <TableCell
+                colSpan={5}
+                className="py-6 text-center whitespace-normal text-muted-foreground"
+              >
+                {emptyMessage}
+              </TableCell>
+            </TableRow>
+          ) : null}
           {rows.map(({ redirect, index, builtin }) => {
             const number = index + 1;
             const rowDisabled = disabled || (index < 0 && full);
@@ -254,13 +280,17 @@ export function ModelRedirectEditor({
               issue && (showAllIssues || !incompleteIssues.has(issue))
                 ? issue
                 : undefined;
+            // A provider's built-in rows wait for the models it lists.
             const unlisted =
               !issue &&
-              (!builtin || redirect.enabled) &&
+              (!builtin || (redirect.enabled && scope !== "service")) &&
               redirect.to !== "" &&
               !listed.has(redirect.to);
+            const builtinName = builtin?.id
+              ? t(`modelRedirect.builtin.${builtin.id}.name`)
+              : builtin?.from;
             return (
-              <Fragment key={builtin?.id ?? index}>
+              <Fragment key={builtin ? `builtin:${builtin.from}` : index}>
                 <TableRow
                   data-redirect-row={index}
                   className={shownIssue || unlisted ? "border-b-0" : undefined}
@@ -277,12 +307,22 @@ export function ModelRedirectEditor({
                     />
                   </TableCell>
                   <TableCell className="py-1" data-redirect-field="from">
-                    {builtin ? (
+                    {builtin && !builtin.id ? (
+                      <div className="flex min-w-0 items-center gap-1.5 py-1">
+                        <ModelBrandIcon model={builtin.from} size={16} />
+                        <span className="truncate text-sm" title={builtin.from}>
+                          {builtin.from}
+                        </span>
+                        <span className="shrink-0 text-xs text-muted-foreground">
+                          {t("modelRedirect.builtin.label")}
+                        </span>
+                      </div>
+                    ) : builtin ? (
                       <div className="grid gap-0.5 py-1">
                         <div className="flex flex-wrap items-center gap-x-1.5">
                           <ModelBrandIcon model={builtin.from} size={16} />
                           <span className="text-sm font-medium">
-                            {t(`modelRedirect.builtin.${builtin.id}.name`)}
+                            {builtinName}
                           </span>
                           <span className="text-xs text-muted-foreground">
                             {t("modelRedirect.builtin.label")}
@@ -310,9 +350,7 @@ export function ModelRedirectEditor({
                           // A recognized built-in replaces this input with its
                           // fixed label, so there will be no later blur event.
                           onEditingChange?.(
-                            !builtinModelRedirects.some(
-                              (builtin) => builtin.from === from,
-                            ),
+                            !builtins.some((builtin) => builtin.from === from),
                           );
                           update(index, redirect, { from });
                         }}
@@ -332,9 +370,7 @@ export function ModelRedirectEditor({
                       aria-label={
                         builtin
                           ? t("modelRedirect.builtin.toLabel", {
-                              name: t(
-                                `modelRedirect.builtin.${builtin.id}.name`,
-                              ),
+                              name: builtinName,
                             })
                           : t("modelRedirect.toLabel", { index: number })
                       }
@@ -374,9 +410,12 @@ export function ModelRedirectEditor({
                       >
                         {shownIssue
                           ? issueMessage(shownIssue)
-                          : t("modelRedirect.targetUnlisted", {
-                              model: redirect.to,
-                            })}
+                          : t(
+                              scope === "service"
+                                ? "modelRedirect.serviceTargetUnlisted"
+                                : "modelRedirect.targetUnlisted",
+                              { model: redirect.to },
+                            )}
                       </FormMessage>
                     </TableCell>
                   </TableRow>

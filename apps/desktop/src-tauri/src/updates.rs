@@ -143,15 +143,20 @@ fn notice(phase: &str, auto_download: bool) -> Option<&'static str> {
     }
 }
 
-/// The main window shows its own toast; a native notification covers the
-/// times it cannot be seen: hidden to the tray, minimized, or behind other apps.
-fn notify_unattended(app: &AppHandle, kind: &str, version: &str) {
-    let attended = app.get_webview_window("main").is_some_and(|window| {
+/// False while the main window is hidden to the tray, minimized, or behind
+/// other apps, where its toasts go unseen.
+pub(crate) fn main_window_attended(app: &AppHandle) -> bool {
+    app.get_webview_window("main").is_some_and(|window| {
         window.is_visible().unwrap_or(false)
             && window.is_focused().unwrap_or(false)
             && !window.is_minimized().unwrap_or(false)
-    });
-    if attended {
+    })
+}
+
+/// The main window shows its own toast; a native notification covers the
+/// times it cannot be seen.
+fn notify_unattended(app: &AppHandle, kind: &str, version: &str) {
+    if main_window_attended(app) {
         return;
     }
     let locale = app

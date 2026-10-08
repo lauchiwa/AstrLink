@@ -39,11 +39,16 @@ const (
 	// authorized through the public Grok CLI OAuth client (device code).
 	SubscriptionProviderXAIGrok     SubscriptionProvider = "xai_grok"
 	SubscriptionProviderAntigravity SubscriptionProvider = "antigravity"
+	// SubscriptionProviderGitHubCopilot is a GitHub Copilot subscription
+	// authorized through the OpenCode GitHub OAuth app (device code), the
+	// third-party client GitHub supports for Copilot plans.
+	SubscriptionProviderGitHubCopilot SubscriptionProvider = "github_copilot"
 )
 
 func (provider SubscriptionProvider) Valid() bool {
 	switch provider {
-	case SubscriptionProviderOpenAICodex, SubscriptionProviderClaudeCode, SubscriptionProviderXAIGrok, SubscriptionProviderAntigravity:
+	case SubscriptionProviderOpenAICodex, SubscriptionProviderClaudeCode, SubscriptionProviderXAIGrok,
+		SubscriptionProviderAntigravity, SubscriptionProviderGitHubCopilot:
 		return true
 	default:
 		return false
@@ -58,6 +63,8 @@ func (provider SubscriptionProvider) ServiceKind() ServiceKind {
 		return ServiceKindGrokSubscription
 	case SubscriptionProviderAntigravity:
 		return ServiceKindAntigravitySubscription
+	case SubscriptionProviderGitHubCopilot:
+		return ServiceKindCopilotSubscription
 	default:
 		return ServiceKindCodexSubscription
 	}
@@ -78,6 +85,8 @@ func (provider SubscriptionProvider) Capabilities() []Capability {
 			{Protocol: ProtocolGoogleModels, Mode: CapabilityModeNative},
 			{Protocol: ProtocolOpenAIModels, Mode: CapabilityModeNative},
 		}
+	case SubscriptionProviderGitHubCopilot:
+		return DefaultGitHubCopilotCapabilities()
 	default:
 		return DefaultOpenAICodexCapabilities()
 	}
@@ -94,6 +103,8 @@ func (provider SubscriptionProvider) ConversionTargets() []ProtocolID {
 		return []ProtocolID{ProtocolOpenAIResponses, ProtocolOpenAIChat}
 	case SubscriptionProviderAntigravity:
 		return []ProtocolID{ProtocolGoogleGenerateContent}
+	case SubscriptionProviderGitHubCopilot:
+		return []ProtocolID{ProtocolAnthropicMessages, ProtocolOpenAIResponses, ProtocolOpenAIChat}
 	default:
 		return []ProtocolID{ProtocolOpenAIResponses}
 	}
@@ -145,6 +156,18 @@ func (provider SubscriptionProvider) ValidateCapabilities(capabilities []Capabil
 // CLI proxy (cli-chat-proxy.grok.com): Responses, Chat Completions and Models.
 func DefaultXAIGrokCapabilities() []Capability {
 	return []Capability{
+		{Protocol: ProtocolOpenAIResponses, Mode: CapabilityModeNative, Streaming: true},
+		{Protocol: ProtocolOpenAIChat, Mode: CapabilityModeNative, Streaming: true},
+		{Protocol: ProtocolOpenAIModels, Mode: CapabilityModeNative},
+	}
+}
+
+// DefaultGitHubCopilotCapabilities is the fixed native capability set of the
+// Copilot API: each model is served on Messages, Responses or Chat
+// Completions (see ServiceKind.ModelNativeProtocol), plus the model list.
+func DefaultGitHubCopilotCapabilities() []Capability {
+	return []Capability{
+		{Protocol: ProtocolAnthropicMessages, Mode: CapabilityModeNative, Streaming: true},
 		{Protocol: ProtocolOpenAIResponses, Mode: CapabilityModeNative, Streaming: true},
 		{Protocol: ProtocolOpenAIChat, Mode: CapabilityModeNative, Streaming: true},
 		{Protocol: ProtocolOpenAIModels, Mode: CapabilityModeNative},
@@ -363,7 +386,7 @@ func (flow AuthorizationFlow) SupportedBy(provider SubscriptionProvider) bool {
 	switch provider {
 	case SubscriptionProviderClaudeCode:
 		return flow == AuthorizationFlowCode
-	case SubscriptionProviderXAIGrok:
+	case SubscriptionProviderXAIGrok, SubscriptionProviderGitHubCopilot:
 		return flow == AuthorizationFlowDeviceCode
 	case SubscriptionProviderAntigravity:
 		return flow == AuthorizationFlowBrowser

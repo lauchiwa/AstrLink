@@ -1061,6 +1061,11 @@ func strictEntityTag(raw string) (string, string, bool) {
 
 func suggestedCanonicalKind(label string) *contract.CanonicalKind {
 	normalized := strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(label), "-", "_"))
+	// A label that already names a canonical kind maps to it directly, so
+	// models trained on AstrLink's own kinds need no manual mapping.
+	if canonical := contract.CanonicalKind(strings.ToLower(normalized)); canonical.Valid() {
+		return &canonical
+	}
 	aliases := nymLabelKinds()
 	for alias, kind := range map[string]contract.CanonicalKind{
 		"EMAIL_ADDRESS":   contract.CanonicalKindEmail,

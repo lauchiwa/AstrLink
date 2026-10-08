@@ -8,11 +8,11 @@ import (
 )
 
 type servicePerformance struct {
-	cacheInput, cacheRead, output, generationMs int64
-	cacheSamples, speedSamples                  int64
+	cacheInput, cacheRead, output, durationMs int64
+	cacheSamples, speedSamples                int64
 }
 
-func (stats *servicePerformance) observe(usage contract.Usage, streaming bool, latency, first sql.NullInt64) {
+func (stats *servicePerformance) observe(usage contract.Usage, latency sql.NullInt64) {
 	if usage.BillingIncomplete {
 		return
 	}
@@ -21,9 +21,10 @@ func (stats *servicePerformance) observe(usage contract.Usage, streaming bool, l
 		stats.cacheRead += int64(*usage.CacheReadTokens)
 		stats.cacheSamples++
 	}
-	if streaming && latency.Valid && first.Valid && first.Int64 >= 0 && latency.Int64 >= first.Int64 && usage.OutputTokens > 0 {
+	// Whole call duration, TTFT included, as sessionPerformance measures it.
+	if latency.Valid && latency.Int64 > 0 && usage.OutputTokens > 0 {
 		stats.output += int64(usage.OutputTokens)
-		stats.generationMs += max(latency.Int64-first.Int64, minGenerationMs)
+		stats.durationMs += latency.Int64
 		stats.speedSamples++
 	}
 }
@@ -38,8 +39,8 @@ func (stats *servicePerformance) summary() *storage.ServicePerformance {
 		rate := float64(stats.cacheRead) / float64(stats.cacheInput)
 		result.CacheHitRate = &rate
 	}
-	if stats.generationMs > 0 {
-		rate := float64(stats.output) * 1000 / float64(stats.generationMs)
+	if stats.durationMs > 0 {
+		rate := float64(stats.output) * 1000 / float64(stats.durationMs)
 		result.OutputTokensPerSecond = &rate
 	}
 	return result

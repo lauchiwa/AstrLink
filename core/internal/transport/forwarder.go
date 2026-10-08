@@ -152,6 +152,11 @@ func (forwarder *Forwarder) RoundTrip(request *http.Request, target Target) (*ht
 			return nil, &TargetError{err: err}
 		}
 	}
+	if target.Service.Kind == contract.ServiceKindCopilotSubscription {
+		if err := providerapi.CopilotRequest(outbound); err != nil {
+			return nil, &TargetError{err: err}
+		}
+	}
 	removeHopByHopHeaders(outbound.Header)
 	removeGatewayHeaders(outbound.Header)
 

@@ -1133,6 +1133,64 @@ describe("RequestRecords", () => {
     expect(bridgeMocks.listRequestRecordChildren).not.toHaveBeenCalled();
   });
 
+  // Opening a session hid the list at once and drew the detail only when it
+  // arrived, so the whole workspace flashed blank on every click.
+  it("keeps the list on screen until the session detail arrives", async () => {
+    const detail = deferred<ReturnType<typeof sessionDetail>>();
+    bridgeMocks.getRequestSession.mockReturnValue(detail.promise);
+    await renderRecords();
+    const list = container.querySelector(
+      '[aria-labelledby="request-records-heading"]',
+    )!;
+    const row = container.querySelector<HTMLButtonElement>(
+      `[data-session-id="${firstRecord.id}"]`,
+    )!;
+
+    await act(async () => {
+      row.click();
+      await Promise.resolve();
+    });
+    expect(list.hasAttribute("hidden")).toBe(false);
+    expect(row.getAttribute("aria-current")).toBe("true");
+    expect(
+      container.querySelector('[data-testid="session-performance"]'),
+    ).toBeNull();
+
+    await act(async () => {
+      detail.resolve(sessionDetail(firstRecord));
+      await Promise.resolve();
+    });
+    await flush();
+    expect(list.hasAttribute("hidden")).toBe(true);
+    expect(
+      container.querySelector('[data-testid="session-performance"]'),
+    ).not.toBeNull();
+    // Opening fetched the detail; selecting it did not fetch it again.
+    expect(bridgeMocks.getRequestSession).toHaveBeenCalledTimes(1);
+  });
+
+  it("stays on the list and says so when a session detail cannot be read", async () => {
+    bridgeMocks.getRequestSession.mockRejectedValue(
+      new Error("control plane offline"),
+    );
+    await renderRecords();
+    const list = container.querySelector(
+      '[aria-labelledby="request-records-heading"]',
+    )!;
+    const row = container.querySelector<HTMLButtonElement>(
+      `[data-session-id="${firstRecord.id}"]`,
+    )!;
+
+    await act(async () => {
+      row.click();
+      await Promise.resolve();
+    });
+    await flush();
+    expect(list.hasAttribute("hidden")).toBe(false);
+    expect(row.getAttribute("aria-current")).toBeNull();
+    expect(notifyMocks.error).toHaveBeenCalledWith("control plane offline");
+  });
+
   // A 95-turn conversation is roughly 1400 phase rows. Mounting them all is
   // what made the trajectory tab unusable, so past a threshold the list is
   // windowed and only a screenful plus overscan reaches the DOM.
@@ -2900,6 +2958,8 @@ describe("RequestRecords", () => {
         ) as HTMLButtonElement
       ).click();
     });
+    // WKWebView drops the offset while display: none hides the list.
+    scroller.scrollTop = 0;
     await act(async () => buttonContaining("实时监控").click());
 
     expect(
@@ -2910,6 +2970,47 @@ describe("RequestRecords", () => {
       firstRecord.id,
     );
     expect(requestAnimationFrame).toHaveBeenCalled();
+  });
+
+  it("brings the last session read back into view on return", async () => {
+    await renderRecords();
+    const scroller = container.querySelector(
+      '[data-testid="request-records-scroll"]',
+    );
+    if (!(scroller instanceof HTMLDivElement)) {
+      throw new Error("Missing monitor scroller");
+    }
+    scroller.scrollTop = 40;
+    scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+
+    await act(async () => {
+      (
+        container.querySelector(
+          `[data-session-id="${secondRecord.id}"]`,
+        ) as HTMLButtonElement
+      ).click();
+    });
+    await act(async () =>
+      (
+        document.querySelector(
+          'button[aria-label="更早的会话"]',
+        ) as HTMLButtonElement
+      ).click(),
+    );
+    // The older session sits 30px below the restored view.
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
+      function getBoundingClientRect(this: HTMLElement) {
+        if (this === scroller) return new DOMRect(0, 0, 800, 200);
+        if (this.dataset.sessionId === firstRecord.id) {
+          return new DOMRect(0, 180, 800, 50);
+        }
+        return new DOMRect();
+      },
+    );
+    scroller.scrollTop = 0;
+    await act(async () => buttonContaining("实时监控").click());
+
+    expect(scroller.scrollTop).toBe(70);
   });
 
   it("saves MiB inputs as bytes without changing body capture", async () => {

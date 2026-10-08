@@ -33,6 +33,7 @@ type ServiceModelProber interface {
 type serviceCreateRequest struct {
 	Proxy                     json.RawMessage         `json:"proxy,omitempty"`
 	ResponsesWebSocketEnabled json.RawMessage         `json:"responses_websocket_enabled,omitempty"`
+	ModelRedirects            json.RawMessage         `json:"model_redirects,omitempty"`
 	FailurePolicy             *contract.FailurePolicy `json:"failure_policy,omitempty"`
 	Name                      string                  `json:"name"`
 	Kind                      *contract.ServiceKind   `json:"kind"`
@@ -43,9 +44,10 @@ type serviceCreateRequest struct {
 }
 
 type serviceHTTPInput struct {
-	BaseURL    string          `json:"base_url"`
-	Auth       json.RawMessage `json:"auth"`
-	Credential json.RawMessage `json:"credential,omitempty"`
+	BaseURL       string          `json:"base_url"`
+	Auth          json.RawMessage `json:"auth"`
+	Credential    json.RawMessage `json:"credential,omitempty"`
+	ModelListPath string          `json:"model_list_path,omitempty"`
 	// ExtraHeaders and ModelRules are optional. Omitted keeps the saved value on
 	// patch and stays unset on create; an explicit empty object or array clears
 	// the configuration. contract.ValidateRequestRules refuses any header the
@@ -339,6 +341,14 @@ func (handler *Handler) createService(writer http.ResponseWriter, request *http.
 			return
 		}
 		service.ResponsesWebSocketEnabled = &enabled
+	}
+	if input.ModelRedirects != nil {
+		redirects, err := decodeServiceModelRedirects(input.ModelRedirects)
+		if err != nil {
+			writeError(writer, http.StatusUnprocessableEntity, "invalid_service", err.Error())
+			return
+		}
+		service.ModelRedirects = redirects
 	}
 	models, err := decodeServiceModels(input.Models)
 	if err != nil {
@@ -768,12 +778,23 @@ func (handler *Handler) probeDraftServiceModels(writer http.ResponseWriter, requ
 	// discovery in the editor matches discovery after saving.
 	connection := contract.HTTPConnection{
 		BaseURL: httpInput.BaseURL, Auth: auth,
-		ExtraHeaders: httpInput.ExtraHeaders, ModelRules: httpInput.ModelRules,
+		ModelListPath: httpInput.ModelListPath,
+		ExtraHeaders:  httpInput.ExtraHeaders, ModelRules: httpInput.ModelRules,
 		IdentityProfileID: httpInput.IdentityProfileID,
 	}
 	if err := contract.ValidateRequestRules(connection.ExtraHeaders, connection.ModelRules, auth); err != nil {
 		writeError(writer, http.StatusUnprocessableEntity, "invalid_model_probe", err.Error())
 		return
+	}
+	if connection.ModelListPath != "" {
+		if *input.Kind != contract.ServiceKindCustom {
+			writeError(writer, http.StatusUnprocessableEntity, "invalid_model_probe", "model_list_path is only supported for custom services")
+			return
+		}
+		if err := contract.ValidateModelListPath(connection.ModelListPath); err != nil {
+			writeError(writer, http.StatusUnprocessableEntity, "invalid_model_probe", err.Error())
+			return
+		}
 	}
 	var secret []byte
 	if httpInput.Credential != nil {
@@ -1124,7 +1145,8 @@ func decodeServiceHTTP(
 	}
 	connection = contract.HTTPConnection{
 		BaseURL: input.BaseURL, Auth: auth,
-		ExtraHeaders: input.ExtraHeaders, ModelRules: input.ModelRules,
+		ModelListPath: input.ModelListPath,
+		ExtraHeaders:  input.ExtraHeaders, ModelRules: input.ModelRules,
 		IdentityProfileID: input.IdentityProfileID,
 	}
 	if input.Credential != nil {
@@ -1149,7 +1171,11 @@ func applyServicePatch(
 	if len(patch) == 0 {
 		return service, credential, fmt.Errorf("patch is empty")
 	}
-	allowed := map[string]bool{"proxy": true, "name": true, "enabled": true, "models": true, "failure_policy": true, "responses_websocket_enabled": true, "capabilities": true}
+	allowed := map[string]bool{
+		"proxy": true, "name": true, "enabled": true, "models": true, "failure_policy": true,
+		"responses_websocket_enabled": true, "capabilities": true,
+		"model_redirects": true,
+	}
 	if service.Kind.IsHTTP() {
 		allowed["http"] = true
 	}
@@ -1193,6 +1219,13 @@ func applyServicePatch(
 		}
 		service.Models = models
 	}
+	if raw, ok := patch["model_redirects"]; ok {
+		redirects, err := decodeServiceModelRedirects(raw)
+		if err != nil {
+			return service, credential, err
+		}
+		service.ModelRedirects = redirects
+	}
 	if raw, ok := patch["capabilities"]; ok {
 		capabilities, err := decodeServiceCapabilities(raw)
 		if err != nil {
@@ -1207,7 +1240,8 @@ func applyServicePatch(
 		}
 		for name := range fields {
 			switch name {
-			case "base_url", "auth", "credential", "extra_headers", "model_rules", "identity_profile_id":
+			case "base_url", "auth", "credential", "model_list_path",
+				"extra_headers", "model_rules", "identity_profile_id":
 			default:
 				return service, credential, fmt.Errorf("unknown http field %q", name)
 			}
@@ -1255,6 +1289,12 @@ func applyServicePatch(
 				return service, credential, err
 			}
 			service.HTTP.Auth = auth
+		}
+		if value, ok := fields["model_list_path"]; ok {
+			service.HTTP.ModelListPath = ""
+			if !isJSONNull(value) && strictUnmarshal(value, &service.HTTP.ModelListPath) != nil {
+				return service, credential, fmt.Errorf("invalid model_list_path")
+			}
 		}
 		if value, ok := fields["credential"]; ok {
 			credential.Present = true

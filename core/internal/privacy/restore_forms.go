@@ -26,9 +26,8 @@ const (
 //
 // A model does not always echo a placeholder byte for byte. It writes text in
 // the syntax of whatever it is producing: an HTML page escapes the angle
-// brackets of a marker, a JSON or URL encoder escapes them differently, and a
-// phone number is regrouped into the local convention or a tel: link. Each
-// target is therefore matched in every spelling that still identifies it
+// brackets of a marker, and a JSON or URL encoder escapes them differently.
+// Each target is therefore matched in every spelling that still identifies it
 // unambiguously, and the value is written back in the same syntax, so restoring
 // into an HTML page cannot inject markup and restoring into a URL cannot break
 // it.
@@ -69,7 +68,7 @@ func NewTextRestorer(redactions []Redaction, encoding ValueEncoding) *TextRestor
 		}
 		seen[redaction.Placeholder] = struct{}{}
 		restorer.mappings++
-		spellings, ok := restoreSpellings(redaction.Kind, redaction.Placeholder, redaction.Value, encoding)
+		spellings, ok := restoreSpellings(redaction.Placeholder, redaction.Value, encoding)
 		if !ok {
 			continue
 		}
@@ -144,7 +143,7 @@ func (restorer *TextRestorer) Restore(input string, final bool) (restored string
 
 // restoreSpellings lists the forms a placeholder is recognised in, each paired
 // with the value written in that form's syntax.
-func restoreSpellings(kind Kind, placeholder, value string, encoding ValueEncoding) ([]restoreSpelling, bool) {
+func restoreSpellings(placeholder, value string, encoding ValueEncoding) ([]restoreSpelling, bool) {
 	encoded, ok := encodeRestoredValue(value, encoding)
 	if !ok {
 		return nil, false
@@ -167,9 +166,6 @@ func restoreSpellings(kind Kind, placeholder, value string, encoding ValueEncodi
 			spellings = append(spellings,
 				escapedMarkerSpelling(percentMarkerOpens, body, percentMarkerCloses, percentValue, false))
 		}
-	}
-	for _, grouped := range groupedSpellings(kind, placeholder) {
-		spellings = append(spellings, grouped.spelling(encoded))
 	}
 	return spellings, true
 }
@@ -285,90 +281,6 @@ func escapedMarkerSpelling(opens []string, body string, closes []string, value s
 	}
 }
 
-// groupedDigits matches a natural stand-in after the model regrouped it:
-// separators may be inserted between any two units, and an optional lead byte
-// may precede the first. Word boundaries on both sides stop a match inside a
-// longer number.
-type groupedDigits struct {
-	units      string
-	lead       byte
-	separators string
-	maxGap     int
-}
-
-func (grouped groupedDigits) spelling(value string) restoreSpelling {
-	starts := []byte{grouped.units[0]}
-	if grouped.lead != 0 {
-		starts = append(starts, grouped.lead)
-	}
-	return restoreSpelling{starts: starts, value: value, match: grouped.match}
-}
-
-func (grouped groupedDigits) match(input string, at int, final bool) (int, matchStatus) {
-	if at > 0 && isASCIIAlphanumeric(input[at-1]) {
-		return 0, matchNone
-	}
-	position := at
-	if grouped.lead != 0 && input[position] == grouped.lead {
-		position++
-	}
-	for index := range len(grouped.units) {
-		if index > 0 {
-			for gap := 0; gap < grouped.maxGap && position < len(input) &&
-				strings.IndexByte(grouped.separators, input[position]) >= 0; gap++ {
-				position++
-			}
-		}
-		if position == len(input) {
-			if final {
-				return 0, matchNone
-			}
-			return 0, matchPartial
-		}
-		if input[position] != grouped.units[index] {
-			return 0, matchNone
-		}
-		position++
-	}
-	return matchWordEnd(input, position, final)
-}
-
-// groupedSpellings lists the regrouped forms of a natural stand-in. Only the
-// stand-ins built from a reserved digit block qualify; any other placeholder
-// of these kinds is a token marker.
-func groupedSpellings(kind Kind, placeholder string) []groupedDigits {
-	switch kind {
-	case KindPhone:
-		// +1-555-555-01NN is also written +1 (555) 555-01NN, (555) 555-01NN,
-		// 555.555.01NN, or tel:+155555501NN.
-		const prefix = "+1-555-555-01"
-		if len(placeholder) != len(prefix)+2 || !strings.HasPrefix(placeholder, prefix) ||
-			!allASCIIDigits(placeholder[len(prefix):]) {
-			return nil
-		}
-		national := "55555501" + placeholder[len(prefix):]
-		return []groupedDigits{
-			{units: "1" + national, lead: '+', separators: " -.()", maxGap: 2},
-			{units: national, lead: '(', separators: " -.()", maxGap: 2},
-		}
-	case KindPaymentCard:
-		if len(placeholder) != 16 || !strings.HasPrefix(placeholder, "4000000000000") ||
-			!allASCIIDigits(placeholder) {
-			return nil
-		}
-		return []groupedDigits{{units: placeholder, separators: " -", maxGap: 1}}
-	case KindAccount:
-		const prefix = "XX00REDACTED"
-		if len(placeholder) != len(prefix)+10 || !strings.HasPrefix(placeholder, prefix) ||
-			!allASCIIDigits(placeholder[len(prefix):]) {
-			return nil
-		}
-		return []groupedDigits{{units: placeholder, separators: " ", maxGap: 1}}
-	default:
-		return nil
-	}
-}
-
 // matchLiteral matches literal at input[at:], optionally folding ASCII case.
 func matchLiteral(input string, at int, literal string, fold, final bool) (int, matchStatus) {
 	rest := input[at:]
@@ -441,15 +353,6 @@ func isASCIIAlphanumeric(character byte) bool {
 		(character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z')
 }
 
-func allASCIIDigits(value string) bool {
-	for index := range len(value) {
-		if !isASCIIDigit(value[index]) {
-			return false
-		}
-	}
-	return value != ""
-}
-
 func precedingBackslashes(input string, at int) int {
 	count := 0
 	for at-count > 0 && input[at-count-1] == '\\' {
@@ -479,29 +382,14 @@ func percentEncode(value string) string {
 // restorableSpellingIn reports whether any spelling the restorer would match
 // for this placeholder already occurs in body. Restoring would otherwise
 // rewrite that genuine occurrence as well.
-func restorableSpellingIn(kind Kind, placeholder, body string) bool {
+func restorableSpellingIn(placeholder, body string) bool {
 	if body == "" {
 		return false
 	}
 	if strings.Contains(body, placeholder) {
 		return true
 	}
-	if marker, ok := markerBody(placeholder); ok {
-		// Every marker spelling contains the body verbatim.
-		return strings.Contains(body, marker)
-	}
-	grouped := groupedSpellings(kind, placeholder)
-	if len(grouped) == 0 {
-		return false
-	}
-	restorer := &TextRestorer{mappings: 1}
-	for index, form := range grouped {
-		spelling := form.spelling("")
-		restorer.spellings = append(restorer.spellings, spelling)
-		for _, start := range spelling.starts {
-			restorer.byStart[start] = append(restorer.byStart[start], index)
-		}
-	}
-	_, count, _ := restorer.Restore(body, true)
-	return count > 0
+	// Every marker spelling contains the body verbatim.
+	marker, ok := markerBody(placeholder)
+	return ok && strings.Contains(body, marker)
 }

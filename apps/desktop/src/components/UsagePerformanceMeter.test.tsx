@@ -75,6 +75,11 @@ describe("performance detail popover", () => {
     }));
     await render("service");
     expect(bridge.getUsageSummary).not.toHaveBeenCalled();
+    // The values are the trigger; no separate period row or icon button.
+    const triggers = host.querySelectorAll("button");
+    expect(triggers).toHaveLength(1);
+    expect(triggers[0].textContent).toContain("25.0%");
+    expect(triggers[0].textContent).toContain("40.0 tok/s");
     await open();
     expect(bridge.getUsageSummary).toHaveBeenCalledTimes(3);
     const dialog = document.querySelector('[role="dialog"]')!;
@@ -152,6 +157,24 @@ describe("performance detail popover", () => {
     expect(
       document.querySelector('[role="dialog"]')?.textContent,
     ).not.toContain("99.0%");
+  });
+
+  it("shows a full cache rate without a trailing decimal", async () => {
+    await act(async () =>
+      root.render(
+        <UsagePerformanceMeter
+          performance={{ ...performance, cache_hit_rate: 1 }}
+          status="ready"
+          periodLabel="近 7 天"
+          scopeDescription="所选对象的统计"
+          ready
+          target={{ kind: "service", id: "target_one", name: "Test target" }}
+        />,
+      ),
+    );
+    const text = host.querySelector("button")!.textContent;
+    expect(text).toContain("100%");
+    expect(text).not.toContain("100.0");
   });
 
   it("uses local calendar days instead of relabeling a rolling 24-hour window", () => {

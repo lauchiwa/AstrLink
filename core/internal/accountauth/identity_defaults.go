@@ -32,6 +32,12 @@ const (
 	// this baseline aligned with observed Grok CLI releases.
 	DefaultGrokCLIClientVersion = "1.0.45"
 	grokUserAgentProduct        = "grok-shell"
+
+	// DefaultCopilotClientVersion is the OpenCode release whose GitHub Copilot
+	// client AstrLink presents, with the Copilot API version that release
+	// pins (packages/opencode/src/plugin/github-copilot/copilot.ts).
+	DefaultCopilotClientVersion = "1.18.34"
+	copilotAPIVersion           = "2026-06-01"
 )
 
 // ClientIdentity is one subscription client's upstream identity: its
@@ -73,6 +79,16 @@ func DefaultCodexIdentity() ClientIdentity {
 // DefaultGrokIdentity mirrors Grok Build's shell User-Agent on this host.
 func DefaultGrokIdentity() ClientIdentity {
 	return grokIdentityAt(DefaultGrokCLIClientVersion)
+}
+
+// DefaultCopilotIdentity is OpenCode's GitHub Copilot client: its
+// User-Agent and the API version it pins on Copilot requests.
+func DefaultCopilotIdentity() ClientIdentity {
+	return ClientIdentity{
+		UserAgent: "opencode/" + DefaultCopilotClientVersion,
+		Version:   DefaultCopilotClientVersion,
+		Headers:   map[string]string{"X-Github-Api-Version": copilotAPIVersion},
+	}
 }
 
 func grokIdentityAt(version string) ClientIdentity {

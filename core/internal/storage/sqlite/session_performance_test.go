@@ -48,7 +48,7 @@ func TestSessionPerformancePersistsAndAggregatesEligibleCalls(t *testing.T) {
 	}
 	if detail.DurationMs != 8500 || detail.ToolDurationMs == nil || *detail.ToolDurationMs != 3000 ||
 		detail.AverageTTFTMs == nil || *detail.AverageTTFTMs != 750 ||
-		detail.OutputTokensPerSecond == nil || math.Abs(*detail.OutputTokensPerSecond-240.0/4.5) > 1e-9 {
+		detail.OutputTokensPerSecond == nil || math.Abs(*detail.OutputTokensPerSecond-390.0/8) > 1e-9 {
 		t.Fatalf("unexpected statistics: %+v", detail.RequestSession)
 	}
 	page, err := store.ListRequestSessions(t.Context(), storagecontract.RequestSessionListOptions{From: &nextTurn.StartedAt})
@@ -79,29 +79,25 @@ func TestSessionPerformanceExcludesMissingAndIncompleteSamples(t *testing.T) {
 	}
 }
 
-func TestSessionPerformanceFloorsBurstGenerationTime(t *testing.T) {
+func TestSessionPerformanceDividesByWholeCallDuration(t *testing.T) {
 	start := time.Now()
 	stats := &sessionPerformance{}
 	burst := contract.RequestRecord{ID: "request_burst", StartedAt: start, CompletedAt: ptrTime(start.Add(7200 * time.Millisecond)),
 		InputProtocol: contract.ProtocolOpenAIChat, Streaming: true, LatencyMs: ptrInt(7200), FirstTokenMs: ptrInt(7199),
-		Usage: &contract.Usage{OutputTokens: 5}}
-	stats.observe(string(burst.ID), 0, burst)
+		Usage: &contract.Usage{OutputTokens: 360}}
+	plain := burst
+	plain.ID, plain.Streaming, plain.FirstTokenMs, plain.LatencyMs = "request_plain", false, nil, ptrInt(1800)
+	plain.Usage = &contract.Usage{OutputTokens: 90}
+	instant := plain
+	instant.ID, instant.LatencyMs = "request_instant", ptrInt(0)
+	for _, record := range []contract.RequestRecord{burst, plain, instant} {
+		stats.observe(string(record.ID), 0, record)
+	}
 	var session contract.RequestSession
 	stats.apply(&session)
-	if session.OutputTokensPerSecond == nil || *session.OutputTokensPerSecond != 10 {
-		t.Fatalf("burst generation was not floored at half a second: %+v", session)
-	}
-	zero := burst
-	zero.ID, zero.FirstTokenMs = "request_zero", ptrInt(7200)
-	streamed := burst
-	streamed.ID, streamed.LatencyMs, streamed.FirstTokenMs = "request_streamed", ptrInt(2100), ptrInt(100)
-	streamed.Usage = &contract.Usage{OutputTokens: 200}
-	stats.observe(string(zero.ID), 0, zero)
-	stats.observe(string(streamed.ID), 0, streamed)
-	session = contract.RequestSession{}
-	stats.apply(&session)
-	if session.OutputTokensPerSecond == nil || *session.OutputTokensPerSecond != 210.0/3 {
-		t.Fatalf("burst and streamed calls aggregated incorrectly: %+v", session)
+	if session.OutputTokensPerSecond == nil || *session.OutputTokensPerSecond != 50 ||
+		session.AverageTTFTMs == nil || *session.AverageTTFTMs != 7199 {
+		t.Fatalf("burst and non-streaming calls aggregated incorrectly: %+v", session)
 	}
 }
 

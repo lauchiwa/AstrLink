@@ -295,7 +295,7 @@ describe("RequestConversation", () => {
     expect(bridgeMocks.getRequestAuditContent).toHaveBeenCalledTimes(3);
     await openFirstTurn();
     await vi.waitFor(() => {
-      expect(container.textContent).toContain("3 次工具调用");
+      expect(container.textContent).toContain("Read ×1 · Grep ×1 · Bash ×1");
     });
     const turns = container.querySelectorAll(
       '[data-testid="conversation-turn"]',
@@ -306,12 +306,22 @@ describe("RequestConversation", () => {
     expect(user?.textContent).toContain("修这四条");
     expect(user?.textContent).not.toContain("system-reminder");
     expect(user?.textContent).toContain("客户端附加 1 段系统提示");
-    // The process line counts calls and tools; the reply is Markdown.
+    // The process line counts calls and names the tools; the reply is
+    // Markdown.
     const process = turns[0]!.querySelector(
       '[data-testid="conversation-process"]',
     );
     expect(process?.textContent).toContain("4 次调用");
-    expect(process?.textContent).toContain("3 次工具调用");
+    expect(process?.textContent).toContain("Read ×1 · Grep ×1 · Bash ×1");
+    // Only the last call streamed, so it alone sets TTFT. Output speed covers
+    // all four calls: 200 tokens over 40 s.
+    expect(
+      process?.querySelector('[data-testid="conversation-ttft"]')?.textContent,
+    ).toBe("TTFT 1.2 s");
+    expect(
+      process?.querySelector('[data-testid="conversation-output-speed"]')
+        ?.textContent,
+    ).toBe("5.0 tok/s");
     // Markdown rendering loads lazily; the reply arrives rich once it has.
     await vi.waitFor(() => {
       expect(
@@ -336,6 +346,11 @@ describe("RequestConversation", () => {
       '[data-testid="conversation-process"]',
     );
     expect(single?.textContent).toContain("1 次调用");
+    // It called no tools, so the line leaves the count out.
+    expect(single?.textContent).not.toContain("工具调用");
+    expect(
+      single?.querySelector('[data-testid="conversation-ttft"]'),
+    ).toBeNull();
     expect(
       single?.querySelector(
         '[data-testid="conversation-call"] [data-testid="conversation-reply"]',
@@ -343,6 +358,58 @@ describe("RequestConversation", () => {
     ).toContain("都在。");
     // Bodies were read once per call, nothing more.
     expect(bridgeMocks.getRequestAuditContent).toHaveBeenCalledTimes(5);
+  });
+
+  // Painting the turns before their bodies made the user text, reply and
+  // tool rows pop in a moment after the view opened.
+  it("paints a session once the turn on screen has been read", async () => {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    bridgeMocks.getRequestAuditContent.mockImplementation(
+      async (id: string) => {
+        if (id === "req_5") await held;
+        return contents[id]!;
+      },
+    );
+    render();
+    await flush();
+    const stream = container.querySelector(
+      '[data-testid="conversation-stream"]',
+    )!;
+    // The folded first turn has been read; the latest one has not.
+    expect(bridgeMocks.getRequestAuditContent).toHaveBeenCalledWith("req_1");
+    expect(stream.getAttribute("aria-busy")).toBe("true");
+    expect(stream.classList.contains("invisible")).toBe(true);
+
+    await act(async () => release());
+    await vi.waitFor(() => {
+      expect(stream.getAttribute("aria-busy")).toBe("false");
+    });
+    expect(stream.classList.contains("invisible")).toBe(false);
+    expect(container.textContent).toContain("都在。");
+  });
+
+  it("does not hold a session back for a slow read", async () => {
+    vi.useFakeTimers();
+    try {
+      bridgeMocks.getRequestAuditContent.mockImplementation(
+        () => new Promise(() => {}),
+      );
+      render();
+      const stream = container.querySelector(
+        '[data-testid="conversation-stream"]',
+      )!;
+      expect(stream.getAttribute("aria-busy")).toBe("true");
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(300);
+      });
+      expect(stream.getAttribute("aria-busy")).toBe("false");
+      expect(stream.classList.contains("invisible")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("marks the latest turn while following and the turn in view after scrolling up", async () => {
@@ -475,6 +542,79 @@ describe("RequestConversation", () => {
     await flush();
     expect(scrollTop).toBe(0);
     expect(container.textContent).toContain("1 轮新内容");
+  });
+
+  it("sums up a folded turn: its tools once in view, its reply as one line", async () => {
+    const observed: Element[] = [];
+    let report!: IntersectionObserverCallback;
+    vi.stubGlobal(
+      "IntersectionObserver",
+      class {
+        constructor(callback: IntersectionObserverCallback) {
+          report = callback;
+        }
+        observe(target: Element) {
+          observed.push(target);
+        }
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    try {
+      render();
+      await vi.waitFor(() => {
+        expect(container.textContent).toContain("都在。");
+      });
+      const turns = container.querySelectorAll(
+        '[data-testid="conversation-turn"]',
+      );
+      const process = turns[0]!.querySelector(
+        '[data-testid="conversation-process"]',
+      )!;
+      // The model that answered, then the reply as plain text.
+      await vi.waitFor(() => {
+        expect(
+          process.querySelector('[data-testid="conversation-excerpt"]'),
+        ).not.toBeNull();
+      });
+      const excerpt = process.querySelector(
+        '[data-testid="conversation-excerpt"]',
+      )!;
+      expect(excerpt.textContent).toContain("claude-fable-5-1");
+      expect(
+        excerpt.querySelector('[data-slot="fade-line"]')?.textContent,
+      ).toBe("修完了，两条已提交。");
+      // Out of view, a folded turn reads only its ends.
+      expect(process.textContent).toContain("1 次工具调用");
+      expect(bridgeMocks.getRequestAuditContent).not.toHaveBeenCalledWith(
+        "req_2",
+      );
+      await act(async () => {
+        report(
+          observed.map(
+            (target) =>
+              ({ target, isIntersecting: true }) as IntersectionObserverEntry,
+          ),
+          {} as IntersectionObserver,
+        );
+      });
+      await vi.waitFor(() => {
+        expect(process.textContent).toContain("Read ×1 · Grep ×1 · Bash ×1");
+      });
+      // The turn stays folded: no call rows, and the reply is one line.
+      expect(
+        turns[0]!.querySelector('[data-testid="conversation-call"]'),
+      ).toBeNull();
+      expect(
+        turns[0]!.querySelector('[data-testid="conversation-reply"]'),
+      ).toBeNull();
+      // An open turn shows the whole reply instead of the line.
+      expect(
+        turns[1]!.querySelector('[data-testid="conversation-excerpt"]'),
+      ).toBeNull();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("hangs the reply beneath the call that wrote it and folds it there", async () => {

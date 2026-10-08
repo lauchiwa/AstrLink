@@ -442,37 +442,65 @@ func (store *Store) withSecureDelete(ctx context.Context, checkpoint bool, fn fu
 	return nil
 }
 
+// sealedRawPart is a raw part sealed to the raw sealing key, with the
+// shared chunks its recipe refers to in order.
+type sealedRawPart struct {
+	blob       storagecontract.AuditBlob
+	contentKey []byte
+	refs       []int64
+}
+
 // sealRawPart re-seals a part captured under dek_audit with a fresh part key
 // wrapped to the raw sealing public key. The content key is random: raw
-// parts are never shared, so equal bodies are not linkable.
-func sealRawPart(auditKey []byte, blob storagecontract.AuditBlob, keyID int64, public []byte) (storagecontract.AuditBlob, []byte, error) {
+// parts are never shared, so equal bodies are not linkable. With recipes,
+// what equals a chunk its session shares is referred to rather than copied
+// (rawRecipe); the references must be stored in the transaction that stores
+// the part, and a chunk gone by then makes it stale (errRawRecipeStale).
+func sealRawPart(ctx context.Context, query interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, auditKey []byte, blob storagecontract.AuditBlob, keyID int64, public []byte, recipes bool) (sealedRawPart, error) {
 	plain, err := storagecontract.OpenAuditBlob(auditKey, blob.Nonce, blob.Ciphertext)
 	if err != nil {
-		return storagecontract.AuditBlob{}, nil, err
+		return sealedRawPart{}, err
 	}
 	defer clear(plain)
+	sealed, refs := plain, []int64(nil)
+	blob.Layout = storagecontract.AuditLayoutWhole
+	if recipes {
+		// A lookup that fails only costs the sharing: the part is sealed whole.
+		recipe, recipeRefs, err := rawRecipe(ctx, query, auditKey, blob.RequestID, plain)
+		if err == nil && recipe != nil {
+			defer clear(recipe)
+			sealed, refs = recipe, recipeRefs
+			blob.Layout = storagecontract.AuditLayoutRecipe
+		}
+	}
 	partKey, err := rawseal.NewBlobKey()
 	if err != nil {
-		return storagecontract.AuditBlob{}, nil, err
+		return sealedRawPart{}, err
 	}
 	defer clear(partKey)
-	nonce, ciphertext, err := storagecontract.SealAuditBlob(partKey, plain)
+	nonce, ciphertext, err := storagecontract.SealAuditBlob(partKey, sealed)
 	if err != nil {
-		return storagecontract.AuditBlob{}, nil, err
+		return sealedRawPart{}, err
 	}
 	wrapped, err := rawseal.SealBlobKey(public, rawseal.BlobKeyInfo(string(blob.RequestID), string(blob.Direction)), partKey)
 	if err != nil {
-		return storagecontract.AuditBlob{}, nil, err
+		return sealedRawPart{}, err
 	}
 	contentKey := make([]byte, storagecontract.AuditKeyBytes)
 	if _, err := io.ReadFull(rand.Reader, contentKey); err != nil {
-		return storagecontract.AuditBlob{}, nil, fmt.Errorf("generate raw content key: %w", err)
+		return sealedRawPart{}, fmt.Errorf("generate raw content key: %w", err)
 	}
 	blob.Nonce, blob.Ciphertext = nonce, ciphertext
 	blob.Sealing, blob.RawKeyID, blob.WrappedKey = storagecontract.AuditSealingRawV1, keyID, wrapped
 	blob.Exposure = storagecontract.AuditExposureRaw
-	return blob, contentKey, nil
+	return sealedRawPart{blob: blob, contentKey: contentKey, refs: refs}, nil
 }
+
+// errRawRecipeStale reports a recipe naming a chunk deleted since it was
+// looked up.
+var errRawRecipeStale = errors.New("raw audit recipe names a deleted chunk")
 
 func insertRawPayload(ctx context.Context, executor execer, blob storagecontract.AuditBlob, contentKey []byte) (int64, error) {
 	result, err := executor.ExecContext(ctx, `INSERT INTO audit_payloads (request_id, content_key, nonce, ciphertext, sealing, key_id, wrapped_key)
@@ -483,19 +511,48 @@ VALUES (?, ?, ?, ?, 'raw_v1', ?, ?)`, blob.RequestID, contentKey, blob.Nonce, bl
 	return result.LastInsertId()
 }
 
-func (store *Store) writeRawAuditBlob(ctx context.Context, blob storagecontract.AuditBlob, contentKey []byte) (err error) {
+// writeRawAuditBlob seals a captured raw part and stores it. A recipe that
+// went stale is sealed again whole rather than looked up a second time.
+func (store *Store) writeRawAuditBlob(ctx context.Context, auditKey []byte, blob storagecontract.AuditBlob, keyID int64, public []byte) error {
+	for _, recipes := range []bool{true, false} {
+		part, err := sealRawPart(ctx, store.db, auditKey, blob, keyID, public, recipes)
+		if err != nil {
+			return errRawPartUnsealable
+		}
+		err = store.writeSealedRawPart(ctx, part)
+		clear(part.contentKey)
+		if !errors.Is(err, errRawRecipeStale) {
+			return err
+		}
+	}
+	return errRawRecipeStale
+}
+
+func (store *Store) writeSealedRawPart(ctx context.Context, part sealedRawPart) (err error) {
 	transaction, err := store.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin raw audit write: %w", err)
 	}
 	defer rollbackOnError(transaction, &err)
-	payloadID, err := insertRawPayload(ctx, transaction, blob, contentKey)
+	blob := part.blob
+	payloadID, err := insertRawPayload(ctx, transaction, blob, part.contentKey)
 	if err != nil {
 		return err
 	}
 	blob.Nonce, blob.Ciphertext = []byte{}, []byte{}
 	if err = upsertAuditBlob(ctx, transaction, blob, payloadID); err != nil {
 		return err
+	}
+	if blob.Layout == storagecontract.AuditLayoutRecipe {
+		stored, refErr := insertPartChunkRefs(ctx, transaction, blob.RequestID, blob.Direction, part.refs)
+		if refErr != nil {
+			err = refErr
+			return err
+		}
+		if !stored {
+			err = errRawRecipeStale
+			return err
+		}
 	}
 	return transaction.Commit()
 }
@@ -506,7 +563,8 @@ func (store *Store) writeRawAuditBlob(ctx context.Context, blob storagecontract.
 // audit payload nothing references any more. Run it on a secure-delete
 // connection so the dropped bytes are zeroed.
 const dropRawContent = `exposure = 'raw', nonce = x'', ciphertext = x'',
-    payload_id = CASE WHEN payload_id IN (SELECT id FROM audit_payloads WHERE sealing = 'raw_v1') THEN payload_id END`
+    payload_id = CASE WHEN payload_id IN (SELECT id FROM audit_payloads WHERE sealing = 'raw_v1') THEN payload_id END,
+    layout = CASE WHEN payload_id IN (SELECT id FROM audit_payloads WHERE sealing = 'raw_v1') THEN layout ELSE 'whole' END`
 
 // resealCandidate is one stored part still sealed under dek_audit that
 // readers withhold, with what it looked like when read.
@@ -567,9 +625,8 @@ WHERE b.rowid = ?1
 }
 
 type resealedPart struct {
-	candidate  resealCandidate
-	sealed     storagecontract.AuditBlob
-	contentKey []byte
+	candidate resealCandidate
+	sealedRawPart
 }
 
 // applyReseal points the part at its new raw_v1 payload if it is unchanged
@@ -577,9 +634,27 @@ type resealedPart struct {
 // trigger removes the old payload once nothing references it, and clearing
 // the inline columns drops a legacy copy.
 func applyReseal(ctx context.Context, transaction *sql.Tx, part resealedPart) (bool, error) {
-	payloadID, err := insertRawPayload(ctx, transaction, part.sealed, part.contentKey)
+	payloadID, err := insertRawPayload(ctx, transaction, part.blob, part.contentKey)
 	if err != nil {
 		return false, err
+	}
+	dropPayload := func() (bool, error) {
+		if _, err := transaction.ExecContext(ctx, `DELETE FROM audit_payloads WHERE id = ?`, payloadID); err != nil {
+			return false, fmt.Errorf("drop unused raw payload: %w", err)
+		}
+		return false, nil
+	}
+	if part.blob.Layout == storagecontract.AuditLayoutRecipe {
+		stored, err := insertPartChunkRefs(ctx, transaction, part.blob.RequestID, part.blob.Direction, part.refs)
+		if err != nil {
+			return false, err
+		}
+		if !stored {
+			if _, err := dropPayload(); err != nil {
+				return false, err
+			}
+			return false, errRawRecipeStale
+		}
 	}
 	candidate := part.candidate
 	var oldPayload any
@@ -591,9 +666,10 @@ func applyReseal(ctx context.Context, transaction *sql.Tx, part resealedPart) (b
 		inlineNonce, inlineCiphertext = candidate.blob.Nonce, candidate.blob.Ciphertext
 	}
 	result, err := transaction.ExecContext(ctx, `UPDATE audit_blobs
-SET payload_id = ?1, nonce = x'', ciphertext = x'', exposure = 'raw'
-WHERE rowid = ?2 AND payload_id IS ?3 AND nonce = ?4 AND ciphertext = ?5 AND exposure = ?6`,
-		payloadID, candidate.rowID, oldPayload, inlineNonce, inlineCiphertext, string(candidate.exposure))
+SET payload_id = ?1, nonce = x'', ciphertext = x'', exposure = 'raw', layout = ?7
+WHERE rowid = ?2 AND payload_id IS ?3 AND nonce = ?4 AND ciphertext = ?5 AND exposure = ?6 AND layout = 'whole'`,
+		payloadID, candidate.rowID, oldPayload, inlineNonce, inlineCiphertext, string(candidate.exposure),
+		string(part.blob.Layout))
 	if err != nil {
 		return false, fmt.Errorf("repoint resealed audit blob: %w", err)
 	}
@@ -602,10 +678,11 @@ WHERE rowid = ?2 AND payload_id IS ?3 AND nonce = ?4 AND ciphertext = ?5 AND exp
 		return false, err
 	}
 	if changed == 0 {
-		if _, err := transaction.ExecContext(ctx, `DELETE FROM audit_payloads WHERE id = ?`, payloadID); err != nil {
-			return false, fmt.Errorf("drop unused raw payload: %w", err)
+		if _, err := transaction.ExecContext(ctx, `DELETE FROM audit_part_chunks WHERE request_id = ? AND direction = ?`,
+			part.blob.RequestID, string(part.blob.Direction)); err != nil {
+			return false, fmt.Errorf("drop unused audit part chunks: %w", err)
 		}
-		return false, nil
+		return dropPayload()
 	}
 	return true, nil
 }
@@ -637,6 +714,7 @@ func (store *Store) ResealRawParts(ctx context.Context, limit int) (storagecontr
 	if limit <= 0 || limit > resealBatchParts {
 		limit = resealBatchParts
 	}
+	stale := false
 	err := store.withSecureDelete(ctx, true, func(conn *sql.Conn) error {
 		var cursor int64
 		for {
@@ -662,24 +740,30 @@ func (store *Store) ResealRawParts(ctx context.Context, limit int) (storagecontr
 				if !ok {
 					continue
 				}
-				sealed, contentKey, err := sealRawPart(auditKey, candidate.blob, keyID, public)
+				part, err := sealRawPart(ctx, conn, auditKey, candidate.blob, keyID, public, true)
 				if err != nil {
 					// Unreadable under this audit key; the reader reports it.
 					continue
 				}
-				batch = append(batch, resealedPart{candidate: candidate, sealed: sealed, contentKey: contentKey})
-				batchBytes += len(sealed.Ciphertext)
+				batch = append(batch, resealedPart{candidate: candidate, sealedRawPart: part})
+				batchBytes += len(part.blob.Ciphertext)
 				if batchBytes >= resealBatchBytes {
 					break
 				}
 			}
-			resealed, err := commitReseals(ctx, conn, batch)
+			resealed, batchStale, err := commitReseals(ctx, conn, batch)
 			if err != nil {
 				return err
 			}
 			result.Resealed += resealed
+			stale = stale || batchStale
 		}
 	})
+	if stale && err == nil {
+		// A part whose recipe went stale is still a candidate; the next pass
+		// looks its chunks up afresh.
+		store.deferReseal()
+	}
 	return result, err
 }
 
@@ -723,29 +807,35 @@ ORDER BY b.rowid LIMIT ?2`, cursor, limit)
 	return rowIDs, rows.Err()
 }
 
-func commitReseals(ctx context.Context, conn *sql.Conn, batch []resealedPart) (resealed int, err error) {
+// commitReseals applies a batch and reports whether a part was left behind
+// because its recipe went stale.
+func commitReseals(ctx context.Context, conn *sql.Conn, batch []resealedPart) (resealed int, stale bool, err error) {
 	if len(batch) == 0 {
-		return 0, nil
+		return 0, false, nil
 	}
 	transaction, err := conn.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, fmt.Errorf("begin reseal batch: %w", err)
+		return 0, false, fmt.Errorf("begin reseal batch: %w", err)
 	}
 	defer rollbackOnError(transaction, &err)
 	for _, part := range batch {
 		applied, applyErr := applyReseal(ctx, transaction, part)
+		if errors.Is(applyErr, errRawRecipeStale) {
+			stale = true
+			continue
+		}
 		if applyErr != nil {
 			err = applyErr
-			return 0, err
+			return 0, false, err
 		}
 		if applied {
 			resealed++
 		}
 	}
 	if err = transaction.Commit(); err != nil {
-		return 0, fmt.Errorf("commit reseal batch: %w", err)
+		return 0, false, fmt.Errorf("commit reseal batch: %w", err)
 	}
-	return resealed, nil
+	return resealed, stale, nil
 }
 
 // resealSettledPart reseals one part that just settled to raw. The request
@@ -775,13 +865,19 @@ func (store *Store) resealSettledPart(ctx context.Context, id contract.RequestID
 		if err != nil || !ok {
 			return err
 		}
-		sealed, contentKey, err := sealRawPart(auditKey, candidate.blob, keyID, public)
-		if err != nil {
-			return errRawPartUnsealable
+		// A recipe that went stale is sealed again whole: this part must not
+		// wait for a later pass under dek_audit.
+		for _, recipes := range []bool{true, false} {
+			part, err := sealRawPart(ctx, conn, auditKey, candidate.blob, keyID, public, recipes)
+			if err != nil {
+				return errRawPartUnsealable
+			}
+			_, stale, err := commitReseals(ctx, conn, []resealedPart{{candidate: candidate, sealedRawPart: part}})
+			if err != nil || !stale {
+				return err
+			}
 		}
-		defer clear(contentKey)
-		_, err = commitReseals(ctx, conn, []resealedPart{{candidate: candidate, sealed: sealed, contentKey: contentKey}})
-		return err
+		return nil
 	})
 	if errors.Is(sealErr, errRawPartUnsealable) {
 		return store.dropRawPart(ctx, id, direction)

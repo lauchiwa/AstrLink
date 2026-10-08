@@ -124,9 +124,18 @@ func ValidPrivacyKind(kind string) bool {
 // private_person, private_address, and private_date have no reserved namespace
 // to draw from, so any natural stand-in risks colliding with a real person or
 // place, and a plausible fake date would be reasoned over as if it were true.
+//
+// phone, payment_card, and account are numbers people write in many ways. A
+// model regroups a stand-in number in the convention of whatever it is writing,
+// cites only its last digits, or remarks on what the reserved range means (a
+// fictional 555 line, a test card), and no restorer can follow every such
+// rewrite back to the original. An opaque marker leaves nothing to rewrite.
+// Natural style stays for email, url, and ip_address, whose syntax admits a
+// single spelling.
 func PlaceholderStyleLocked(kind string) bool {
 	switch kind {
-	case "common_secret", "private_person", "private_address", "private_date":
+	case "common_secret", "private_person", "private_address", "private_date",
+		"phone", "payment_card", "account":
 		return true
 	default:
 		return false
@@ -138,16 +147,11 @@ func PlaceholderStyleLocked(kind string) bool {
 // url and ip_address default to disabled: they are the dominant false-positive
 // source for coding agents, whose prompts are dense with documentation links,
 // loopback addresses, and repository URLs that carry no user PII.
-//
-// phone defaults to token although it has a reserved stand-in. A model
-// rewrites a number in the convention of whatever it is writing, and the
-// fictional block holds only 100 numbers, so a sample number the model makes up
-// can coincide with a stand-in. An opaque marker fails loudly instead.
 func DefaultPrivacyKindRules() []PolicyKindRule {
 	rules := make([]PolicyKindRule, 0, len(PrivacyKinds()))
 	for _, kind := range PrivacyKinds() {
 		style := PlaceholderStyleNatural
-		if PlaceholderStyleLocked(kind) || kind == "phone" {
+		if PlaceholderStyleLocked(kind) {
 			style = PlaceholderStyleToken
 		}
 		enabled := kind != "url" && kind != "ip_address"

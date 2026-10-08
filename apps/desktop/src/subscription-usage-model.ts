@@ -446,6 +446,12 @@ export function parseSubscriptionUsageReset(
 
 const planTypeLabels: Record<SubscriptionProvider, Record<string, string>> = {
   antigravity: {},
+  github_copilot: {
+    free: "Free",
+    individual: "Individual",
+    business: "Business",
+    enterprise: "Enterprise",
+  },
   openai_codex: {
     plus: "Plus",
     pro: "Pro 20×",

@@ -74,7 +74,13 @@ func (cache *sessionFingerprints) get(ctx context.Context, blobs AuditBlobPersis
 
 // sessionLookup adapts the record store to convo.Lookup, binding the
 // principal to the local access token that authenticated this request.
-func sessionLookup(store RequestRecordStore, accessTokenID *contract.AccessTokenID) convo.Lookup {
+// statuses, when not nil, learns each matched record's status under
+// matchKey, since convo.Match has no room for it.
+func sessionLookup(
+	store RequestRecordStore,
+	accessTokenID *contract.AccessTokenID,
+	statuses map[string]contract.RequestStatus,
+) convo.Lookup {
 	if store == nil {
 		return nil
 	}
@@ -88,6 +94,9 @@ func sessionLookup(store RequestRecordStore, accessTokenID *contract.AccessToken
 			return convo.Match{}, false, err
 		}
 		result := convo.Match{SessionID: string(match.SessionID), Kind: kind, Value: match.Value}
+		if statuses != nil {
+			statuses[matchKey(result)] = match.Status
+		}
 		// A row that stored a turn but no comparison state (written before
 		// migration v23) cannot tell the next request whether it is a new
 		// turn; treat it as unknown so the count restarts instead of
@@ -101,6 +110,11 @@ func sessionLookup(store RequestRecordStore, accessTokenID *contract.AccessToken
 		}
 		return result, true, nil
 	}
+}
+
+// matchKey names a match by the cursor that found it.
+func matchKey(match convo.Match) string {
+	return string(match.Kind) + "\x00" + match.Value
 }
 
 func contractCursors(cursors []convo.Cursor) []contract.SessionCursor {

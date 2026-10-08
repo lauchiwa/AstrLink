@@ -939,6 +939,66 @@ func TestPassthroughCapabilityModesMergeToNative(t *testing.T) {
 	}
 }
 
+// A policy saved by an earlier build stores every kind rule, including the
+// natural style that phone, payment_card, and account no longer accept.
+func TestPrivacyNumberKindsMigrateToTokenStyle(t *testing.T) {
+	database, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "astrlink.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	migrations := DefaultMigrations()
+	target := -1
+	for position, migration := range migrations {
+		if migration.Name == "privacy_token_kinds_audit_chunks" {
+			target = position
+		}
+	}
+	if target < 0 {
+		t.Fatal("privacy_token_kinds_audit_chunks migration is missing")
+	}
+	before, err := New(SQLDatabase{DB: database}, migrations[:target])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := before.Up(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(
+		`UPDATE policies SET document_json = json_set(document_json, '$.kind_rules', json(?)) WHERE id = 'policy_privacy_default'`,
+		`[{"kind":"common_secret","enabled":true,"style":"token"},`+
+			`{"kind":"payment_card","enabled":false,"style":"natural"},`+
+			`{"kind":"account","enabled":true,"style":"natural"},`+
+			`{"kind":"email","enabled":true,"style":"natural"},`+
+			`{"kind":"phone","enabled":true,"style":"natural"},`+
+			`{"kind":"url","enabled":false,"style":"token"}]`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	latest, err := New(SQLDatabase{DB: database}, migrations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := latest.Up(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var rules string
+	if err := database.QueryRow(
+		`SELECT json_extract(document_json, '$.kind_rules') FROM policies WHERE id = 'policy_privacy_default'`,
+	).Scan(&rules); err != nil {
+		t.Fatal(err)
+	}
+	want := `[{"kind":"common_secret","enabled":true,"style":"token"},` +
+		`{"kind":"payment_card","enabled":false,"style":"token"},` +
+		`{"kind":"account","enabled":true,"style":"token"},` +
+		`{"kind":"email","enabled":true,"style":"natural"},` +
+		`{"kind":"phone","enabled":true,"style":"token"},` +
+		`{"kind":"url","enabled":false,"style":"token"}]`
+	if rules != want {
+		t.Fatalf("kind_rules = %s\nwant %s", rules, want)
+	}
+}
+
 // A development build once recorded request_model_redirect as migration 34.
 // After rebasing onto privacy_tool_declaration_defaults, Up must reject that
 // database unchanged instead of skipping 34 and re-adding the column in 35.

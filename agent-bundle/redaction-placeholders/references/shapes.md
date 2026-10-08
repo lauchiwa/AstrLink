@@ -10,9 +10,9 @@ one.
 | Email address | `<PRIVATE_EMAIL_…>`          | `redacted-…@private.invalid`  |
 | URL           | `<PRIVATE_URL_…>`            | `https://private.invalid/r/…` |
 | IP address    | `<PRIVATE_IP_ADDRESS_…>`     | `192.0.2.17`, `203.0.113.9`   |
-| Phone number  | `<PRIVATE_PHONE_…>`          | `+1-555-555-0142`             |
-| Payment card  | `<PRIVATE_PAYMENT_CARD_…>`   | `4000000000000123`            |
-| Bank account  | `<PRIVATE_ACCOUNT_NUMBER_…>` | `XX00REDACTED0123456789`      |
+| Phone number  | `<PRIVATE_PHONE_…>`          | none                          |
+| Payment card  | `<PRIVATE_PAYMENT_CARD_…>`   | none                          |
+| Bank account  | `<PRIVATE_ACCOUNT_NUMBER_…>` | none                          |
 | Secret        | `<SECRET_…>`                 | none                          |
 | Person name   | `<PRIVATE_PERSON_…>`         | none                          |
 | Address       | `<PRIVATE_ADDRESS_…>`        | none                          |
@@ -22,17 +22,16 @@ one.
 
 - The angle brackets belong to the marker. Copy `<`, the name, the suffix, and
   `>` together.
-- Secrets, person names, addresses, and dates are always markers.
+- Secrets, phone numbers, card and account numbers, person names, addresses, and
+  dates are always markers.
 - A secret marker can cover a key name together with its value, for example a
   whole `password=…` assignment. Keep the marker where it is and edit around it.
 
 ## Natural stand-ins
 
 - Each one is a syntactically valid value of its type, drawn from ranges that
-  are reserved and can never be real: the `.invalid` top-level domain, the RFC
-  5737 and RFC 3849 documentation address blocks, the fictional `555-01NN`
-  telephone range, card numbers that fail the Luhn check, and the unassigned
-  `XX` country code.
+  are reserved and can never be real: the `.invalid` top-level domain and the
+  RFC 5737 and RFC 3849 documentation address blocks.
 - An IPv4 original becomes an IPv4 stand-in and an IPv6 original becomes an IPv6
   stand-in such as `2001:db8::3f2a:91c0:7b4e`.
 - A kind set to natural stand-ins falls back to a marker when its reserved range

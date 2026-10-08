@@ -17,6 +17,7 @@ const kindMarks: Record<ServiceKind, Mark> = {
   claude_subscription: "claude",
   grok_subscription: "grok",
   antigravity_subscription: "antigravity",
+  copilot_subscription: "copilot",
   opencode_go: "opencode",
   opencode_zen: "opencode",
   moonshot: "kimi",

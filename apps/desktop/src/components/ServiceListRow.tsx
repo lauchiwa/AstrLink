@@ -27,7 +27,7 @@ const tracks: Record<ServiceListColumn, string> = {
   models: "minmax(6rem,0.6fr)",
   usage: "minmax(7.5rem,1.2fr)",
   billing: "minmax(4.75rem,0.7fr)",
-  performance: "minmax(5.25rem,0.7fr)",
+  performance: "minmax(6.5rem,0.7fr)",
   status: "2.25rem",
 };
 

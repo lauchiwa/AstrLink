@@ -14,7 +14,8 @@ import (
 const (
 	spellingPersonMarker = "<PRIVATE_PERSON_6ad1158cae28c183>"
 	spellingPersonValue  = `Zoë "Z" O'Neil`
-	spellingPhone        = "+1-555-555-0152"
+	spellingPhoneBare    = "PRIVATE_PHONE_0b3f6c2a9d1e4f57"
+	spellingPhone        = "<" + spellingPhoneBare + ">"
 	spellingPhoneValue   = "+86 138 0013 8000"
 )
 
@@ -41,8 +42,8 @@ func writeSSEEvents(t *testing.T, writer *restoringResponseWriter, events ...map
 }
 
 // TestRestoringWriterRestoresCodexPatchSpellings reproduces a Codex
-// apply_patch that wrote a person marker HTML-escaped and a phone stand-in
-// regrouped into an HTML page. A custom tool's input is raw text, so values are
+// apply_patch that wrote markers into an HTML page HTML-escaped and, inside a
+// tel: link, without brackets. A custom tool's input is raw text, so values are
 // written as is rather than escaped for JSON.
 func TestRestoringWriterRestoresCodexPatchSpellings(t *testing.T) {
 	recorder := httptest.NewRecorder()
@@ -55,8 +56,8 @@ func TestRestoringWriterRestoresCodexPatchSpellings(t *testing.T) {
 	fragments := []string{
 		"*** Add File: index.html\n+<footer>&lt;PRIVATE_PERSON_6ad1",
 		"158cae28c183&gt;</footer>\n+<!-- " + spellingPersonMarker + " -->\n" +
-			`+<a href="tel:+15555550152">+1 (555) 555-01`,
-		"52</a>",
+			`+<a href="tel:` + spellingPhoneBare + `">&lt;PRIVATE_PHONE_0b3f`,
+		"6c2a9d1e4f57&gt;</a>",
 	}
 	input := strings.Join(fragments, "")
 	item := func(input string) map[string]any {
@@ -140,8 +141,9 @@ func TestRestoringWriterRestoresCodexPatchSpellings(t *testing.T) {
 }
 
 // TestRestoringWriterReleasesHeldSpellingWhenChannelEnds pins the latency
-// contract: a number at the very end of a delta is held only until the stream
-// says that text is finished, not until the response ends.
+// contract: a bare marker at the very end of a delta, which could still run
+// into a longer word, is held only until the stream says that text is finished,
+// not until the response ends.
 func TestRestoringWriterReleasesHeldSpellingWhenChannelEnds(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	writer := newRestoringResponseWriter(
@@ -152,14 +154,14 @@ func TestRestoringWriterReleasesHeldSpellingWhenChannelEnds(t *testing.T) {
 
 	writeSSEEvents(t, writer, map[string]any{
 		"type": "response.output_text.delta", "item_id": "msg_1",
-		"output_index": 0, "content_index": 0, "delta": "Call +1 (555) 555-0152",
+		"output_index": 0, "content_index": 0, "delta": "Call " + spellingPhoneBare,
 	})
 	if recorder.Body.Len() != 0 {
-		t.Fatalf("a number that may continue was released early: %s", recorder.Body.String())
+		t.Fatalf("a marker that may continue was released early: %s", recorder.Body.String())
 	}
 	writeSSEEvents(t, writer, map[string]any{
 		"type": "response.output_text.done", "item_id": "msg_1",
-		"output_index": 0, "content_index": 0, "text": "Call +1 (555) 555-0152",
+		"output_index": 0, "content_index": 0, "text": "Call " + spellingPhoneBare,
 	})
 	want := "Call " + spellingPhoneValue
 	got := visibleSSEText(t, contract.ProtocolOpenAIResponses, recorder.Body.Bytes())
@@ -184,7 +186,7 @@ func TestRestoringWriterResolvesSpellingInFinishingChatChunk(t *testing.T) {
 	writeSSEEvents(t, writer, map[string]any{
 		"choices": []any{map[string]any{
 			"index":         0,
-			"delta":         map[string]any{"content": "Call 555.555.0152"},
+			"delta":         map[string]any{"content": "Call " + spellingPhoneBare},
 			"finish_reason": "stop",
 		}},
 	})
@@ -194,7 +196,7 @@ func TestRestoringWriterResolvesSpellingInFinishingChatChunk(t *testing.T) {
 }
 
 // TestRestoringWriterTreatsBufferedResponseAsFinal covers a non-streaming body,
-// whose text cannot continue even when it ends in a number.
+// whose text cannot continue even when it ends in a bare marker.
 func TestRestoringWriterTreatsBufferedResponseAsFinal(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	writer := newRestoringResponseWriter(
@@ -202,7 +204,7 @@ func TestRestoringWriterTreatsBufferedResponseAsFinal(t *testing.T) {
 	)
 	writer.Header().Set("Content-Type", "application/json")
 	writer.WriteHeader(http.StatusOK)
-	body := `{"candidates":[{"content":{"parts":[{"text":"Call +1 (555) 555-0152"}]}}]}`
+	body := `{"candidates":[{"content":{"parts":[{"text":"Call ` + spellingPhoneBare + `"}]}}]}`
 	if _, err := writer.Write([]byte(body)); err != nil {
 		t.Fatal(err)
 	}
@@ -222,7 +224,7 @@ func TestRestoringWriterRestoresSpellingsInPlainTextStream(t *testing.T) {
 	)
 	writer.Header().Set("Content-Type", "text/plain")
 	writer.WriteHeader(http.StatusOK)
-	for _, chunk := range []string{"&lt;PRIVATE_PERSON_6ad1158cae28c183&gt; at +1 (555) 555-01", "52"} {
+	for _, chunk := range []string{"&lt;PRIVATE_PERSON_6ad1158cae28c183&gt; at PRIVATE_PHONE_0b3f", "6c2a9d1e4f57"} {
 		if _, err := writer.Write([]byte(chunk)); err != nil {
 			t.Fatal(err)
 		}

@@ -1086,7 +1086,16 @@ describe("desktop bridge contract", () => {
     await expect(getPrivacyModelReleases()).resolves.toEqual({
       items: [release],
     });
-    expect(invokeMock).toHaveBeenLastCalledWith("get_privacy_model_releases");
+    expect(invokeMock).toHaveBeenLastCalledWith("get_privacy_model_releases", {
+      refresh: false,
+    });
+    invokeMock.mockResolvedValueOnce({ items: [release] });
+    await expect(getPrivacyModelReleases(true)).resolves.toEqual({
+      items: [release],
+    });
+    expect(invokeMock).toHaveBeenLastCalledWith("get_privacy_model_releases", {
+      refresh: true,
+    });
     invokeMock.mockResolvedValueOnce({
       items: [{ ...release, version: "v0.2.0" }],
     });

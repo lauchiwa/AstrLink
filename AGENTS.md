@@ -53,6 +53,21 @@ identify AstrLink as the forwarding client.
   storage, control APIs, and explicitly installed debug tools may retain their
   product names; they are not gateway-injected upstream identity.
 
+## Database migrations
+
+Schema migrations are listed in `core/internal/storage/migrate/defaults.go`.
+
+- Migrations not yet pushed to the remote `main` branch must be merged into one
+  version. Before adding one, fetch and compare with the pushed list
+  (`git show github/main:core/internal/storage/migrate/defaults.go`). If an
+  unpushed version exists, add the new statements to it and rename it for the
+  combined change instead of adding another version; update tests that look it
+  up by name.
+- Never change a pushed version; add the next version after it.
+- A database that already applied the unpushed version under its old name fails
+  the migration history check after the merge. Tell the user; do not delete or
+  edit that database yourself.
+
 ## Documentation changes
 
 - Do not modify README files, including those in subdirectories, unless the user

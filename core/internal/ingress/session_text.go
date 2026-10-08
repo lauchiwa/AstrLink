@@ -3,6 +3,7 @@ package ingress
 import (
 	"encoding/json"
 	"regexp"
+	"slices"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -78,6 +79,27 @@ func sanitizePreview(raw string) string {
 		return contract.ClampRunes(sentence, contract.MaxInputPreviewRunes)
 	}
 	return contract.ClampRunes(truncatePreview(line, previewTargetRunes), contract.MaxInputPreviewRunes)
+}
+
+// maskProtected replaces every occurrence of what a privacy decision
+// protected with the ellipsis sanitizePreview uses for secrets. The replacer
+// tries values in argument order, so the longest go first: a value inside a
+// longer one must not leave the longer one's remainder in the clear.
+func maskProtected(text string, values []string) string {
+	ordered := slices.Clone(values)
+	slices.SortStableFunc(ordered, func(left, right string) int {
+		return len(right) - len(left)
+	})
+	pairs := make([]string, 0, 2*len(ordered))
+	for _, value := range ordered {
+		if value != "" {
+			pairs = append(pairs, value, "…")
+		}
+	}
+	if len(pairs) == 0 {
+		return text
+	}
+	return strings.NewReplacer(pairs...).Replace(text)
 }
 
 // firstPreviewLine returns the first line that keeps words after markup and

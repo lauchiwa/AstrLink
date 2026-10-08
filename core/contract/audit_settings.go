@@ -8,13 +8,16 @@ import (
 )
 
 const (
-	DefaultRequestBodyMaxBytes     = 1_048_576
+	// Agent requests carry their whole history; 32 MiB is the largest body
+	// the Anthropic Messages API accepts. Bodies are stored as chunks shared
+	// within a session, so a long session no longer grows with its square.
+	DefaultRequestBodyMaxBytes     = 33_554_432
 	DefaultResponseContentMaxBytes = 4_194_304
 	DefaultMetadataRetentionDays   = 30
 	DefaultContentRetentionDays    = 7
 
 	MinRequestBodyMaxBytes     = 1024
-	MaxRequestBodyMaxBytes     = 16_777_216
+	MaxRequestBodyMaxBytes     = 67_108_864
 	MinResponseContentMaxBytes = 1024
 	MaxResponseContentMaxBytes = 67_108_864
 	MinMetadataRetentionDays   = 1

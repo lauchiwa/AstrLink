@@ -74,13 +74,17 @@ export const PRIVACY_KINDS: readonly CanonicalPrivacyKind[] = [
 
 /**
  * Kinds whose placeholder shape is fixed. A credential dressed up as a
- * usable-looking key invites the model to actually call an API with it, and
- * names, addresses, and dates have no reserved namespace to draw a safe
- * stand-in from.
+ * usable-looking key invites the model to actually call an API with it; names,
+ * addresses, and dates have no reserved namespace to draw a safe stand-in from;
+ * and a stand-in phone, card, or account number is regrouped, cut down to its
+ * last digits, or remarked on by the model in ways restoration cannot follow.
  */
 export const PLACEHOLDER_STYLE_LOCKED_KINDS: ReadonlySet<CanonicalPrivacyKind> =
   new Set([
     "common_secret",
+    "payment_card",
+    "account",
+    "phone",
     "private_person",
     "private_address",
     "private_date",
@@ -835,17 +839,13 @@ export function parsePrivacyPolicy(value: unknown, path = "$"): PrivacyPolicy {
 /**
  * Mirrors core/contract.DefaultPrivacyKindRules for responses that predate the
  * field. url and ip_address are off because they were the dominant
- * false-positive source for coding agents. phone uses token because models
- * regroup its stand-in and its fictional block is small.
+ * false-positive source for coding agents.
  */
 export function defaultPrivacyKindRules(): PrivacyKindRule[] {
   return PRIVACY_KINDS.map((kind) => ({
     kind,
     enabled: kind !== "url" && kind !== "ip_address",
-    style:
-      PLACEHOLDER_STYLE_LOCKED_KINDS.has(kind) || kind === "phone"
-        ? "token"
-        : "natural",
+    style: PLACEHOLDER_STYLE_LOCKED_KINDS.has(kind) ? "token" : "natural",
   }));
 }
 

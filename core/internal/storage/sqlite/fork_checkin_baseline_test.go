@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"reflect"
@@ -20,6 +21,7 @@ import (
 	"github.com/QuantumNous/astrlink/core/contract"
 	"github.com/QuantumNous/astrlink/core/internal/secretstore"
 	storagecontract "github.com/QuantumNous/astrlink/core/internal/storage"
+	"github.com/QuantumNous/astrlink/core/internal/storage/migrate"
 )
 
 const (
@@ -228,6 +230,18 @@ func TestForkCheckinBaselineProcess(t *testing.T) {
 		t.Fatalf("unknown baseline mode %q", mode)
 	}
 	store, err := Open(context.Background(), path, options...)
+	// An upstream sync can add main migrations, so this older Core may be
+	// behind the database. Refusing it is the designed outcome; the parent
+	// decides which outcome to expect by comparing schema versions.
+	if os.Getenv("ASTRLINK_CHECKIN_BASELINE_EXPECT") == "schema_newer" {
+		if !errors.Is(err, migrate.ErrDatabaseNewer) {
+			if err == nil {
+				_ = store.Close()
+			}
+			t.Fatalf("baseline %s opened a newer database: %v", mode, err)
+		}
+		return
+	}
 	if err != nil {
 		t.Fatal(err)
 	}

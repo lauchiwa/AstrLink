@@ -43,6 +43,9 @@ type Manager struct {
 	antigravitySessions     *accountauth.SessionManager
 	antigravityTokens       *accountauth.TokenSource
 	antigravityConfig       accountauth.OAuthConfig
+	copilotSessions         *accountauth.SessionManager
+	copilotTokens           *accountauth.TokenSource
+	copilotConfig           accountauth.OAuthConfig
 	provider                *CodexProvider
 	now                     func() time.Time
 	newID                   func() (contract.SubscriptionAccountID, error)
@@ -65,7 +68,7 @@ type usageCacheEntry struct {
 // NewManager wires one OAuth client per provider. oauth configures Codex.
 // overrides customize the other providers: an override whose Provider is set
 // applies to that provider; unlabeled overrides apply positionally to Claude
-// Code and then xAI Grok. Unspecified providers use their public defaults
+// Code, xAI Grok, Antigravity and then GitHub Copilot. Unspecified providers use their public defaults
 // while sharing oauth's HTTP client and clock.
 func NewManager(accounts AccountStore, credentials accountauth.AccountCredentialStore, oauth accountauth.OAuthConfig, overrides ...accountauth.OAuthConfig) (*Manager, error) {
 	if accounts == nil {
@@ -109,6 +112,11 @@ func NewManager(accounts AccountStore, credentials accountauth.AccountCredential
 	manager.antigravitySessions = accountauth.NewSessionManager(antigravity, credentials, manager.persistAuthorizedTokens)
 	manager.antigravityTokens = accountauth.NewTokenSource(credentials, accountauth.NewTokenClient(antigravity), antigravity.RefreshSkew, now)
 	manager.antigravityTokens.SetHooks(manager.onTokenRotated, manager.onInvalidGrant)
+	copilot := providerOverride(overrides, contract.SubscriptionProviderGitHubCopilot, 3, oauth)
+	manager.copilotConfig = copilot
+	manager.copilotSessions = accountauth.NewSessionManager(copilot, credentials, manager.persistAuthorizedTokens)
+	manager.copilotTokens = accountauth.NewTokenSource(credentials, accountauth.NewTokenClient(copilot), copilot.RefreshSkew, now)
+	manager.copilotTokens.SetHooks(manager.onTokenRotated, manager.onInvalidGrant)
 	return manager, nil
 }
 
@@ -148,6 +156,8 @@ func (manager *Manager) sessionsFor(provider contract.SubscriptionProvider) *acc
 		return manager.grokSessions
 	case contract.SubscriptionProviderAntigravity:
 		return manager.antigravitySessions
+	case contract.SubscriptionProviderGitHubCopilot:
+		return manager.copilotSessions
 	default:
 		return manager.sessions
 	}
@@ -161,13 +171,15 @@ func (manager *Manager) tokensFor(provider contract.SubscriptionProvider) *accou
 		return manager.grokTokens
 	case contract.SubscriptionProviderAntigravity:
 		return manager.antigravityTokens
+	case contract.SubscriptionProviderGitHubCopilot:
+		return manager.copilotTokens
 	default:
 		return manager.tokens
 	}
 }
 
 func (manager *Manager) allSessions() []*accountauth.SessionManager {
-	return []*accountauth.SessionManager{manager.sessions, manager.claudeSessions, manager.grokSessions, manager.antigravitySessions}
+	return []*accountauth.SessionManager{manager.sessions, manager.claudeSessions, manager.grokSessions, manager.antigravitySessions, manager.copilotSessions}
 }
 
 func (manager *Manager) invalidateTokens(id contract.ServiceID) {
@@ -175,6 +187,7 @@ func (manager *Manager) invalidateTokens(id contract.ServiceID) {
 	manager.claudeTokens.Invalidate(id)
 	manager.grokTokens.Invalidate(id)
 	manager.antigravityTokens.Invalidate(id)
+	manager.copilotTokens.Invalidate(id)
 }
 
 func (manager *Manager) activateTokens(id contract.ServiceID) {
@@ -182,6 +195,7 @@ func (manager *Manager) activateTokens(id contract.ServiceID) {
 	manager.claudeTokens.Activate(id)
 	manager.grokTokens.Activate(id)
 	manager.antigravityTokens.Activate(id)
+	manager.copilotTokens.Activate(id)
 }
 
 func (manager *Manager) AuthorizationBoundary() string {
@@ -455,6 +469,8 @@ func (manager *Manager) Usage(ctx context.Context, id contract.ServiceID) (contr
 		usage, err = manager.grokUsage(ctx, tokens)
 	case contract.SubscriptionProviderAntigravity:
 		usage, err = manager.antigravityUsage(ctx, tokens)
+	case contract.SubscriptionProviderGitHubCopilot:
+		usage, err = manager.copilotUsage(ctx, tokens)
 	default:
 		usage, err = manager.provider.Usage(ctx, tokens)
 	}
@@ -538,6 +554,8 @@ func usageProviderLabel(provider contract.SubscriptionProvider) string {
 		return "grok"
 	case contract.SubscriptionProviderAntigravity:
 		return "antigravity"
+	case contract.SubscriptionProviderGitHubCopilot:
+		return "copilot"
 	default:
 		return "codex"
 	}
@@ -561,6 +579,8 @@ func (manager *Manager) APIBaseURLFor(provider contract.SubscriptionProvider) st
 		return manager.grokConfig.APIBaseURL
 	case contract.SubscriptionProviderAntigravity:
 		return manager.antigravityConfig.APIBaseURL
+	case contract.SubscriptionProviderGitHubCopilot:
+		return manager.copilotConfig.APIBaseURL
 	default:
 		return manager.APIBaseURL()
 	}

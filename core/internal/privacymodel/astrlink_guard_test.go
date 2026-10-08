@@ -302,7 +302,7 @@ func TestAstrLinkGuardReleaseSkipsIncompatibleTagsAndInstallsUpdate(t *testing.T
 		t.Fatal(err)
 	}
 
-	releases, err := registry.CatalogReleases(context.Background())
+	releases, err := registry.CatalogReleases(context.Background(), false)
 	if err != nil || len(releases.Items) != 1 {
 		t.Fatalf("releases=%#v err=%v", releases, err)
 	}
@@ -324,10 +324,15 @@ func TestAstrLinkGuardReleaseSkipsIncompatibleTagsAndInstallsUpdate(t *testing.T
 		t.Fatalf("int8 total=%d want=%d", latest.Variants[0].BytesTotal, int8Total)
 	}
 	checked := hub.requests.Load()
-	if _, err := registry.CatalogReleases(context.Background()); err != nil ||
+	if _, err := registry.CatalogReleases(context.Background(), false); err != nil ||
 		hub.requests.Load() != checked {
 		t.Fatalf("release check was not cached: err=%v requests=%d->%d",
 			err, checked, hub.requests.Load())
+	}
+	if _, err := registry.CatalogReleases(context.Background(), true); err != nil ||
+		hub.requests.Load() == checked {
+		t.Fatalf("refresh reused the cached release check: err=%v requests=%d",
+			err, hub.requests.Load())
 	}
 
 	for revision, want := range map[string]error{
@@ -408,7 +413,7 @@ func TestAstrLinkGuardReleaseRejectsChecksumsThatDisagreeWithHub(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := registry.CatalogReleases(context.Background()); !errors.Is(err, ErrRemoteMetadata) {
+	if _, err := registry.CatalogReleases(context.Background(), false); !errors.Is(err, ErrRemoteMetadata) {
 		t.Fatalf("tampered release error=%v", err)
 	}
 	if _, err := registry.Install(context.Background(), contract.PrivacyModelInstallRequest{

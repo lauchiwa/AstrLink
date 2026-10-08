@@ -246,7 +246,13 @@ describe("privacy-policy IPC contract", () => {
     expect(parsed.kind_rules).toEqual(defaultPrivacyKindRules());
     expect(parsed.allowlist_rules).toEqual([]);
 
-    for (const kind of ["common_secret", "private_person"] as const) {
+    for (const kind of [
+      "common_secret",
+      "private_person",
+      "phone",
+      "payment_card",
+      "account",
+    ] as const) {
       expect(() =>
         parsePrivacyPolicyPage({
           items: [

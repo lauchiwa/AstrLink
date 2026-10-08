@@ -72,8 +72,8 @@ func (store *Store) FindSessionLink(
 	// client-chosen ids such as prompt_cache_key that no response emits.
 	query := strings.Builder{}
 	args := make([]any, 0, 5*len(cleaned)+2*len(scopeArgs)+1)
-	query.WriteString(`SELECT session_id, turn_index, turn_user_messages, turn_user_fingerprint, value FROM (
-SELECT r.session_id, r.turn_index, r.turn_user_messages, r.turn_user_fingerprint, c.value AS value,
+	query.WriteString(`SELECT session_id, turn_index, turn_user_messages, turn_user_fingerprint, value, status FROM (
+SELECT r.session_id, r.turn_index, r.turn_user_messages, r.turn_user_fingerprint, c.value AS value, r.status,
        CASE WHEN c.direction = 'out' THEN 0 ELSE 1 END AS priority,
        r.started_at, r.id
 FROM request_record_cursors c
@@ -93,7 +93,7 @@ WHERE c.kind = ? AND c.value IN (` + placeholders + `)`)
 			query.WriteString(`
 UNION ALL
 SELECT r.session_id, r.turn_index, r.turn_user_messages, r.turn_user_fingerprint,
-       r.` + column + ` AS value, ? AS priority, r.started_at, r.id
+       r.` + column + ` AS value, r.status, ? AS priority, r.started_at, r.id
 FROM request_records r
 WHERE r.` + column + ` IN (` + placeholders + `)
   AND r.parent_request_id IS NULL AND r.session_id IS NOT NULL`)
@@ -107,11 +107,11 @@ WHERE r.` + column + ` IN (` + placeholders + `)
 ) ORDER BY priority ASC, started_at DESC, id DESC LIMIT 1`)
 
 	var (
-		sessionID, turnUserFingerprint, value sql.NullString
-		turnIndex, turnUserMessages           sql.NullInt64
+		sessionID, turnUserFingerprint, value, status sql.NullString
+		turnIndex, turnUserMessages                   sql.NullInt64
 	)
 	err := store.db.QueryRowContext(ctx, query.String(), args...).Scan(
-		&sessionID, &turnIndex, &turnUserMessages, &turnUserFingerprint, &value,
+		&sessionID, &turnIndex, &turnUserMessages, &turnUserFingerprint, &value, &status,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -126,7 +126,7 @@ WHERE r.` + column + ` IN (` + placeholders + `)
 	if err := id.Validate(); err != nil {
 		return storagecontract.SessionLinkMatch{}, false, fmt.Errorf("%w: session %q", storagecontract.ErrInvalidRecord, sessionID.String)
 	}
-	match := storagecontract.SessionLinkMatch{SessionID: id, Value: value.String}
+	match := storagecontract.SessionLinkMatch{SessionID: id, Value: value.String, Status: contract.RequestStatus(status.String)}
 	if turnIndex.Valid && turnIndex.Int64 >= 1 {
 		turn := int(turnIndex.Int64)
 		match.TurnIndex = &turn

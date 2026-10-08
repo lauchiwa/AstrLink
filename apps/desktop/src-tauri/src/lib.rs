@@ -15,6 +15,7 @@ mod i18n;
 mod kek_store;
 #[cfg(target_os = "macos")]
 mod macos_app;
+mod model_updates;
 mod preferences;
 mod provider_import;
 mod proxy_check;
@@ -1901,8 +1902,12 @@ async fn update_privacy_policy(
     etag: String,
     patch: serde_json::Value,
     manager: State<'_, Arc<CoreManager>>,
+    model_updates: State<'_, Arc<model_updates::PrivacyModelUpdates>>,
 ) -> Result<PolicyRecordResponse, String> {
-    manager.update_privacy_policy(&etag, patch).await
+    let record = manager.update_privacy_policy(&etag, patch).await?;
+    // Switching models settles the reminder now, not on the next tick.
+    model_updates.wake();
+    Ok(record)
 }
 
 #[tauri::command]
@@ -1929,9 +1934,16 @@ async fn get_privacy_model_catalog(
 
 #[tauri::command]
 async fn get_privacy_model_releases(
+    refresh: Option<bool>,
     manager: State<'_, Arc<CoreManager>>,
+    model_updates: State<'_, Arc<model_updates::PrivacyModelUpdates>>,
 ) -> Result<serde_json::Value, String> {
-    manager.get_privacy_model_releases().await
+    let releases = manager
+        .get_privacy_model_releases(refresh.unwrap_or(false))
+        .await?;
+    // The page may have seen a release the reminder has not.
+    model_updates.recheck();
+    Ok(releases)
 }
 
 #[tauri::command]
@@ -2055,6 +2067,7 @@ pub fn run() {
         .manage(Mutex::new(InspectorRegistry::default()))
         .manage(tray::TrayState::default())
         .manage(Arc::new(client_updates::ClientUpdateManager::default()))
+        .manage(Arc::new(model_updates::PrivacyModelUpdates::default()))
         .manage(provider_import::ProviderImports::default())
         .invoke_handler(tauri::generate_handler![
             fork_checkin::fork_checkin_operation,
@@ -2065,6 +2078,7 @@ pub fn run() {
             client_updates::refresh_local_clients,
             client_updates::update_local_clients,
             updates::app_update_status,
+            model_updates::privacy_model_update_status,
             updates::check_app_update,
             updates::download_app_update,
             updates::install_app_update,
@@ -2222,6 +2236,7 @@ pub fn run() {
 
             tray::build(app.handle())?;
             tray::start(app.handle());
+            model_updates::start(app.handle());
 
             let deep_link = app.deep_link();
             // Installers register the scheme; this repairs portable copies.

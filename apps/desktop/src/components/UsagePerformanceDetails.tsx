@@ -1,3 +1,5 @@
+import type { HTMLAttributes } from "react";
+import { cn } from "@/lib/utils";
 import { useT } from "../i18n";
 import {
   usePerformanceDetails,
@@ -14,6 +16,59 @@ import {
   TableHeader,
   TableRow,
 } from "./ui/table";
+
+/** The muted unit after a cache rate or speed. */
+export function PerformanceUnit({
+  className,
+  ...props
+}: HTMLAttributes<HTMLSpanElement>) {
+  return (
+    <span
+      className={cn("text-micro font-normal text-muted-foreground", className)}
+      {...props}
+    />
+  );
+}
+
+/** A full cache rate reads 100 rather than 100.0. */
+export function formatCacheRate(rate: number) {
+  const percent = (rate * 100).toFixed(1);
+  return percent === "100.0" ? "100" : percent;
+}
+
+/** Cache rate with its unit; a missing value stays a bare placeholder. */
+export function CacheRate({
+  value,
+  placeholder,
+}: {
+  value?: number | null;
+  placeholder: string;
+}) {
+  if (value == null) return placeholder;
+  return (
+    <>
+      {formatCacheRate(value)}
+      <PerformanceUnit>%</PerformanceUnit>
+    </>
+  );
+}
+
+/** Output speed with its unit; a missing value stays a bare placeholder. */
+export function TokensPerSecond({
+  value,
+  placeholder,
+}: {
+  value?: number | null;
+  placeholder: string;
+}) {
+  if (value == null) return placeholder;
+  // The unit never wraps onto a line of its own in a narrow column.
+  return (
+    <span className="whitespace-nowrap">
+      {value.toFixed(1)} <PerformanceUnit>tok/s</PerformanceUnit>
+    </span>
+  );
+}
 
 export function UsagePerformanceDetails({
   target,
@@ -99,9 +154,10 @@ export function UsagePerformanceDetails({
                 </TableCell>
                 <TableCell className="text-right">
                   <div className="font-semibold">
-                    {performance?.cache_hit_rate == null
-                      ? placeholder
-                      : `${(performance.cache_hit_rate * 100).toFixed(1)}%`}
+                    <CacheRate
+                      value={performance?.cache_hit_rate}
+                      placeholder={placeholder}
+                    />
                   </div>
                   <div className="mt-1 whitespace-normal text-micro text-muted-foreground">
                     {status === "ready"
@@ -113,9 +169,10 @@ export function UsagePerformanceDetails({
                 </TableCell>
                 <TableCell className="pr-0 text-right">
                   <div className="font-semibold">
-                    {performance?.output_tokens_per_second == null
-                      ? placeholder
-                      : performance.output_tokens_per_second.toFixed(1)}
+                    <TokensPerSecond
+                      value={performance?.output_tokens_per_second}
+                      placeholder={placeholder}
+                    />
                   </div>
                   <div className="mt-1 whitespace-normal text-micro text-muted-foreground">
                     {status === "ready"

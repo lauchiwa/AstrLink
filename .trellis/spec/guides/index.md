@@ -1,12 +1,14 @@
 # Thinking Guides
 
-> **Purpose**: Expand your thinking to catch things you might not have considered.
+> **Purpose**: Expand your thinking to catch things you might not have
+> considered.
 
 ---
 
 ## Why Thinking Guides?
 
-**Most bugs and tech debt come from "didn't think of that"**, not from lack of skill:
+**Most bugs and tech debt come from "didn't think of that"**, not from lack of
+skill:
 
 - Didn't think about what happens at layer boundaries → cross-layer bugs
 - Didn't think about code patterns repeating → duplicated code everywhere
@@ -19,10 +21,11 @@ These guides help you **ask the right questions before coding**.
 
 ## Available Guides
 
-| Guide | Purpose | When to Use |
-|-------|---------|-------------|
-| [Code Reuse Thinking Guide](./code-reuse-thinking-guide.md) | Identify patterns and reduce duplication | When you notice repeated patterns |
-| [Cross-Layer Thinking Guide](./cross-layer-thinking-guide.md) | Think through data flow across layers | Features spanning multiple layers |
+| Guide                                                             | Purpose                                  | When to Use                                  |
+| ----------------------------------------------------------------- | ---------------------------------------- | -------------------------------------------- |
+| [Code Reuse Thinking Guide](./code-reuse-thinking-guide.md)       | Identify patterns and reduce duplication | When you notice repeated patterns            |
+| [Cross-Layer Thinking Guide](./cross-layer-thinking-guide.md)     | Think through data flow across layers    | Features spanning multiple layers            |
+| [Upstream Sync Thinking Guide](./upstream-sync-thinking-guide.md) | Keep the fork cheap to sync              | Resolving a conflict against `upstream/main` |
 
 ---
 
@@ -51,19 +54,39 @@ These guides help you **ask the right questions before coding**.
 
 → Read [Code Reuse Thinking Guide](./code-reuse-thinking-guide.md)
 
+### When to Think About Upstream Divergence
+
+- [ ] You are resolving a conflict against `upstream/main`
+- [ ] You are about to delete or rewrite an upstream step, command, or default
+- [ ] You are appending a schema migration, or two sides claim the same version
+- [ ] A fork-owned test or admission gate fails after a sync
+- [ ] You are editing a file to find out later whether upstream owns it
+
+→ Read [Upstream Sync Thinking Guide](./upstream-sync-thinking-guide.md)
+
 ### When Verifying AI Cross-Review Results
 
-- [ ] Reviewer claims "user input can be malicious" → Check the actual data source (internal manifest? user config? external API?)
-- [ ] Reviewer flags "missing validation" → Is the data from a trusted internal source?
-- [ ] Reviewer says "behavior change" → Read the code comments — is it intentional design?
-- [ ] Reviewer identifies a "bug" in test → Mentally delete the feature being tested — does the test still pass? If yes → tautological test
+- [ ] Reviewer claims "user input can be malicious" → Check the actual data
+      source (internal manifest? user config? external API?)
+- [ ] Reviewer flags "missing validation" → Is the data from a trusted internal
+      source?
+- [ ] Reviewer says "behavior change" → Read the code comments — is it
+      intentional design?
+- [ ] Reviewer identifies a "bug" in test → Mentally delete the feature being
+      tested — does the test still pass? If yes → tautological test
 
 **Common AI reviewer false-positive patterns**:
-1. **Trust boundary confusion**: Treating internal data (bundled JSON manifests) as untrusted external input
-2. **Ignoring design comments**: Flagging intentional behavior documented in code comments as bugs
-3. **Variable misreading**: Not tracing a variable to its actual definition (e.g., Map keyed by path vs name)
 
-**Verification rule**: Every CRITICAL/WARNING finding must be verified against the actual code before prioritizing. Budget ~35% false-positive rate for AI reviews.
+1. **Trust boundary confusion**: Treating internal data (bundled JSON manifests)
+   as untrusted external input
+2. **Ignoring design comments**: Flagging intentional behavior documented in
+   code comments as bugs
+3. **Variable misreading**: Not tracing a variable to its actual definition
+   (e.g., Map keyed by path vs name)
+
+**Verification rule**: Every CRITICAL/WARNING finding must be verified against
+the actual code before prioritizing. Budget ~35% false-positive rate for AI
+reviews.
 
 ---
 

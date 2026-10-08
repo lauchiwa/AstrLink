@@ -53,7 +53,9 @@ type Store struct {
 	// settleDeferred holds the in-flight requests whose part a failed settle
 	// left pending; their end asks for another reseal pass.
 	settleDeferred sync.Map
-	now            func() time.Time
+	// chunker moves finished request bodies into session chunks.
+	chunker auditChunkWorker
+	now     func() time.Time
 }
 
 // Option configures Open.
@@ -304,6 +306,7 @@ func (store *Store) Close() error {
 	if store == nil {
 		return nil
 	}
+	store.stopAuditChunker()
 	store.keys.clear()
 	if store.db == nil {
 		return nil

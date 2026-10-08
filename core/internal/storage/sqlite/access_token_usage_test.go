@@ -71,7 +71,7 @@ func TestAccessTokenUsageCountsAllHistoryAndLocalDayWithoutRetryDuplicates(t *te
 		}
 		if items[0].TodayPerformance.CacheSamples != todayTokens/3 || items[0].TotalPerformance.SpeedSamples != totalTokens/3 ||
 			items[0].TodayPerformance.CacheHitRate == nil || *items[0].TodayPerformance.CacheHitRate != 0.5 ||
-			items[0].TotalPerformance.OutputTokensPerSecond == nil || *items[0].TotalPerformance.OutputTokensPerSecond != 1.25 {
+			items[0].TotalPerformance.OutputTokensPerSecond == nil || *items[0].TotalPerformance.OutputTokensPerSecond != 1 {
 			t.Fatalf("performance was capped or incorrectly counted: %+v", items[0])
 		}
 	}
@@ -148,18 +148,18 @@ func TestAccessTokenPerformanceAcrossProvidersAndPeriods(t *testing.T) {
 		t.Fatalf("items=%+v err=%v", items, err)
 	}
 	for _, test := range []struct {
-		stats        storagecontract.ServicePerformance
-		cache, speed float64
-		samples      int64
+		stats                      storagecontract.ServicePerformance
+		cache, speed               float64
+		cacheSamples, speedSamples int64
 	}{
-		{items[0].TodayPerformance, .26, 240.0 / 4.5, 2},
-		{items[0].TotalPerformance, .63, 500.0 / 6.5, 3},
+		{items[0].TodayPerformance, .26, 390.0 / 8, 2, 3},
+		{items[0].TotalPerformance, .63, 650.0 / 11, 3, 4},
 	} {
-		if test.stats.CacheHitRate == nil || math.Abs(*test.stats.CacheHitRate-test.cache) > 1e-9 || test.stats.OutputTokensPerSecond == nil || math.Abs(*test.stats.OutputTokensPerSecond-test.speed) > 1e-9 || test.stats.CacheSamples != test.samples || test.stats.SpeedSamples != test.samples {
+		if test.stats.CacheHitRate == nil || math.Abs(*test.stats.CacheHitRate-test.cache) > 1e-9 || test.stats.OutputTokensPerSecond == nil || math.Abs(*test.stats.OutputTokensPerSecond-test.speed) > 1e-9 || test.stats.CacheSamples != test.cacheSamples || test.stats.SpeedSamples != test.speedSamples {
 			t.Fatalf("incorrect token performance: %+v", test.stats)
 		}
 	}
-	if got := items[1].TodayPerformance; got.CacheHitRate == nil || *got.CacheHitRate != 0 || got.OutputTokensPerSecond != nil || got.CacheSamples != 1 || got.SpeedSamples != 0 {
+	if got := items[1].TodayPerformance; got.CacheHitRate == nil || *got.CacheHitRate != 0 || got.OutputTokensPerSecond == nil || *got.OutputTokensPerSecond != 75 || got.CacheSamples != 1 || got.SpeedSamples != 1 {
 		t.Fatalf("zero/unknown lost: %+v", got)
 	}
 }

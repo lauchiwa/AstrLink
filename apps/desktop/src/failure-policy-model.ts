@@ -113,13 +113,17 @@ export const maxModelRedirects = 200;
 export const maxRedirectModelLength = 256;
 export const astrlinkAutoModelId = "astrlink/auto";
 
-/** Built-in redirects are always shown; missing entries default to disabled. */
+/**
+ * A built-in redirect row is always shown. Until the user changes it, it
+ * uses its default target and switch state; a change is saved as a rule.
+ */
 export interface BuiltinModelRedirect {
-  /** Key under `modelRedirect.builtin` in the locales. */
-  id: "codexAutoReview";
+  /** Key under `modelRedirect.builtin` in the locales. A row without one is labeled by its source model. */
+  id?: "codexAutoReview";
   from: string;
-  /** Default target; only forwarded after the user enables and saves the rule. */
   defaultTo: string;
+  /** Routing-wide built-in rules start off; a provider's start on. */
+  defaultEnabled?: boolean;
 }
 
 export const builtinModelRedirects: readonly BuiltinModelRedirect[] = [
@@ -385,7 +389,7 @@ export function parseFailoverPolicy(
   };
 }
 
-function parseModelRedirects(value: unknown): ModelRedirect[] {
+export function parseModelRedirects(value: unknown): ModelRedirect[] {
   if (value === undefined) return [];
   if (!Array.isArray(value) || value.length > maxModelRedirects)
     throw Error("model_redirects: expected an array");

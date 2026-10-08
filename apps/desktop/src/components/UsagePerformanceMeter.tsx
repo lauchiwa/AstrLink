@@ -1,8 +1,14 @@
-import { useEffect, useId, useState } from "react";
+import { type ReactNode, useEffect, useId, useState } from "react";
 import { useT } from "../i18n";
 import type { ServicePerformance, UsageStatus } from "../usage-range";
 import type { PerformanceTarget } from "../use-performance-details";
-import { UsagePerformanceDetails } from "./UsagePerformanceDetails";
+import {
+  CacheRate,
+  formatCacheRate,
+  PerformanceUnit,
+  TokensPerSecond,
+  UsagePerformanceDetails,
+} from "./UsagePerformanceDetails";
 import { Activity } from "./icons";
 import { DataField } from "./DataRow";
 import { Button } from "./ui/button";
@@ -34,25 +40,13 @@ export function UsagePerformanceMeter({
     if (!ready) setOpen(false);
   }, [ready]);
   const titleId = useId();
+  const valuesId = useId();
   const cache = performance?.cache_hit_rate;
   const speed = performance?.output_tokens_per_second;
   const placeholder = status === "loading" ? "…" : "—";
-  const details = (
+  const details = (trigger: ReactNode) => (
     <Popover open={open && ready} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <Button
-          aria-label={t("services.performanceDetailsFor", {
-            name: target.name,
-          })}
-          className={layout !== "fields" ? "justify-end" : undefined}
-          disabled={!ready}
-          size="icon-xs"
-          variant="ghost"
-          type="button"
-        >
-          <Activity aria-hidden="true" className="text-muted-foreground" />
-        </Button>
-      </PopoverTrigger>
+      <PopoverTrigger asChild>{trigger}</PopoverTrigger>
       <PopoverContent align="end" className="w-96" aria-labelledby={titleId}>
         <UsagePerformanceDetails
           target={target}
@@ -63,6 +57,9 @@ export function UsagePerformanceMeter({
       </PopoverContent>
     </Popover>
   );
+  const detailsLabel = t("services.performanceDetailsFor", {
+    name: target.name,
+  });
   if (layout === "fields") {
     return (
       <div
@@ -77,17 +74,37 @@ export function UsagePerformanceMeter({
           label={t("services.cacheUtilization")}
           value={
             <span className="font-semibold">
-              {cache == null ? placeholder : `${(cache * 100).toFixed(1)}%`}
+              <CacheRate value={cache} placeholder={placeholder} />
             </span>
           }
         />
+        {/* The details button sits beside the label so the value keeps the
+            whole column; the negative margin keeps the label row height. */}
         <DataField
           className="row-span-2 grid grid-rows-subgrid"
-          label="TPS"
+          label={
+            <span className="inline-flex items-center gap-1">
+              TPS
+              {details(
+                <Button
+                  aria-label={detailsLabel}
+                  className="-my-0.75"
+                  disabled={!ready}
+                  size="icon-xs"
+                  variant="ghost"
+                  type="button"
+                >
+                  <Activity
+                    aria-hidden="true"
+                    className="text-muted-foreground"
+                  />
+                </Button>,
+              )}
+            </span>
+          }
           value={
-            <span className="inline-flex items-center gap-1 font-semibold">
-              {speed == null ? placeholder : speed.toFixed(1)}
-              {details}
+            <span className="font-semibold">
+              <TokensPerSecond value={speed} placeholder={placeholder} />
             </span>
           }
         />
@@ -99,44 +116,82 @@ export function UsagePerformanceMeter({
       </div>
     );
   }
-  return (
-    <div
+  // Units share the last column, so "%" and "tok/s" start at the same edge and
+  // the numbers end at the same edge. Each label stays with its own number,
+  // so a long TPS can use the space under the longer cache label. A missing
+  // value keeps its unit invisible, so every provider reserves the same width.
+  const metricRow = (
+    label: string,
+    amount: string | null,
+    unit: string,
+    spaced = false,
+  ) => (
+    <span
       className={cn(
-        "grid gap-1 text-xs tabular-nums",
-        layout === "service" &&
-          "flex flex-wrap items-center gap-x-3 @[640px]/service-list:grid @[640px]/service-list:gap-x-1",
+        "col-span-full grid grid-cols-subgrid items-baseline gap-x-0.5",
+        layout === "service" && "flex @[640px]/service-list:grid",
+      )}
+    >
+      <span className="flex items-baseline justify-between gap-1.5">
+        <span className="text-muted-foreground">{label}</span>
+        <span>{amount ?? placeholder}</span>
+      </span>
+      {/* Grid and flex drop this space from layout; it only keeps the unit a
+          separate word in the text alternative. */}
+      {spaced && amount != null ? " " : null}
+      <PerformanceUnit
+        aria-hidden={amount == null || undefined}
+        className={cn(amount == null && "invisible")}
+      >
+        {unit}
+      </PerformanceUnit>
+    </span>
+  );
+  // The two values open the details themselves, like the billing amount next
+  // to them; the range selector above the list already names the period.
+  return details(
+    <Button
+      aria-describedby={valuesId}
+      aria-label={detailsLabel}
+      className={cn(
+        "h-auto w-full justify-start px-0 text-left text-xs font-normal tabular-nums",
+        layout === "service" && "w-fit @[640px]/service-list:w-full",
       )}
       data-testid={testId}
+      disabled={!ready}
+      size="xs"
+      variant="ghost"
+      type="button"
     >
-      <div className="flex items-center justify-between gap-2">
-        <span className="text-muted-foreground">
-          {t("services.cacheUtilization")}
-        </span>
-        <span>
-          {cache == null ? placeholder : `${(cache * 100).toFixed(1)}%`}
-        </span>
-      </div>
-      <div className="flex items-center justify-between gap-2">
-        <span className="text-muted-foreground">TPS</span>
-        <span>{speed == null ? placeholder : speed.toFixed(1)}</span>
-      </div>
-      <div
+      <span
         className={cn(
-          "flex items-center justify-between gap-2 text-micro text-muted-foreground",
-          layout === "service" && "ml-auto @[640px]/service-list:ml-0",
+          "grid w-full grid-cols-[1fr_auto] gap-x-0.5 gap-y-1",
+          layout === "service" &&
+            "flex flex-wrap items-center gap-x-3 @[640px]/service-list:grid @[640px]/service-list:gap-x-0.5",
         )}
+        id={valuesId}
       >
-        <span
-          className={cn(
-            layout === "service" &&
-              status !== "error" &&
-              "sr-only @[640px]/service-list:not-sr-only",
-          )}
-        >
-          {status === "error" ? t("services.performanceError") : periodLabel}
-        </span>
-        {details}
-      </div>
-    </div>
+        <span className="sr-only">{periodLabel}</span>
+        {status === "error" ? (
+          <span className="col-span-full text-muted-foreground">
+            {t("services.performanceError")}
+          </span>
+        ) : (
+          <>
+            {metricRow(
+              t("services.cacheUtilization"),
+              cache == null ? null : formatCacheRate(cache),
+              "%",
+            )}
+            {metricRow(
+              "TPS",
+              speed == null ? null : speed.toFixed(1),
+              "tok/s",
+              true,
+            )}
+          </>
+        )}
+      </span>
+    </Button>,
   );
 }

@@ -523,6 +523,42 @@ func TestServiceResponsesWebSocketDefaultsAndPersistence(t *testing.T) {
 	}
 }
 
+func TestServiceModelRedirectsPersist(t *testing.T) {
+	store, handler := newServiceHandler(t, "service_copilot_default", "service_redirect_api", "service_redirect_bad")
+	copilot := createServiceForTest(t, handler, `{"name":"Copilot","kind":"copilot_subscription"}`)
+	if copilot.ModelRedirects != nil {
+		t.Fatalf("Copilot defaults = %#v", copilot.ModelRedirects)
+	}
+	api := createServiceForTest(t, handler, `{"name":"API","kind":"openai","http":{"base_url":"https://api.example/v1","auth":{"scheme":"none"}},"capabilities":[{"protocol":"openai.chat","mode":"native","streaming":true}],"models":["gpt-5.4"],"model_redirects":[{"from":"gpt-5","to":"gpt-5.4","enabled":true}]}`)
+	if len(api.ModelRedirects) != 1 || api.ModelRedirects[0].To != "gpt-5.4" {
+		t.Fatalf("created redirects = %#v", api)
+	}
+	if response := serviceRequestForTest(t, handler, http.MethodPost, ServicesPath, "application/json",
+		`{"name":"Bad","kind":"openai","http":{"base_url":"https://api.example/v1","auth":{"scheme":"none"}},"capabilities":[{"protocol":"openai.chat","mode":"native","streaming":true}],"model_redirects":[{"from":"a","to":"b","enabled":true},{"from":"b","to":"c","enabled":true}]}`, ""); response.Code != 422 {
+		t.Fatalf("accepted a chained table: %d %s", response.Code, response.Body.String())
+	}
+	record, err := store.GetService(context.Background(), copilot.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := serviceRequestForTest(t, handler, http.MethodPatch, ServicesPath+"/"+string(copilot.ID), "application/merge-patch+json",
+		`{"model_redirects":[{"from":"claude-sonnet-4-6","to":"claude-sonnet-4.6","enabled":true}]}`, record.ETag)
+	if response.Code != 200 {
+		t.Fatalf("patch %d %s", response.Code, response.Body.String())
+	}
+	saved, err := store.GetService(context.Background(), copilot.ID)
+	if err != nil || len(saved.Service.ModelRedirects) != 1 {
+		t.Fatalf("persisted = %#v, %v", saved.Service, err)
+	}
+	response = serviceRequestForTest(t, handler, http.MethodPatch, ServicesPath+"/"+string(copilot.ID), "application/merge-patch+json", `{"model_redirects":[]}`, saved.ETag)
+	if response.Code != 200 {
+		t.Fatalf("clear %d %s", response.Code, response.Body.String())
+	}
+	if cleared, err := store.GetService(context.Background(), copilot.ID); err != nil || cleared.Service.ModelRedirects != nil {
+		t.Fatalf("cleared = %#v, %v", cleared.Service.ModelRedirects, err)
+	}
+}
+
 func TestSubscriptionServicesAcceptOnlyProviderEgressConversions(t *testing.T) {
 	// Rejected creates still draw an ID, so reserve one per create attempt.
 	store, handler := newServiceHandler(t,

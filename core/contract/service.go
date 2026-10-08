@@ -3,6 +3,7 @@ package contract
 import (
 	"fmt"
 	"net/url"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -24,6 +25,7 @@ const (
 	ServiceKindClaudeSubscription      ServiceKind = "claude_subscription"
 	ServiceKindGrokSubscription        ServiceKind = "grok_subscription"
 	ServiceKindAntigravitySubscription ServiceKind = "antigravity_subscription"
+	ServiceKindCopilotSubscription     ServiceKind = "copilot_subscription"
 	ServiceKindOpenCodeGo              ServiceKind = "opencode_go"
 	ServiceKindOpenCodeZen             ServiceKind = "opencode_zen"
 	ServiceKindKimiCoding              ServiceKind = "kimi_coding"
@@ -48,7 +50,8 @@ func (kind ServiceKind) Valid() bool {
 	switch kind {
 	case ServiceKindCodexSubscription, ServiceKindNewAPI, ServiceKindOpenAI,
 		ServiceKindAnthropic, ServiceKindGemini, ServiceKindOpenAICompatible,
-		ServiceKindCustom, ServiceKindClaudeSubscription, ServiceKindGrokSubscription, ServiceKindAntigravitySubscription, ServiceKindOpenCodeGo,
+		ServiceKindCustom, ServiceKindClaudeSubscription, ServiceKindGrokSubscription, ServiceKindAntigravitySubscription,
+		ServiceKindCopilotSubscription, ServiceKindOpenCodeGo,
 		ServiceKindOpenCodeZen, ServiceKindKimiCoding, ServiceKindGLMCoding, ServiceKindMiniMaxCoding,
 		ServiceKindDeepSeek, ServiceKindQwen, ServiceKindMoonshot, ServiceKindGLM, ServiceKindMiniMax, ServiceKindDoubao, ServiceKindXAI:
 		return true
@@ -58,7 +61,8 @@ func (kind ServiceKind) Valid() bool {
 }
 
 func (kind ServiceKind) IsSubscription() bool {
-	return kind == ServiceKindCodexSubscription || kind == ServiceKindClaudeSubscription || kind == ServiceKindGrokSubscription || kind == ServiceKindAntigravitySubscription
+	return kind == ServiceKindCodexSubscription || kind == ServiceKindClaudeSubscription || kind == ServiceKindGrokSubscription ||
+		kind == ServiceKindAntigravitySubscription || kind == ServiceKindCopilotSubscription
 }
 
 func (kind ServiceKind) SubscriptionProvider() SubscriptionProvider {
@@ -69,6 +73,8 @@ func (kind ServiceKind) SubscriptionProvider() SubscriptionProvider {
 		return SubscriptionProviderAntigravity
 	case ServiceKindGrokSubscription:
 		return SubscriptionProviderXAIGrok
+	case ServiceKindCopilotSubscription:
+		return SubscriptionProviderGitHubCopilot
 	case ServiceKindCodexSubscription:
 		return SubscriptionProviderOpenAICodex
 	default:
@@ -86,6 +92,7 @@ type HTTPConnection struct {
 	BaseURL       string      `json:"base_url"`
 	Auth          ServiceAuth `json:"auth"`
 	CredentialRef string      `json:"credential_ref,omitempty"`
+	ModelListPath string      `json:"model_list_path,omitempty"`
 	// ExtraHeaders applies to every model this service forwards, unless a
 	// ModelRules entry matches. A nil map keeps the current behavior; an empty
 	// map clears the configuration.
@@ -97,6 +104,25 @@ type HTTPConnection struct {
 	// IdentityProfileID pins a confirmed snapshot used for every model without
 	// a matching rule. Empty keeps the gateway's existing behavior.
 	IdentityProfileID IdentityProfileID `json:"identity_profile_id,omitempty"`
+}
+
+// ValidateModelListPath accepts an absolute URL path appended to base_url for
+// model discovery. Query strings and fragments are rejected because the prober
+// builds its own pagination query.
+func ValidateModelListPath(path string) error {
+	if len(path) > 2048 {
+		return fmt.Errorf("model_list_path exceeds 2048 characters")
+	}
+	if !strings.HasPrefix(path, "/") {
+		return fmt.Errorf("model_list_path must start with /")
+	}
+	if strings.ContainsAny(path, "?#") {
+		return fmt.Errorf("model_list_path must not contain a query or fragment")
+	}
+	if strings.TrimSpace(path) != path || strings.ContainsAny(path, " \t\r\n") {
+		return fmt.Errorf("model_list_path must not contain whitespace")
+	}
+	return nil
 }
 
 func (connection HTTPConnection) Validate(serviceID ServiceID) error {
@@ -126,6 +152,11 @@ func (connection HTTPConnection) Validate(serviceID ServiceID) error {
 	}
 	if parsed.RawQuery != "" || parsed.Fragment != "" {
 		return fmt.Errorf("base_url must not contain a query or fragment")
+	}
+	if connection.ModelListPath != "" {
+		if err := ValidateModelListPath(connection.ModelListPath); err != nil {
+			return err
+		}
 	}
 	if connection.CredentialRef != "" {
 		if err := ValidateCredentialRef(connection.CredentialRef); err != nil {
@@ -180,22 +211,89 @@ func (connection SubscriptionConnection) Validate(serviceID ServiceID) error {
 type Service struct {
 	Proxy *ServiceProxy `json:"proxy,omitempty"`
 	// Nil preserves the provider default for existing documents; explicit false is retained.
-	ResponsesWebSocketEnabled *bool                   `json:"responses_websocket_enabled,omitempty"`
-	FailurePolicy             *FailurePolicy          `json:"failure_policy,omitempty"`
-	ID                        ServiceID               `json:"id"`
-	Name                      string                  `json:"name"`
-	Kind                      ServiceKind             `json:"kind"`
-	Enabled                   bool                    `json:"enabled"`
-	Models                    []string                `json:"models"`
-	Capabilities              []Capability            `json:"capabilities"`
-	HTTP                      *HTTPConnection         `json:"http,omitempty"`
-	Subscription              *SubscriptionConnection `json:"subscription,omitempty"`
-	CreatedAt                 time.Time               `json:"created_at,omitempty"`
-	UpdatedAt                 time.Time               `json:"updated_at,omitempty"`
+	ResponsesWebSocketEnabled *bool `json:"responses_websocket_enabled,omitempty"`
+	// ModelRedirects belong to this provider alone: a requested model is
+	// served as the rule's target when the provider lists it. Routing keeps
+	// the requested model, so other providers that list it can still serve it.
+	ModelRedirects []ModelRedirect         `json:"model_redirects,omitempty"`
+	FailurePolicy  *FailurePolicy          `json:"failure_policy,omitempty"`
+	ID             ServiceID               `json:"id"`
+	Name           string                  `json:"name"`
+	Kind           ServiceKind             `json:"kind"`
+	Enabled        bool                    `json:"enabled"`
+	Models         []string                `json:"models"`
+	Capabilities   []Capability            `json:"capabilities"`
+	HTTP           *HTTPConnection         `json:"http,omitempty"`
+	Subscription   *SubscriptionConnection `json:"subscription,omitempty"`
+	CreatedAt      time.Time               `json:"created_at,omitempty"`
+	UpdatedAt      time.Time               `json:"updated_at,omitempty"`
+}
+
+// copilotClaudeRedirects maps the model ids Claude Code sends to the dotted
+// ids GitHub Copilot lists. Keep it in step with serviceBuiltinRedirects in
+// apps/desktop/src/service-model.ts.
+var copilotClaudeRedirects = []ModelRedirect{
+	{From: "claude-fable-5-1", To: "claude-fable-5.1", Enabled: true},
+	{From: "claude-opus-5-5", To: "claude-opus-5.5", Enabled: true},
+	{From: "claude-sonnet-5-5", To: "claude-sonnet-5.5", Enabled: true},
+	{From: "claude-opus-4-6", To: "claude-opus-4.6", Enabled: true},
+	{From: "claude-sonnet-4-6", To: "claude-sonnet-4.6", Enabled: true},
+	{From: "claude-opus-4-5", To: "claude-opus-4.5", Enabled: true},
+	{From: "claude-sonnet-4-5", To: "claude-sonnet-4.5", Enabled: true},
+	{From: "claude-haiku-4-5", To: "claude-haiku-4.5", Enabled: true},
+	{From: "claude-opus-4-1", To: "claude-opus-4.1", Enabled: true},
+}
+
+// BuiltinModelRedirects are the rules a kind applies until a service stores
+// its own rule for the same source model.
+func (kind ServiceKind) BuiltinModelRedirects() []ModelRedirect {
+	if kind == ServiceKindCopilotSubscription {
+		return slices.Clone(copilotClaudeRedirects)
+	}
+	return nil
+}
+
+// EffectiveModelRedirects is the service's own rules followed by each
+// built-in rule whose source model the service has no rule for. A stored
+// rule, enabled or not, replaces the built-in rule with the same source.
+func (service Service) EffectiveModelRedirects() []ModelRedirect {
+	redirects := slices.Clone(service.ModelRedirects)
+	for _, builtin := range service.Kind.BuiltinModelRedirects() {
+		if !slices.ContainsFunc(service.ModelRedirects, func(redirect ModelRedirect) bool { return redirect.From == builtin.From }) {
+			redirects = append(redirects, builtin)
+		}
+	}
+	return redirects
+}
+
+// UpstreamModelFor returns the model this provider serves for a requested
+// one, trying in order an enabled redirect rule whose target it lists, the
+// model itself, and then the rule for the Claude id without its release
+// date, so claude-haiku-4-5-20251001 follows a claude-haiku-4-5 rule. ok is
+// false when the provider cannot serve the model.
+func (service Service) UpstreamModelFor(model string) (string, bool) {
+	listed := func(candidate string) bool { return candidate != "" && slices.Contains(service.Models, candidate) }
+	redirects := service.EffectiveModelRedirects()
+	if redirect, ok := ResolveModelRedirect(redirects, model); ok && listed(redirect.To) {
+		return redirect.To, true
+	}
+	if listed(model) {
+		return model, true
+	}
+	if undated := UndatedClaudeModel(model); undated != model {
+		if redirect, ok := ResolveModelRedirect(redirects, undated); ok && listed(redirect.To) {
+			return redirect.To, true
+		}
+	}
+	return "", false
 }
 
 // ResponsesWebSocket reports the effective per-channel transport setting.
+// The Copilot API serves Responses over HTTP only.
 func (service Service) ResponsesWebSocket() bool {
+	if service.Kind == ServiceKindCopilotSubscription {
+		return false
+	}
 	if service.ResponsesWebSocketEnabled != nil {
 		return *service.ResponsesWebSocketEnabled
 	}
@@ -228,6 +326,9 @@ func (service Service) Validate() error {
 		if err := service.HTTP.Validate(service.ID); err != nil {
 			return fmt.Errorf("http: %w", err)
 		}
+		if service.HTTP.ModelListPath != "" && service.Kind != ServiceKindCustom {
+			return fmt.Errorf("http: model_list_path is only supported for custom services")
+		}
 	case service.Kind.IsSubscription():
 		if service.Subscription == nil || service.HTTP != nil {
 			return fmt.Errorf("subscription service requires only the subscription connection")
@@ -244,6 +345,9 @@ func (service Service) Validate() error {
 	}
 	if err := validateServiceModels(service.Models); err != nil {
 		return err
+	}
+	if err := ValidateModelRedirects(service.ModelRedirects); err != nil {
+		return fmt.Errorf("model_redirects: %w", err)
 	}
 	if service.Kind.IsSubscription() {
 		if err := service.Kind.SubscriptionProvider().ValidateCapabilities(service.Capabilities); err != nil {

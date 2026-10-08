@@ -177,10 +177,9 @@ var errStoredRaw = errors.New("audit part is stored as raw")
 func (store *Store) writeRawCapture(ctx context.Context, auditKey []byte, blob storagecontract.AuditBlob) error {
 	keyID, public := store.rawKey.captureKey()
 	if keyID != 0 && auditKey != nil {
-		sealed, contentKey, err := sealRawPart(auditKey, blob, keyID, public)
-		if err == nil {
-			defer clear(contentKey)
-			return store.writeRawAuditBlob(ctx, sealed, contentKey)
+		err := store.writeRawAuditBlob(ctx, auditKey, blob, keyID, public)
+		if !errors.Is(err, errRawPartUnsealable) {
+			return err
 		}
 	}
 	blob.Nonce, blob.Ciphertext = []byte{}, []byte{}
@@ -268,11 +267,16 @@ func upsertAuditBlob(ctx context.Context, executor interface {
 	if exposure == "" {
 		exposure = storagecontract.AuditExposureRaw
 	}
+	layout := blob.Layout
+	if layout == "" {
+		layout = storagecontract.AuditLayoutWhole
+	}
 	// Raw is sticky: a later capture of the same part may tighten its
-	// exposure but never share what an earlier decision withheld.
+	// exposure but never share what an earlier decision withheld. A whole
+	// recapture of a chunked part drops its chunk references by trigger.
 	_, err := executor.ExecContext(ctx, `INSERT INTO audit_blobs (
-    request_id, direction, media_type, nonce, ciphertext, truncated, captured_bytes, created_at, payload_id, exposure
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    request_id, direction, media_type, nonce, ciphertext, truncated, captured_bytes, created_at, payload_id, exposure, layout
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(request_id, direction) DO UPDATE SET
     media_type = excluded.media_type,
     nonce = excluded.nonce,
@@ -281,10 +285,11 @@ ON CONFLICT(request_id, direction) DO UPDATE SET
     captured_bytes = excluded.captured_bytes,
     created_at = excluded.created_at,
     payload_id = excluded.payload_id,
-    exposure = CASE WHEN audit_blobs.exposure = 'raw' THEN 'raw' ELSE excluded.exposure END`,
+    exposure = CASE WHEN audit_blobs.exposure = 'raw' THEN 'raw' ELSE excluded.exposure END,
+    layout = excluded.layout`,
 		string(blob.RequestID), string(blob.Direction), blob.MediaType,
 		blob.Nonce, blob.Ciphertext, boolToInt(blob.Truncated), blob.CapturedBytes,
-		blob.CreatedAt.UTC().Format(time.RFC3339Nano), payloadID, string(exposure),
+		blob.CreatedAt.UTC().Format(time.RFC3339Nano), payloadID, string(exposure), string(layout),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert audit blob: %w", err)
@@ -320,8 +325,11 @@ func (store *Store) listAuditBlobs(
     CASE WHEN ?2 AND b.exposure <> 'shareable' THEN x'' ELSE COALESCE(p.nonce, b.nonce) END,
     CASE WHEN ?2 AND b.exposure <> 'shareable' THEN x'' ELSE COALESCE(p.ciphertext, b.ciphertext) END,
     b.truncated, b.captured_bytes, b.created_at, b.exposure,
-    CASE WHEN b.payload_id IS NULL AND length(b.ciphertext) = 0 THEN 'none' ELSE COALESCE(p.sealing, 'audit') END, p.key_id,
-    CASE WHEN ?2 AND b.exposure <> 'shareable' THEN NULL ELSE p.wrapped_key END
+    CASE WHEN b.layout = 'chunks' THEN 'audit'
+         WHEN b.payload_id IS NULL AND length(b.ciphertext) = 0 THEN 'none'
+         ELSE COALESCE(p.sealing, 'audit') END, p.key_id,
+    CASE WHEN ?2 AND b.exposure <> 'shareable' THEN NULL ELSE p.wrapped_key END,
+    b.layout
 FROM audit_blobs b LEFT JOIN audit_payloads p ON p.id = b.payload_id
 WHERE b.request_id = ?1 ORDER BY b.direction ASC`, id, shareableOnly)
 	if err != nil {
@@ -339,6 +347,17 @@ WHERE b.request_id = ?1 ORDER BY b.direction ASC`, id, shareableOnly)
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate audit blobs: %w", err)
 	}
+	rows.Close()
+	for index := range blobs {
+		blob := &blobs[index]
+		if blob.Layout == storagecontract.AuditLayoutWhole ||
+			(shareableOnly && blob.Exposure != storagecontract.AuditExposureShareable) {
+			continue
+		}
+		if blob.Chunks, err = loadPartChunks(ctx, store.db, blob.RequestID, blob.Direction); err != nil {
+			return nil, err
+		}
+	}
 	return blobs, nil
 }
 
@@ -353,6 +372,20 @@ func (store *Store) UpdateAuditExposure(
 	}
 	if !direction.Valid() || !exposure.Valid() {
 		return fmt.Errorf("%w: audit exposure", storagecontract.ErrInvalidArgument)
+	}
+	if exposure == storagecontract.AuditExposureRaw {
+		// Chunks are shared under dek_audit; a part that tightens leaves
+		// them first, so its content is never raw there.
+		var layout string
+		err := store.db.QueryRowContext(ctx, `SELECT layout FROM audit_blobs WHERE request_id = ? AND direction = ?`, id, string(direction)).Scan(&layout)
+		if err == nil && layout == string(storagecontract.AuditLayoutChunks) {
+			auditKey := store.keys.audit()
+			err = store.unchunkPart(ctx, auditKey, id, direction)
+			clear(auditKey)
+			if err != nil {
+				return fmt.Errorf("unchunk audit part: %w", err)
+			}
+		}
 	}
 	if exposure == storagecontract.AuditExposureRaw && !store.keepsRawCaptures() {
 		return store.settleRawWithoutPassword(ctx, id, direction)
@@ -513,6 +546,9 @@ WHERE request_id NOT IN (SELECT id FROM request_records)`)
 	if err := store.compactLegacyAuditBlobs(ctx); err != nil {
 		return storagecontract.SweepResult{}, err
 	}
+	if err := store.chunkEndedParts(ctx); err != nil {
+		return storagecontract.SweepResult{}, err
+	}
 	return storagecontract.SweepResult{
 		DeletedRecords:    int(deletedRecords),
 		DeletedAuditBlobs: blobCountBefore + int(deletedByAge) + int(deletedOrphans),
@@ -550,7 +586,7 @@ ORDER BY rowid LIMIT 1`, cursor, rawKeyLoaded).Scan(&rowID)
 		cursor = rowID
 		blob, err := scanAuditBlob(store.db.QueryRowContext(ctx, `SELECT
 request_id, direction, media_type, nonce, ciphertext, truncated, captured_bytes, created_at, exposure,
-'audit', NULL, NULL
+'audit', NULL, NULL, layout
 FROM audit_blobs WHERE rowid = ? AND payload_id IS NULL`, rowID))
 		if errors.Is(err, sql.ErrNoRows) {
 			continue
@@ -572,15 +608,15 @@ FROM audit_blobs WHERE rowid = ? AND payload_id IS NULL`, rowID))
 
 func scanAuditBlob(row scannable) (storagecontract.AuditBlob, error) {
 	var (
-		requestID, direction, mediaType, createdAt, exposure, sealing string
-		nonce, ciphertext, wrappedKey                                 []byte
-		truncated, capturedBytes                                      int
-		rawKeyID                                                      sql.NullInt64
+		requestID, direction, mediaType, createdAt, exposure, sealing, layout string
+		nonce, ciphertext, wrappedKey                                         []byte
+		truncated, capturedBytes                                              int
+		rawKeyID                                                              sql.NullInt64
 	)
 	if err := row.Scan(
 		&requestID, &direction, &mediaType, &nonce, &ciphertext,
 		&truncated, &capturedBytes, &createdAt, &exposure,
-		&sealing, &rawKeyID, &wrappedKey,
+		&sealing, &rawKeyID, &wrappedKey, &layout,
 	); err != nil {
 		return storagecontract.AuditBlob{}, err
 	}
@@ -601,11 +637,12 @@ func scanAuditBlob(row scannable) (storagecontract.AuditBlob, error) {
 		Sealing:       storagecontract.AuditSealing(sealing),
 		RawKeyID:      rawKeyID.Int64,
 		WrappedKey:    append([]byte(nil), wrappedKey...),
+		Layout:        storagecontract.AuditLayout(layout),
 	}
 	if len(wrappedKey) == 0 {
 		blob.WrappedKey = nil
 	}
-	if err := blob.RequestID.Validate(); err != nil || !blob.Direction.Valid() || !blob.Exposure.Valid() {
+	if err := blob.RequestID.Validate(); err != nil || !blob.Direction.Valid() || !blob.Exposure.Valid() || !blob.Layout.Valid() {
 		return storagecontract.AuditBlob{}, fmt.Errorf("%w: audit blob identity", storagecontract.ErrInvalidRecord)
 	}
 	switch blob.Sealing {

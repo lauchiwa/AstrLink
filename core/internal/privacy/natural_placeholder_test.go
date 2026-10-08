@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -43,26 +44,13 @@ func TestNaturalPlaceholdersStayInsideReservedNamespaces(t *testing.T) {
 			if !isReservedTestNetAddress(got) {
 				t.Fatalf("v6 stand-in %q is outside the documentation prefix", got)
 			}
-			if address := net.ParseIP(got); address == nil || address.To4() != nil {
+			address := net.ParseIP(got)
+			if address == nil || address.To4() != nil {
 				t.Fatalf("v6 stand-in %q changed address family", got)
 			}
-		}},
-		{KindPhone, "+1-415-987-6543", func(t *testing.T, got string) {
-			if !strings.HasPrefix(got, "+1-555-555-01") {
-				t.Fatalf("phone stand-in %q is outside the fictional block", got)
-			}
-			if !validPhone(got) {
-				t.Fatalf("phone stand-in %q is not a well-formed number", got)
-			}
-		}},
-		{KindPaymentCard, "4242 4242 4242 4242", func(t *testing.T, got string) {
-			if validPaymentCard(got) {
-				t.Fatalf("card stand-in %q passes the Luhn checksum", got)
-			}
-		}},
-		{KindAccount, "GB33BUKB20201555555555", func(t *testing.T, got string) {
-			if validIBAN(got) {
-				t.Fatalf("account stand-in %q passes the IBAN checksum", got)
+			// A model or tool that normalizes the address must not change it.
+			if address.String() != got {
+				t.Fatalf("v6 stand-in %q is not canonical, want %q", got, address.String())
 			}
 		}},
 	} {
@@ -93,6 +81,23 @@ func TestNaturalPlaceholdersStayInsideReservedNamespaces(t *testing.T) {
 	}
 }
 
+// TestIPv6StandInsAreCanonical guards against a second spelling: a model or
+// tool rewriting a group with a leading zero in RFC 5952 form would leave a
+// stand-in the restorer no longer recognizes.
+func TestIPv6StandInsAreCanonical(t *testing.T) {
+	allocator := newPlaceholderAllocator(testDerivationKey(8), naturalKindRule, nil)
+	for index := range 256 {
+		value := "2606:4700::" + strconv.FormatInt(int64(index), 16)
+		placeholder, style, err := allocator.allocate(KindIPAddress, value)
+		if err != nil || style != contract.PlaceholderStyleNatural {
+			t.Fatalf("allocate %q: %q %q %v", value, placeholder, style, err)
+		}
+		if canonical := net.ParseIP(placeholder).String(); canonical != placeholder {
+			t.Fatalf("stand-in %q for %q is not canonical, want %q", placeholder, value, canonical)
+		}
+	}
+}
+
 // TestSelfRedactionGuardLeavesOwnStandInsAlone covers the chain-pollution case:
 // a stand-in that escaped restoration returns in the client's history next
 // turn, and redacting it again would bury the original behind two mappings of
@@ -104,7 +109,7 @@ func TestSelfRedactionGuardLeavesOwnStandInsAlone(t *testing.T) {
 		t.Context(),
 		policy,
 		contract.ProtocolOpenAIChat,
-		[]byte(`{"messages":[{"role":"user","content":"mail alice@example.com card 4242 4242 4242 4242 phone +1-415-987-6543"}]}`),
+		[]byte(`{"messages":[{"role":"user","content":"mail alice@example.com host 10.4.7.9 v6 2606:4700::1111 link https://internal.corp/x"}]}`),
 	)
 	if err != nil || first.Decision != DecisionRedact {
 		t.Fatalf("first inspect: %#v %v", first, err)
@@ -180,11 +185,12 @@ func TestExhaustedNamespaceFallsBackToTokens(t *testing.T) {
 	allocator := newPlaceholderAllocator(testDerivationKey(6), naturalKindRule, nil)
 	naturals := 0
 	tokens := 0
-	// The fictional phone block holds 100 numbers, so asking for more forces the
+	// The IPv4 test networks hold 768 addresses, so asking for more forces the
 	// fallback.
-	for index := range fictionalPhoneCount + 20 {
+	pool := len(testNetPrefixes) * testNetHostsPerPrefix
+	for index := range pool + 20 {
 		placeholder, style, err := allocator.allocate(
-			KindPhone, "+1-415-987-"+strings.Repeat("0", 4-len(itoa(index)))+itoa(index),
+			KindIPAddress, "10.4."+itoa(index/256)+"."+itoa(index%256),
 		)
 		if err != nil {
 			t.Fatalf("allocate %d: %v", index, err)
@@ -194,18 +200,18 @@ func TestExhaustedNamespaceFallsBackToTokens(t *testing.T) {
 			naturals++
 		case contract.PlaceholderStyleToken:
 			tokens++
-			if !strings.HasPrefix(placeholder, "<PRIVATE_PHONE_") {
+			if !strings.HasPrefix(placeholder, "<PRIVATE_IP_ADDRESS_") {
 				t.Fatalf("fallback placeholder = %q", placeholder)
 			}
 		}
 	}
-	if naturals > fictionalPhoneCount {
-		t.Fatalf("allocated %d stand-ins from a pool of %d", naturals, fictionalPhoneCount)
+	if naturals > pool {
+		t.Fatalf("allocated %d stand-ins from a pool of %d", naturals, pool)
 	}
 	if tokens == 0 {
-		t.Fatal("exhausting the phone pool did not fall back to token placeholders")
+		t.Fatal("exhausting the IPv4 pool did not fall back to token placeholders")
 	}
-	if !allocator.exhaustedKinds()[KindPhone] {
+	if !allocator.exhaustedKinds()[KindIPAddress] {
 		t.Fatal("exhaustion was not reported")
 	}
 }

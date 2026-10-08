@@ -214,6 +214,11 @@ type Result struct {
 	Findings           []Finding
 	SuppressedFindings []Finding
 	Redactions         []Redaction
+	// Protected is the plaintext of every accepted finding of a block or
+	// redact decision, so the gateway can mask what it keeps in the clear
+	// (the record's preview). Like Redactions it stays in process: never
+	// stored, logged, or forwarded.
+	Protected []string
 	// NoticeInjected reports that a placeholder convention note was prepended
 	// to the upstream system prompt.
 	NoticeInjected bool

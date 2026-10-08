@@ -101,7 +101,7 @@ type AccessTokenManager interface {
 
 type PrivacyModelRegistry interface {
 	Catalog() contract.PrivacyModelCatalogResponse
-	CatalogReleases(context.Context) (contract.PrivacyModelCatalogResponse, error)
+	CatalogReleases(context.Context, bool) (contract.PrivacyModelCatalogResponse, error)
 	Probe(context.Context, contract.PrivacyModelProbeRequest) (contract.PrivacyModelProbeResponse, error)
 	ProbeLocal(context.Context, contract.PrivacyModelLocalProbeRequest) (contract.PrivacyModelProbeResponse, error)
 	ListInstallations() []contract.PrivacyModelInstallation

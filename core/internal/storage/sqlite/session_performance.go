@@ -7,15 +7,10 @@ import (
 	"github.com/QuantumNous/astrlink/core/contract"
 )
 
-// Output that arrives in one burst after TTFT leaves a near-zero window that
-// turns a handful of tokens into thousands of tok/s, so generation time is
-// floored at minGenerationMs.
-const minGenerationMs = 500
-
 type sessionPerformance struct {
-	ttftSum, ttftCount         int64
-	outputTokens, generationMs int64
-	calls                      map[string]*sessionCallInterval
+	ttftSum, ttftCount       int64
+	outputTokens, durationMs int64
+	calls                    map[string]*sessionCallInterval
 }
 
 type sessionCallInterval struct {
@@ -45,18 +40,18 @@ func (stats *sessionPerformance) observe(rootID string, turn int, record contrac
 	if string(record.ID) == rootID && (record.Error == nil || record.Error.Code != "core_interrupted") {
 		call.end = record.CompletedAt
 	}
-	if !record.Streaming || record.FirstTokenMs == nil {
-		return
+	if record.Streaming && record.FirstTokenMs != nil {
+		stats.ttftSum += int64(*record.FirstTokenMs)
+		stats.ttftCount++
 	}
-	first := int64(*record.FirstTokenMs)
-	stats.ttftSum += first
-	stats.ttftCount++
-	if record.LatencyMs == nil || record.Usage == nil || record.Usage.BillingIncomplete ||
-		record.Usage.OutputTokens <= 0 {
+	// TPS divides by the whole call duration, TTFT included: non-streaming calls
+	// have no first token, and streamed output can arrive in one burst after it.
+	if record.LatencyMs == nil || *record.LatencyMs <= 0 || record.Usage == nil ||
+		record.Usage.BillingIncomplete || record.Usage.OutputTokens <= 0 {
 		return
 	}
 	stats.outputTokens += int64(record.Usage.OutputTokens)
-	stats.generationMs += max(int64(*record.LatencyMs)-first, minGenerationMs)
+	stats.durationMs += int64(*record.LatencyMs)
 }
 
 func (stats *sessionPerformance) apply(session *contract.RequestSession) {
@@ -64,8 +59,8 @@ func (stats *sessionPerformance) apply(session *contract.RequestSession) {
 		average := float64(stats.ttftSum) / float64(stats.ttftCount)
 		session.AverageTTFTMs = &average
 	}
-	if stats.generationMs > 0 {
-		rate := float64(stats.outputTokens) * 1000 / float64(stats.generationMs)
+	if stats.durationMs > 0 {
+		rate := float64(stats.outputTokens) * 1000 / float64(stats.durationMs)
 		session.OutputTokensPerSecond = &rate
 	}
 	if len(stats.calls) == 0 {

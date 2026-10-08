@@ -89,6 +89,8 @@ type SessionLinkMatch struct {
 	TurnIndex           *int
 	TurnUserMessages    *int
 	TurnUserFingerprint string
+	// Status is the matched record's status at lookup time.
+	Status contract.RequestStatus
 	// Value is the queried cursor value that matched.
 	Value string
 }

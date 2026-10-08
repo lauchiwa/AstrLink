@@ -797,9 +797,74 @@ CHECK(sealed IN (0, 1) AND (sealed = 0 OR length(credential_value) >= 30))`,
 		{Version: 48, Name: "request_first_answer_timing", Statements: []string{
 			`ALTER TABLE request_records ADD COLUMN first_answer_ms INTEGER CHECK(first_answer_ms IS NULL OR first_answer_ms >= 0)`,
 		}},
-		// IF NOT EXISTS preserves profiles from the fork's original migration 48.
-		// Up reconciles that specific legacy history before applying this step.
-		{Version: 49, Name: "service_identity_profiles", Statements: []string{
+		// phone, payment_card, and account now only accept token placeholders.
+		// Any save wrote the full kind list, so a stored natural style for them
+		// would otherwise fail validation and take privacy protection down.
+		//
+		// Agents resend their history on every call, so request bodies are
+		// stored as chunks shared within a session: audit_part_chunks orders a
+		// part's chunks, and a chunk goes once nothing references it. Leaving
+		// the chunked layout drops the references. The request capture limit
+		// moves from 1 MiB to 32 MiB where it was never changed.
+		{Version: 49, Name: "privacy_token_kinds_audit_chunks", Statements: []string{
+			`UPDATE policies
+SET document_json = json_set(
+    document_json,
+    '$.kind_rules',
+    json((
+        SELECT json_group_array(
+            json(
+                CASE
+                    WHEN json_extract(value, '$.kind') IN ('phone', 'payment_card', 'account')
+                        THEN json_set(value, '$.style', 'token')
+                    ELSE value
+                END
+            )
+        )
+        FROM json_each(policies.document_json, '$.kind_rules')
+    ))
+)
+WHERE id = 'policy_privacy_default'
+  AND json_type(document_json, '$.kind_rules') = 'array'
+  AND EXISTS (
+      SELECT 1 FROM json_each(policies.document_json, '$.kind_rules')
+      WHERE json_extract(value, '$.kind') IN ('phone', 'payment_card', 'account')
+        AND json_extract(value, '$.style') IS NOT 'token'
+  )`,
+			`CREATE TABLE audit_chunks (
+    id INTEGER PRIMARY KEY,
+    scope TEXT NOT NULL,
+    content_key BLOB NOT NULL CHECK(length(content_key) = 32),
+    nonce BLOB NOT NULL,
+    ciphertext BLOB NOT NULL,
+    UNIQUE(scope, content_key)
+)`,
+			`CREATE TABLE audit_part_chunks (
+    request_id TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    seq INTEGER NOT NULL CHECK(seq >= 0),
+    chunk_id INTEGER NOT NULL REFERENCES audit_chunks(id),
+    PRIMARY KEY (request_id, direction, seq),
+    FOREIGN KEY (request_id, direction) REFERENCES audit_blobs(request_id, direction) ON DELETE CASCADE
+)`,
+			`CREATE INDEX audit_part_chunks_chunk_idx ON audit_part_chunks(chunk_id)`,
+			`CREATE TRIGGER audit_part_chunk_delete AFTER DELETE ON audit_part_chunks BEGIN
+    DELETE FROM audit_chunks WHERE id = OLD.chunk_id
+      AND NOT EXISTS (SELECT 1 FROM audit_part_chunks WHERE chunk_id = OLD.chunk_id);
+END`,
+			`ALTER TABLE audit_blobs ADD COLUMN layout TEXT NOT NULL DEFAULT 'whole'
+CHECK(layout IN ('whole', 'chunks', 'recipe'))`,
+			`CREATE TRIGGER audit_blob_layout_whole AFTER UPDATE OF layout ON audit_blobs
+WHEN NEW.layout = 'whole' AND OLD.layout <> 'whole' BEGIN
+    DELETE FROM audit_part_chunks WHERE request_id = NEW.request_id AND direction = NEW.direction;
+END`,
+			`UPDATE audit_settings SET request_body_max_bytes = 33554432 WHERE request_body_max_bytes = 1048576`,
+		}},
+		// Upstream has now claimed both 48 and 49, so the fork's profiles moved
+		// again: 48 -> 49 -> 50. IF NOT EXISTS preserves profiles created by
+		// either earlier numbering, and Up reconciles both known collisions
+		// before applying this step.
+		{Version: 50, Name: "service_identity_profiles", Statements: []string{
 			`CREATE TABLE IF NOT EXISTS service_identity_profiles (
     id TEXT PRIMARY KEY,
     service_id TEXT NOT NULL REFERENCES services(id) ON DELETE CASCADE,

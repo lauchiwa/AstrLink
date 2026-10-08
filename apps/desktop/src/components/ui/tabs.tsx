@@ -52,8 +52,10 @@ function TabsList({
       data-variant={variant}
       className={cn(
         tabsListVariants({ variant }),
+        // A scrollport clips both axes; the line underline hangs below the
+        // triggers, so make room for it inside the list.
         scrollable &&
-          "max-w-full justify-start overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden [&>[data-slot=tabs-trigger]]:flex-none",
+          "max-w-full justify-start overflow-x-auto [scrollbar-width:none] data-[variant=line]:pb-[3.5px] [&::-webkit-scrollbar]:hidden [&>[data-slot=tabs-trigger]]:flex-none",
         className,
       )}
       {...props}
@@ -71,7 +73,10 @@ function TabsTrigger({
       className={cn(
         "relative inline-flex h-[calc(100%-1px)] flex-1 items-center justify-center gap-1.5 rounded-sm border border-transparent px-2.5 py-1 text-xs font-medium whitespace-nowrap text-foreground/60 transition-all group-data-[orientation=vertical]/tabs:w-full group-data-[orientation=vertical]/tabs:justify-start hover:text-foreground focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30 focus-visible:outline-1 focus-visible:outline-ring disabled:pointer-events-none disabled:opacity-45 group-data-[variant=default]/tabs-list:data-[state=active]:shadow-none group-data-[variant=line]/tabs-list:data-[state=active]:shadow-none [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-3.5",
         "group-data-[variant=line]/tabs-list:bg-transparent group-data-[variant=line]/tabs-list:data-[state=active]:bg-transparent",
-        "data-[state=active]:bg-background data-[state=active]:text-foreground",
+        "data-[state=active]:bg-background data-[state=active]:text-foreground group-data-[variant=default]/tabs-list:data-[state=active]:border-border",
+        // A count badge belongs to its label: it takes the label's ink and
+        // keeps a fill that differs from the surface behind it.
+        "[&>[data-slot=badge]]:bg-border/70 [&>[data-slot=badge]]:text-current data-[state=active]:[&>[data-slot=badge]]:bg-muted",
         "before:pointer-events-none before:absolute before:rounded-full before:bg-border/80 before:opacity-0 before:transition-opacity group-data-[orientation=horizontal]/tabs:before:inset-y-1/4 group-data-[orientation=horizontal]/tabs:before:-left-px group-data-[orientation=horizontal]/tabs:before:w-px group-data-[orientation=vertical]/tabs:before:inset-x-2 group-data-[orientation=vertical]/tabs:before:-top-px group-data-[orientation=vertical]/tabs:before:h-px",
         "after:absolute after:bg-foreground after:opacity-0 after:transition-opacity group-data-[orientation=horizontal]/tabs:after:inset-x-0 group-data-[orientation=horizontal]/tabs:after:bottom-[-5px] group-data-[orientation=horizontal]/tabs:after:h-0.5 group-data-[orientation=vertical]/tabs:after:inset-y-0 group-data-[orientation=vertical]/tabs:after:-right-1 group-data-[orientation=vertical]/tabs:after:w-0.5 group-data-[variant=line]/tabs-list:data-[state=active]:after:opacity-100",
         className,

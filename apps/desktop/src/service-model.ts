@@ -8,7 +8,14 @@ import {
   type ServiceProxy,
   type ServiceProxyInput,
 } from "./service-proxy-model";
-import { parseFailurePolicy, type FailurePolicy } from "./failure-policy-model";
+import {
+  maxModelRedirects,
+  parseFailurePolicy,
+  parseModelRedirects,
+  type BuiltinModelRedirect,
+  type FailurePolicy,
+  type ModelRedirect,
+} from "./failure-policy-model";
 import { i18n } from "./i18n";
 import type {
   SubscriptionError,
@@ -90,7 +97,8 @@ export type SubscriptionServiceKind =
   | "codex_subscription"
   | "claude_subscription"
   | "grok_subscription"
-  | "antigravity_subscription";
+  | "antigravity_subscription"
+  | "copilot_subscription";
 export type ServiceKind = SubscriptionServiceKind | HTTPServiceKind;
 
 /** Provider owning each subscription kind; mirrors contract.ServiceKind.SubscriptionProvider. */
@@ -102,6 +110,7 @@ export const subscriptionKindProviders: Record<
   claude_subscription: "claude_code",
   grok_subscription: "xai_grok",
   antigravity_subscription: "antigravity",
+  copilot_subscription: "github_copilot",
 };
 
 /** Fixed native capabilities; mirrors contract.SubscriptionProvider.Capabilities. */
@@ -128,6 +137,12 @@ export const subscriptionNativeCapabilities: Record<
     { protocol: "openai.chat", mode: "native", streaming: true },
     { protocol: "openai.models", mode: "native", streaming: false },
   ],
+  copilot_subscription: [
+    { protocol: "anthropic.messages", mode: "native", streaming: true },
+    { protocol: "openai.responses", mode: "native", streaming: true },
+    { protocol: "openai.chat", mode: "native", streaming: true },
+    { protocol: "openai.models", mode: "native", streaming: false },
+  ],
 };
 
 /**
@@ -142,6 +157,11 @@ export const subscriptionConversionTargets: Record<
   claude_subscription: ["anthropic.messages"],
   grok_subscription: ["openai.responses", "openai.chat"],
   antigravity_subscription: ["google.generate_content"],
+  copilot_subscription: [
+    "anthropic.messages",
+    "openai.responses",
+    "openai.chat",
+  ],
 };
 
 export const subscriptionKinds = Object.keys(
@@ -185,6 +205,7 @@ export interface HTTPServiceConnection extends RequestCompatibility {
   base_url: string;
   auth: ServiceAuth;
   credential_ref?: string;
+  model_list_path?: string;
   /** Saved key's last characters ("…a1b2"); only on a single-service read. */
   credential_hint?: string;
 }
@@ -236,6 +257,8 @@ export interface SubscriptionRiskEvent {
 export interface Service {
   proxy?: ServiceProxy;
   responses_websocket_enabled?: boolean;
+  /** This provider's own redirects; routing keeps the requested model. */
+  model_redirects?: ModelRedirect[];
   failure_policy?: FailurePolicy;
   id: string;
   name: string;
@@ -273,6 +296,8 @@ export interface ServiceRecord {
 export type SubscriptionServiceCreateInput = {
   proxy?: ServiceProxyInput | null;
   responses_websocket_enabled?: boolean;
+  model_redirects?: ModelRedirect[];
+  claude_model_aliases_enabled?: boolean;
   failure_policy?: FailurePolicy;
   name: string;
   kind: SubscriptionServiceKind;
@@ -284,6 +309,8 @@ export type SubscriptionServiceCreateInput = {
 export type HTTPServiceCreateInput = {
   proxy?: ServiceProxyInput | null;
   responses_websocket_enabled?: boolean;
+  model_redirects?: ModelRedirect[];
+  claude_model_aliases_enabled?: boolean;
   failure_policy?: FailurePolicy;
   name: string;
   kind: HTTPServiceKind;
@@ -293,6 +320,7 @@ export type HTTPServiceCreateInput = {
     base_url: string;
     auth: ServiceAuth;
     credential?: { secret: string };
+    model_list_path?: string;
   };
   capabilities: ServiceCapability[];
 };
@@ -304,6 +332,7 @@ export type ServiceCreateInput =
 export type ServicePatchInput = {
   proxy?: ServiceProxyInput | null;
   responses_websocket_enabled?: boolean;
+  model_redirects?: ModelRedirect[];
   failure_policy?: FailurePolicy | null;
   name?: string;
   enabled?: boolean;
@@ -312,6 +341,7 @@ export type ServicePatchInput = {
     base_url?: string;
     auth?: ServiceAuth;
     credential?: { secret: string } | null;
+    model_list_path?: string | null;
     extra_headers?: RequestCompatibility["extra_headers"] | null;
     model_rules?: RequestCompatibility["model_rules"] | null;
     identity_profile_id?: string | null;
@@ -522,6 +552,7 @@ function parseHTTPConnection(
     [
       "credential_ref",
       "credential_hint",
+      "model_list_path",
       "extra_headers",
       "model_rules",
       "identity_profile_id",
@@ -556,6 +587,15 @@ function parseHTTPConnection(
       invalid(`${path}.credential_ref`, "must use local://service/<id>");
     }
   }
+  let modelListPath: string | undefined;
+  if (Object.hasOwn(connection, "model_list_path")) {
+    modelListPath = stringAt(
+      connection.model_list_path,
+      `${path}.model_list_path`,
+      1,
+      512,
+    );
+  }
   let credentialHint: string | undefined;
   if (Object.hasOwn(connection, "credential_hint")) {
     credentialHint = stringAt(
@@ -576,6 +616,7 @@ function parseHTTPConnection(
       parseAuth(connection.auth, `${path}.auth`),
     ),
     ...(credentialRef ? { credential_ref: credentialRef } : {}),
+    ...(modelListPath ? { model_list_path: modelListPath } : {}),
     ...(credentialHint ? { credential_hint: credentialHint } : {}),
   };
 }
@@ -780,7 +821,8 @@ function parseSubscriptionConnection(
     subscription.provider !== "openai_codex" &&
     subscription.provider !== "claude_code" &&
     subscription.provider !== "xai_grok" &&
-    subscription.provider !== "antigravity"
+    subscription.provider !== "antigravity" &&
+    subscription.provider !== "github_copilot"
   ) {
     invalid(`${path}.provider`, "unknown subscription provider");
   }
@@ -868,6 +910,7 @@ export function parseService(value: unknown, path = "$"): Service {
       "subscription",
       "failure_policy",
       "responses_websocket_enabled",
+      "model_redirects",
       "proxy",
     ],
     path,
@@ -896,6 +939,14 @@ export function parseService(value: unknown, path = "$"): Service {
           service.responses_websocket_enabled as boolean,
       }
     : {};
+  let modelRedirects: ModelRedirect[] = [];
+  try {
+    modelRedirects = parseModelRedirects(service.model_redirects);
+  } catch {
+    invalid(`${path}.model_redirects`, "invalid model redirects");
+  }
+  const redirectSettings =
+    modelRedirects.length > 0 ? { model_redirects: modelRedirects } : {};
   const models = parseModels(service.models, `${path}.models`);
   if (!Array.isArray(service.capabilities)) {
     invalid(`${path}.capabilities`, "expected an array");
@@ -932,6 +983,7 @@ export function parseService(value: unknown, path = "$"): Service {
       kind: service.kind,
       enabled: service.enabled,
       ...websocketSetting,
+      ...redirectSettings,
       ...(service.proxy !== undefined
         ? { proxy: parseServiceProxy(service.proxy, id) }
         : {}),
@@ -962,6 +1014,7 @@ export function parseService(value: unknown, path = "$"): Service {
     kind: service.kind as HTTPServiceKind,
     enabled: service.enabled,
     ...websocketSetting,
+    ...redirectSettings,
     ...(service.proxy !== undefined
       ? { proxy: parseServiceProxy(service.proxy, id) }
       : {}),
@@ -1089,6 +1142,8 @@ export function subscriptionRiskLabel(
 export function supportsResponsesWebSocket(
   service: Pick<Service, "kind" | "capabilities">,
 ): boolean {
+  // The Copilot API serves Responses over HTTP only.
+  if (service.kind === "copilot_subscription") return false;
   return (
     service.kind === "codex_subscription" ||
     service.capabilities.some(
@@ -1098,6 +1153,66 @@ export function supportsResponsesWebSocket(
         !capability.convert_to,
     )
   );
+}
+
+/**
+ * Model ids Claude Code sends, mapped to the dotted ids GitHub Copilot lists.
+ * Mirrors contract.ServiceKind.BuiltinModelRedirects.
+ */
+const copilotClaudeRedirects: readonly BuiltinModelRedirect[] = [
+  ["claude-fable-5-1", "claude-fable-5.1"],
+  ["claude-opus-5-5", "claude-opus-5.5"],
+  ["claude-sonnet-5-5", "claude-sonnet-5.5"],
+  ["claude-opus-4-6", "claude-opus-4.6"],
+  ["claude-sonnet-4-6", "claude-sonnet-4.6"],
+  ["claude-opus-4-5", "claude-opus-4.5"],
+  ["claude-sonnet-4-5", "claude-sonnet-4.5"],
+  ["claude-haiku-4-5", "claude-haiku-4.5"],
+  ["claude-opus-4-1", "claude-opus-4.1"],
+].map(([from, defaultTo]) => ({ from, defaultTo, defaultEnabled: true }));
+
+/** Built-in redirect rows a provider of this kind applies until changed. */
+export function serviceBuiltinRedirects(
+  kind: ServiceKind,
+): readonly BuiltinModelRedirect[] {
+  return kind === "copilot_subscription" ? copilotClaudeRedirects : [];
+}
+
+const dottedClaudeModel = /^claude-(.+)-([0-9]+)\.([0-9]+)$/;
+
+/**
+ * Adds a rule for each Claude model a Copilot provider newly lists without a
+ * built-in row, from Claude Code's id to the dotted id (claude-fable-6-0 to
+ * claude-fable-6.0). Existing rules for either name stay as they are.
+ */
+export function withClaudeCodeRedirects(
+  kind: ServiceKind,
+  redirects: readonly ModelRedirect[],
+  previousModels: readonly string[],
+  models: readonly string[],
+): ModelRedirect[] {
+  const result = [...redirects];
+  if (kind !== "copilot_subscription") return result;
+  const builtins = serviceBuiltinRedirects(kind);
+  const previous = new Set(previousModels);
+  for (const model of models) {
+    const match = previous.has(model) ? null : dottedClaudeModel.exec(model);
+    if (!match || result.length >= maxModelRedirects) continue;
+    const from = `claude-${match[1]}-${match[2]}-${match[3]}`;
+    if (
+      builtins.some((builtin) => builtin.defaultTo === model) ||
+      result.some(
+        (redirect) =>
+          redirect.from === from ||
+          redirect.to === from ||
+          redirect.from === model,
+      )
+    ) {
+      continue;
+    }
+    result.push({ from, to: model, enabled: true });
+  }
+  return result;
 }
 
 export function responsesWebSocketEnabled(

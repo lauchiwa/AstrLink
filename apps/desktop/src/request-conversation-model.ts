@@ -125,6 +125,8 @@ export interface ConversationTurnStats {
   /** Null while no call has been read; `partial` when some have not. */
   toolCalls: number | null;
   toolCallsPartial: boolean;
+  /** Tool name → count over the calls already read. */
+  tools: Array<[string, number]>;
   failed: number;
   /** Calls that ended without an answer because the call was cancelled. */
   cancelled: number;
@@ -132,6 +134,10 @@ export interface ConversationTurnStats {
   disconnected: number;
   durationMs: number;
   tokens: TokenUsage | null;
+  /** Average time to first token over the streamed calls that recorded it. */
+  ttftMs: number | null;
+  /** Output tokens over generation time, as the session header counts it. */
+  outputTokensPerSecond: number | null;
   pending: boolean;
 }
 
@@ -535,6 +541,38 @@ function usageOf(records: RequestRecord[]): TokenUsage | null {
   return any ? { input, output } : null;
 }
 
+// Output speed divides by the whole call duration, TTFT included, the way the
+// session totals do: non-streaming calls have no first token, and streamed
+// output can arrive in one burst after it.
+function performanceOf(records: RequestRecord[]) {
+  let ttftSum = 0;
+  let ttftCount = 0;
+  let output = 0;
+  let durationMs = 0;
+  for (const record of records) {
+    if (record.streaming && record.first_token_ms != null) {
+      ttftSum += record.first_token_ms;
+      ttftCount += 1;
+    }
+    const usage = record.usage;
+    if (
+      record.latency_ms === null ||
+      record.latency_ms <= 0 ||
+      !usage ||
+      usage.billing_incomplete ||
+      usage.output_tokens <= 0
+    ) {
+      continue;
+    }
+    output += usage.output_tokens;
+    durationMs += record.latency_ms;
+  }
+  return {
+    ttftMs: ttftCount > 0 ? ttftSum / ttftCount : null,
+    outputTokensPerSecond: durationMs > 0 ? (output * 1000) / durationMs : null,
+  };
+}
+
 function addUsage(left: TokenUsage | null, right: TokenUsage | null) {
   if (!left) return right;
   if (!right) return left;
@@ -638,17 +676,11 @@ export function foldRoutineCalls(
   let run: ConversationCall[] = [];
   const flush = () => {
     if (run.length >= 2) {
-      const counts = new Map<string, number>();
-      for (const call of run) {
-        for (const tool of call.toolCalls) {
-          counts.set(tool.name, (counts.get(tool.name) ?? 0) + 1);
-        }
-      }
       const unread = run.some((call) => call.toolCount === null);
       segments.push({
         kind: "run",
         calls: run,
-        toolCounts: [...counts.entries()].sort((a, b) => b[1] - a[1]),
+        toolCounts: countTools(run),
         toolTotal: unread
           ? null
           : run.reduce((sum, call) => sum + (call.toolCount ?? 0), 0),
@@ -753,11 +785,13 @@ export function conversationTurns(
       calls: everyRecord.length,
       toolCalls: readCalls.length > 0 ? toolCalls : null,
       toolCallsPartial: readCalls.length > 0 && readCalls.length < calls.length,
+      tools: countTools(readCalls),
       failed,
       cancelled: cancelledRecords.length,
       disconnected: cancelledRecords.filter(clientDisconnect).length,
       durationMs: spanMs(everyRecord, nowMs),
       tokens: usageOf(everyRecord),
+      ...performanceOf(everyRecord),
       pending,
     };
     const read = calls.filter((call) => call.parsed !== null);
@@ -790,7 +824,37 @@ export function cancelledLabel(stats: ConversationTurnStats): string | null {
   );
 }
 
+/** Tool name → count over these calls, most used first. */
+function countTools(calls: ConversationCall[]): Array<[string, number]> {
+  const counts = new Map<string, number>();
+  for (const call of calls) {
+    for (const tool of call.toolCalls) {
+      counts.set(tool.name, (counts.get(tool.name) ?? 0) + 1);
+    }
+  }
+  return [...counts.entries()].sort((a, b) => b[1] - a[1]);
+}
+
 /** Tool name → count, sorted by count, for a run or a whole turn. */
 export function toolCountLabel(counts: Array<[string, number]>): string {
   return counts.map(([name, count]) => `${name} ×${count}`).join(" · ");
+}
+
+const EXCERPT_LIMIT = 240;
+
+/**
+ * A reply as one plain line for a folded turn: Markdown marks dropped,
+ * whitespace collapsed, cut well past what one line can show.
+ */
+export function replyExcerpt(text: string): string {
+  return text
+    .slice(0, EXCERPT_LIMIT * 4)
+    .replace(/^\s*```.*$/gm, " ")
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/^\s{0,3}(?:#{1,6}\s+|>\s?|[-*+]\s+(?:\[[ xX]\]\s+)?)/gm, "")
+    .replace(/\*\*|~~|`/g, "")
+    .replace(/\*(\S[^*]*)\*/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, EXCERPT_LIMIT);
 }

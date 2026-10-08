@@ -53,14 +53,16 @@ type releaseChecksum struct {
 }
 
 // CatalogReleases reports the newest compatible release of each catalog model
-// published through versioned tags, so clients can offer an update.
+// published through versioned tags, so clients can offer an update. Refresh
+// skips the hour-long cache for an operator who asked to check now.
 func (registry *Registry) CatalogReleases(
 	ctx context.Context,
+	refresh bool,
 ) (contract.PrivacyModelCatalogResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	release, err := registry.latestAstrLinkGuardRelease(ctx)
+	release, err := registry.latestAstrLinkGuardRelease(ctx, refresh)
 	if err != nil {
 		return contract.PrivacyModelCatalogResponse{}, err
 	}
@@ -114,7 +116,7 @@ func (registry *Registry) astrLinkGuardRelease(
 	case revision == pinned.item.Revision || revision == "v"+astrLinkGuardVersion:
 		return pinned, nil
 	case revision == "main":
-		return registry.latestAstrLinkGuardRelease(ctx)
+		return registry.latestAstrLinkGuardRelease(ctx, false)
 	case !releaseTagPattern.MatchString(revision) &&
 		contract.ValidatePrivacyModelRevision(revision) != nil:
 		return catalogRelease{}, ErrUnsupportedModel
@@ -137,10 +139,11 @@ func (registry *Registry) astrLinkGuardRelease(
 
 func (registry *Registry) latestAstrLinkGuardRelease(
 	ctx context.Context,
+	refresh bool,
 ) (catalogRelease, error) {
 	cache := &registry.releases
 	cache.mu.Lock()
-	if cache.latest != nil && time.Since(cache.checkedAt) < catalogReleaseTTL {
+	if !refresh && cache.latest != nil && time.Since(cache.checkedAt) < catalogReleaseTTL {
 		latest := *cache.latest
 		cache.mu.Unlock()
 		return latest, nil

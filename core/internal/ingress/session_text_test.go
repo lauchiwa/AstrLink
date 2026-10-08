@@ -319,3 +319,26 @@ func TestPreviewClamp(t *testing.T) {
 		t.Fatalf("unbroken CJK must be cut at the target with an ellipsis, got %d runes: %q", len(runes), got)
 	}
 }
+
+func TestMaskProtected(t *testing.T) {
+	cases := []struct {
+		name   string
+		text   string
+		values []string
+		want   string
+	}{
+		{"nothing protected", "hello", nil, "hello"},
+		{"every occurrence", "key k1 then k1 again", []string{"k1"}, "key … then … again"},
+		// Values merge across attempts, so order is not guaranteed; a short
+		// value must not split a longer one that contains it.
+		{"longest first", "token abc123456 and abc", []string{"abc", "abc123456"}, "token … and …"},
+		{"empty value ignored", "plain", []string{""}, "plain"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := maskProtected(tc.text, tc.values); got != tc.want {
+				t.Fatalf("maskProtected(%q, %q) = %q, want %q", tc.text, tc.values, got, tc.want)
+			}
+		})
+	}
+}

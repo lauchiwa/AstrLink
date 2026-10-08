@@ -94,6 +94,12 @@ type AuditBlob struct {
 	Sealing    AuditSealing
 	RawKeyID   int64
 	WrappedKey []byte
+	// Layout is set by readers. For chunks and recipe parts, Chunks holds the
+	// referenced chunks in order and Nonce and Ciphertext are empty for
+	// chunks; see OpenAuditChunks and AssembleAuditRecipe. Writers leave both
+	// empty: a part is captured whole and the store lays it out.
+	Layout AuditLayout
+	Chunks []AuditChunk
 }
 
 // AuditSealing names the key a stored part opens with.
@@ -130,6 +136,13 @@ type AuditBlobStore interface {
 	GetShareableAuditBlobsByRequest(context.Context, contract.RequestID) ([]AuditBlob, error)
 	DeleteAuditBlobsByRequest(context.Context, contract.RequestID) (int, error)
 	DeleteAuditBlobsOlderThan(context.Context, time.Time) (int, error)
+}
+
+// AuditChunker shares a finished request's shareable request bodies with
+// the rest of its session by splitting them into chunks. It works in the
+// background; the retention sweep picks up whatever it misses.
+type AuditChunker interface {
+	ChunkRequestAudit(contract.RequestID)
 }
 
 // AuditExposureStore settles the exposure of an already stored part without

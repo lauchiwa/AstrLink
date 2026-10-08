@@ -124,14 +124,33 @@ func buildForkCheckinBaseline(t *testing.T) string {
 
 func runForkCheckinBaseline(t *testing.T, binary, path, report, mode string) {
 	t.Helper()
+	runForkCheckinBaselineExpecting(t, binary, path, report, mode, "")
+}
+
+// expect is passed to the probe so the older binary knows whether this
+// database is still at its own schema version or has moved ahead of it.
+func runForkCheckinBaselineExpecting(t *testing.T, binary, path, report, mode, expect string) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	command := exec.CommandContext(ctx, binary, "-test.run=^TestForkCheckinBaselineProcess$")
 	command.Env = append(os.Environ(), "ASTRLINK_CHECKIN_BASELINE_DB="+path,
-		"ASTRLINK_CHECKIN_BASELINE_REPORT="+report, "ASTRLINK_CHECKIN_BASELINE_MODE="+mode)
+		"ASTRLINK_CHECKIN_BASELINE_REPORT="+report, "ASTRLINK_CHECKIN_BASELINE_MODE="+mode,
+		"ASTRLINK_CHECKIN_BASELINE_EXPECT="+expect)
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("baseline %s: %v\n%s", mode, err, output)
 	}
+}
+
+// mainSchemaVersion reads the applied main migration version, which upstream
+// advances independently of the check-in extension.
+func mainSchemaVersion(t *testing.T, store *Store) int64 {
+	t.Helper()
+	var version int64
+	if err := store.db.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	return version
 }
 
 func TestForkCheckinCompatBaselineUpgradeAndDisabledReopen(t *testing.T) {
@@ -149,8 +168,29 @@ func TestForkCheckinCompatBaselineUpgradeAndDisabledReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("baseline main schema=%d, tables=%d", report.Version, len(report.Main.Tables))
+	// Positive control: the baseline binary must be able to read the database
+	// it just wrote. Without this, an always-refusing probe would make the
+	// schema_newer expectations below pass for the wrong reason.
+	runForkCheckinBaseline(t, binary, path, reportPath, "normal")
 	store := openWithKey(t, path, testLocalKey(t, forkCheckinCompatKeyByte), nil)
-	assertForkCheckinDatabaseDigest(t, report.Main, snapshotForkCheckinDatabase(t, store, true))
+	// Opening ran this Core's main migrations. Upstream legitimately adds
+	// migrations, so compare the extension's footprint against the migrated
+	// database rather than the baseline's report, which would otherwise
+	// attribute upstream's schema changes to the check-in extension.
+	migrated := snapshotForkCheckinDatabase(t, store, true)
+	currentVersion := mainSchemaVersion(t, store)
+	if currentVersion < report.Version {
+		t.Fatalf("main schema went backwards: baseline=%d current=%d", report.Version, currentVersion)
+	}
+	// An older Core reads the database only while the main schema still
+	// matches. Once an upstream sync moves it ahead, refusing is the designed
+	// outcome and the gate asserts that refusal instead of a successful read.
+	baselineExpect := ""
+	if currentVersion > report.Version {
+		baselineExpect = "schema_newer"
+	}
+	// Whatever the migrations changed, the baseline's data must survive them.
+	assertForkCheckinBaselineReadable(t, store, report)
 	if present, err := store.ForkCheckinSchemaPresent(ctx); err != nil || present {
 		t.Fatalf("plain Open initialized the extension: %v %v", present, err)
 	}
@@ -163,7 +203,10 @@ func TestForkCheckinCompatBaselineUpgradeAndDisabledReopen(t *testing.T) {
 	if _, err := store.UpdateForkCheckinAccount(ctx, account, 1); err != nil {
 		t.Fatal(err)
 	}
-	assertForkCheckinDatabaseDigest(t, report.Main, snapshotForkCheckinDatabase(t, store, true))
+	assertForkCheckinDatabaseDigest(t, migrated, snapshotForkCheckinDatabase(t, store, true))
+	if after := mainSchemaVersion(t, store); after != currentVersion {
+		t.Fatalf("extension moved the main schema: %d -> %d", currentVersion, after)
+	}
 	assertForkCheckinBaselineReadable(t, store, report)
 	beforeDisabled := snapshotForkCheckinDatabase(t, store, false)
 	backup := filepath.Join(t.TempDir(), "baseline-backup.db")
@@ -183,7 +226,7 @@ func TestForkCheckinCompatBaselineUpgradeAndDisabledReopen(t *testing.T) {
 	}
 	for _, candidate := range []string{path, backup} {
 		for _, mode := range []string{"readonly", "offline", "normal"} {
-			runForkCheckinBaseline(t, binary, candidate, reportPath, mode)
+			runForkCheckinBaselineExpecting(t, binary, candidate, reportPath, mode, baselineExpect)
 		}
 	}
 	// Unknown extension history must also be irrelevant to the baseline.
@@ -195,7 +238,7 @@ func TestForkCheckinCompatBaselineUpgradeAndDisabledReopen(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	runForkCheckinBaseline(t, binary, path, reportPath, "normal")
+	runForkCheckinBaselineExpecting(t, binary, path, reportPath, "normal", baselineExpect)
 }
 
 func TestForkCheckinCompatReadOnlyAndOfflineReaders(t *testing.T) {

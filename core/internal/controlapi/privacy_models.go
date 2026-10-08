@@ -89,8 +89,11 @@ func (handler *Handler) privacyModelReleases(
 	writer http.ResponseWriter,
 	request *http.Request,
 ) {
-	if request.URL.RawQuery != "" {
-		writeError(writer, http.StatusBadRequest, "invalid_query", "privacy model releases do not accept query parameters")
+	// ?refresh=1 is an operator asking for the Hub's current tags, not the
+	// hour-long snapshot; background checks never send it.
+	refresh := request.URL.RawQuery == "refresh=1"
+	if request.URL.RawQuery != "" && !refresh {
+		writeError(writer, http.StatusBadRequest, "invalid_query", "privacy model releases accept only refresh=1")
 		return
 	}
 	if request.Method != http.MethodGet {
@@ -98,7 +101,7 @@ func (handler *Handler) privacyModelReleases(
 		writeError(writer, http.StatusMethodNotAllowed, "method_not_allowed", "only GET is allowed")
 		return
 	}
-	response, err := handler.privacyModels.CatalogReleases(request.Context())
+	response, err := handler.privacyModels.CatalogReleases(request.Context(), refresh)
 	if err != nil {
 		handler.writePrivacyModelRegistryError(writer, err)
 		return

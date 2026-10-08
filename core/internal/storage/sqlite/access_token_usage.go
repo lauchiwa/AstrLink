@@ -53,7 +53,7 @@ func (store *Store) ListAccessTokenUsage(ctx context.Context, todayFrom time.Tim
 	rows, err := store.db.QueryContext(ctx, `
 SELECT local_access_token_id, started_at >= ?,
        json_extract(usage_json, '$.total_tokens'), json_type(usage_json, '$.total_tokens'),
-       usage_json, input_protocol, streaming, latency_ms, first_token_ms
+       usage_json, input_protocol, latency_ms
 FROM request_records
 WHERE parent_request_id IS NULL AND status = 'succeeded' AND local_access_token_id IS NOT NULL
   AND (http_status IS NULL OR http_status < 400)`, boundary)
@@ -68,12 +68,12 @@ WHERE parent_request_id IS NULL AND status = 'succeeded' AND local_access_token_
 	byToken := make(map[contract.AccessTokenID]*accumulator)
 	for rows.Next() {
 		var id contract.AccessTokenID
-		var today, streaming bool
+		var today bool
 		var totalRaw any
 		var totalType, usageJSON sql.NullString
-		var latency, first sql.NullInt64
+		var latency sql.NullInt64
 		var protocol contract.ProtocolID
-		if err := rows.Scan(&id, &today, &totalRaw, &totalType, &usageJSON, &protocol, &streaming, &latency, &first); err != nil {
+		if err := rows.Scan(&id, &today, &totalRaw, &totalType, &usageJSON, &protocol, &latency); err != nil {
 			return nil, fmt.Errorf("read access token usage: %w", err)
 		}
 		if id.Validate() != nil {
@@ -103,9 +103,9 @@ WHERE parent_request_id IS NULL AND status = 'succeeded' AND local_access_token_
 		}
 		// Preserve existing token totals; performance only measures inference.
 		if protocol != contract.ProtocolOpenAIModels && protocol != contract.ProtocolGoogleModels {
-			group.total.observe(usage, streaming, latency, first)
+			group.total.observe(usage, latency)
 			if today {
-				group.today.observe(usage, streaming, latency, first)
+				group.today.observe(usage, latency)
 			}
 		}
 	}

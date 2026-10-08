@@ -168,12 +168,35 @@ jobs:
         run: bun ../../scripts/check-no-production-models.mjs
       - name: Stage Core and worker sidecars
         run: bun run sidecar:build
-      - name: Build app and DMG with the selected signing policy
-        # Honor CI=true so create-dmg skips Finder layout on headless runners.
-        # Do not set TAURI_BUNDLER_DMG_IGNORE_CI=true: that forces AppleScript.
-        run: bun run tauri build --verbose --ci --bundles app,dmg --config src-tauri/tauri.signing.conf.json
-      - name: Verify signing policy and notarize only in Developer ID mode
-        run: bun scripts/macos-release.mjs verify
+      - name: Build release app
+        run: bun run tauri build --ci --no-bundle --config src-tauri/tauri.signing.conf.json
+      - name: Bundle Developer ID signed app and DMG
+        # Deliberate fork deviation: upstream sets
+        # TAURI_BUNDLER_DMG_IGNORE_CI=true to apply the DMG Finder layout and
+        # relies on the retry below. Intel CI failed on that Finder dependency
+        # (see "avoid depending on Finder when packaging the DMG on Intel CI"),
+        # so honor CI=true instead and accept the default DMG layout. Re-check
+        # on real CI before restoring upstream's value.
+        run: |
+          # hdiutil and Finder sometimes fail on hosted runners and leave the
+          # writable image attached. Retry only the bundle phase; --verbose
+          # prints the bundle_dmg.sh output that Tauri otherwise hides.
+          bundle_dir="$PWD/src-tauri/target/release/bundle"
+          for attempt in 1 2 3; do
+            if bun run tauri bundle --ci --verbose --bundles app,dmg --config src-tauri/tauri.signing.conf.json; then
+              exit 0
+            fi
+            echo "::warning::macOS bundling failed on attempt $attempt"
+            hdiutil info | awk -v dir="$bundle_dir/" '
+              /^image-path/ { keep = index($0, dir) > 0 }
+              keep && /^\/dev\/disk[0-9]+[[:space:]]/ { print $1; keep = 0 }
+            ' | xargs -n 1 hdiutil detach -force || true
+            rm -f "$bundle_dir"/macos/rw.*.dmg
+            sleep 10
+          done
+          exit 1
+      - name: Notarize, staple and verify app and DMG
+        run: bun run macos:notarize
       - name: Mount DMG and verify packaged application
         env:
           PACKAGE_ARCH: ${{ matrix.arch }}

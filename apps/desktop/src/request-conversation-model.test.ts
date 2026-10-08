@@ -9,6 +9,7 @@ import {
   foldRoutineCalls,
   pairToolCalls,
   parseCallContent,
+  replyExcerpt,
   stripClientWrappers,
   type ParsedCall,
 } from "./request-conversation-model";
@@ -453,6 +454,11 @@ describe("conversationTurns", () => {
     expect(turn.calls[3].narration).toEqual([]);
     expect(turn.stats.toolCalls).toBe(3);
     expect(turn.stats.toolCallsPartial).toBe(false);
+    expect(turn.stats.tools).toEqual([
+      ["Read", 1],
+      ["Grep", 1],
+      ["Bash", 1],
+    ]);
     expect(turn.segments.map((segment) => segment.kind)).toEqual([
       "run",
       "call",
@@ -571,5 +577,96 @@ describe("conversationTurns", () => {
     expect(segments.map((segment) => segment.kind)).toEqual(["run", "call"]);
     expect(calls[3].tone).toBe("pending");
     expect(calls[3].durationMs).toBe(9000);
+  });
+
+  it("measures TTFT over streamed calls and output speed over whole call durations the way the session does", () => {
+    const streamed = (
+      overrides: Partial<RequestRecord>,
+      ttft: number,
+      latency: number,
+    ) => record({ ...overrides, first_token_ms: ttft, latency_ms: latency });
+    const turn = [
+      streamed({ id: "req_1" }, 2000, 10_000),
+      streamed(
+        {
+          id: "req_2",
+          usage: { input_tokens: 1000, output_tokens: 100, total_tokens: 1100 },
+        },
+        3000,
+        7000,
+      ),
+      // Not streamed: no first token, but its output speed still counts.
+      record({ id: "req_3", streaming: false }),
+      // The stream ended before usage was final, so only its TTFT counts.
+      streamed(
+        {
+          id: "req_4",
+          usage: {
+            input_tokens: 1000,
+            output_tokens: 300,
+            total_tokens: 1300,
+            billing_incomplete: true,
+          },
+        },
+        4000,
+        9000,
+      ),
+      // Output in one burst still divides by the whole call.
+      streamed(
+        {
+          id: "req_5",
+          usage: { input_tokens: 1000, output_tokens: 20, total_tokens: 1020 },
+        },
+        1000,
+        1200,
+      ),
+    ];
+    const retry = streamed(
+      {
+        id: "req_2_retry",
+        parent_request_id: "req_2",
+        status: "failed",
+        usage: null,
+      },
+      1000,
+      3000,
+    );
+    const [stats] = conversationTurns(turn, { req_2: [retry] }, new Map()).map(
+      (built) => built.stats,
+    );
+    expect(stats.ttftMs).toBe(2200);
+    // (50 + 100 + 50 + 20) tokens over (10 + 7 + 10 + 1.2) seconds.
+    expect(stats.outputTokensPerSecond).toBeCloseTo(220 / 28.2);
+
+    const [plain] = conversationTurns(
+      [
+        record({ id: "req_6", streaming: false }),
+        record({ id: "req_7", streaming: false, latency_ms: 0 }),
+      ],
+      {},
+      new Map(),
+    );
+    expect(plain.stats.ttftMs).toBeNull();
+    expect(plain.stats.outputTokensPerSecond).toBe(5);
+  });
+});
+
+describe("replyExcerpt", () => {
+  it("reads a Markdown reply as one plain line", () => {
+    expect(
+      replyExcerpt(
+        "## 结论\n\n修完了，**两条**已提交：\n\n- [x] 改了 `init_db`\n- 见 [日志](https://example.com/log)\n\n```ts\nconst a = 1;\n```",
+      ),
+    ).toBe("结论 修完了，两条已提交： 改了 init_db 见 日志 const a = 1;");
+  });
+
+  it("keeps identifiers and arithmetic intact", () => {
+    expect(replyExcerpt("__init__ 里 a * b * c 不变，*强调* 去掉")).toBe(
+      "__init__ 里 a * b * c 不变，强调 去掉",
+    );
+  });
+
+  it("cuts a long reply well past one line", () => {
+    expect(replyExcerpt("长".repeat(5000))).toHaveLength(240);
   });
 });

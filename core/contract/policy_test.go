@@ -166,7 +166,7 @@ func TestDefaultKindRulesCoverEveryKindAndDisableTheNoisyOnes(t *testing.T) {
 			t.Fatalf("default rule %q rejected: %v", rule.Kind, err)
 		}
 		wantStyle := PlaceholderStyleNatural
-		if PlaceholderStyleLocked(rule.Kind) || rule.Kind == "phone" {
+		if PlaceholderStyleLocked(rule.Kind) {
 			wantStyle = PlaceholderStyleToken
 		}
 		if rule.Style != wantStyle {
@@ -181,10 +181,15 @@ func TestDefaultKindRulesCoverEveryKindAndDisableTheNoisyOnes(t *testing.T) {
 
 // TestLockedKindsRejectNaturalPlaceholderStyle pins the safety property: a
 // credential dressed up as a usable-looking key invites the model to call an
-// API with it, and a plausible fake name, address, or date would be taken as
-// fact because those kinds have no reserved namespace to draw stand-ins from.
+// API with it, a plausible fake name, address, or date would be taken as fact
+// because those kinds have no reserved namespace to draw stand-ins from, and a
+// stand-in number is rewritten in more ways than restoration can follow.
 func TestLockedKindsRejectNaturalPlaceholderStyle(t *testing.T) {
+	natural := map[string]bool{"email": true, "url": true, "ip_address": true}
 	for _, kind := range PrivacyKinds() {
+		if PlaceholderStyleLocked(kind) == natural[kind] {
+			t.Fatalf("kind %q locked=%v", kind, PlaceholderStyleLocked(kind))
+		}
 		rule := PolicyKindRule{Kind: kind, Enabled: true, Style: PlaceholderStyleNatural}
 		err := rule.Validate()
 		if !PlaceholderStyleLocked(kind) {

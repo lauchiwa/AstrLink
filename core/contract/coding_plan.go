@@ -5,6 +5,9 @@ import "strings"
 // ModelNativeProtocol follows OpenCode's published endpoint tables. The
 // catalog is fetched live; these rules select its wire protocol, not access.
 func (kind ServiceKind) ModelNativeProtocol(model string) ProtocolID {
+	if kind == ServiceKindCopilotSubscription {
+		return copilotModelProtocol(strings.ToLower(model))
+	}
 	if kind != ServiceKindOpenCodeGo && kind != ServiceKindOpenCodeZen {
 		return ""
 	}
@@ -17,4 +20,19 @@ func (kind ServiceKind) ModelNativeProtocol(model string) ProtocolID {
 		return ProtocolAnthropicMessages
 	}
 	return ProtocolOpenAIChat
+}
+
+// copilotModelProtocol mirrors OpenCode's choice among the endpoints a Copilot
+// model lists: Messages when offered (Claude), then Responses (GPT-5, o-series
+// and Codex models), otherwise Chat Completions.
+func copilotModelProtocol(model string) ProtocolID {
+	switch {
+	case strings.HasPrefix(model, "claude-"):
+		return ProtocolAnthropicMessages
+	case strings.HasPrefix(model, "gpt-5"), strings.Contains(model, "codex"),
+		strings.HasPrefix(model, "o1"), strings.HasPrefix(model, "o3"), strings.HasPrefix(model, "o4"):
+		return ProtocolOpenAIResponses
+	default:
+		return ProtocolOpenAIChat
+	}
 }

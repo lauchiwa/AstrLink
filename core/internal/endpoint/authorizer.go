@@ -97,6 +97,10 @@ func (authorizer *ServiceAuthorizer) Headers(ctx context.Context, endpoint contr
 		switch endpoint.Kind {
 		case contract.ServiceKindAntigravitySubscription:
 			accountauth.ApplyAntigravityHeaders(headers, tokens)
+		case contract.ServiceKindCopilotSubscription:
+			// Every Copilot call presents OpenCode, whatever the caller;
+			// providerapi.CopilotRequest drops the caller's other headers.
+			accountauth.ApplyCopilotAPIHeaders(headers, tokens)
 		case contract.ServiceKindClaudeSubscription:
 			if official {
 				accountauth.ApplyClaudeOfficialForwardHeaders(headers, tokens, clientHeaders)

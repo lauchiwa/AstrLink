@@ -104,10 +104,10 @@ export function AuditSettingsDialog({
                   <div className="mt-2 grid grid-cols-2 gap-4">
                     <NumberField
                       label={t("records.requestLimit")}
-                      hint={t("records.limitMaximum", { count: 16 })}
+                      hint={t("records.limitMaximum", { count: 64 })}
                       unit="MiB"
                       min={1 / 1024}
-                      max={16}
+                      max={64}
                       step="any"
                       value={draft.request_body_max_bytes / MIB}
                       disabled={busy}

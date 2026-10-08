@@ -4,9 +4,9 @@ description: >-
   Handle redaction placeholders in conversation, files, or tool output: markers
   such as <PRIVATE_EMAIL_…> or <SECRET_…>, and reserved stand-ins such as
   redacted-…@private.invalid, https://private.invalid/r/…, 192.0.2.x,
-  198.51.100.x, 203.0.113.x, 2001:db8::…, +1-555-555-01NN, 4000000000000NNN,
-  XX00REDACTED…. Copy them byte for byte and never guess the hidden value. Load
-  before putting one in a tool call, file, command, or reply.
+  198.51.100.x, 203.0.113.x, or 2001:db8::…. Copy them byte for byte and never
+  guess the hidden value. Load before putting one in a tool call, file, command,
+  or reply.
 ---
 
 # Redaction placeholders
@@ -20,12 +20,12 @@ Two shapes appear. [references/shapes.md](references/shapes.md) lists every
 kind.
 
 - **Markers** such as `<PRIVATE_EMAIL_…>`, `<PRIVATE_PHONE_…>`, or `<SECRET_…>`,
-  where `…` is a hex suffix. Secrets, names, street addresses, and dates always
-  use this shape.
+  where `…` is a hex suffix. Secrets, phone numbers, card and account numbers,
+  names, street addresses, and dates always use this shape.
 - **Natural stand-ins**: well-formed values from namespaces that can never be
-  real, such as `redacted-…@private.invalid`, `https://private.invalid/r/…`,
+  real, such as `redacted-…@private.invalid`, `https://private.invalid/r/…`, and
   addresses in `192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`, or
-  `2001:db8::/32`, `+1-555-555-01NN`, `4000000000000NNN`, and `XX00REDACTED…`.
+  `2001:db8::/32`.
 
 ## Rules
 

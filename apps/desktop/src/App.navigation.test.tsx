@@ -110,6 +110,14 @@ vi.mock("./features/fork-checkin/bridge", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./features/fork-checkin/bridge")>()),
   ...checkinMocks,
 }));
+const modelUpdate = vi.hoisted(() => ({
+  current: null as
+    | import("./use-privacy-model-update").PrivacyModelUpdate
+    | null,
+}));
+vi.mock("./use-privacy-model-update", () => ({
+  usePrivacyModelUpdate: () => modelUpdate.current,
+}));
 
 import App from "./App";
 import type { AppSnapshot } from "./core-model";
@@ -301,6 +309,7 @@ describe("App workspace navigation", () => {
     checkinMocks.loadCheckinAvailability
       .mockReset()
       .mockResolvedValue({ kind: "unavailable" });
+    modelUpdate.current = null;
 
     localStorage.removeItem(ONBOARDING_STORAGE_KEY);
     (
@@ -1130,6 +1139,46 @@ describe("App workspace navigation", () => {
     expect(
       container.querySelector('[data-testid="service-list-scroller"]'),
     ).toBeNull();
+  });
+
+  it("marks Safety for a model update until the policy switches to it", async () => {
+    const guard = {
+      catalog_id: "astrlink-guard",
+      name: "AstrLink Guard",
+      version: "0.1.1",
+    };
+    modelUpdate.current = { ...guard, phase: "available" };
+    await renderApp();
+    const available =
+      "AstrLink Guard v0.1.1 已发布，可以在「安全 → 模型」中更新。";
+    const mark = () =>
+      button("安全")
+        .querySelector('[role="status"]')
+        ?.getAttribute("aria-label");
+    expect(mark()).toBe(available);
+    expect(updateMocks.info).toHaveBeenCalledOnce();
+    expect(updateMocks.info.mock.calls[0][0]).toBe(available);
+    expect(updateMocks.info.mock.calls[0][1].action.label).toBe("去更新");
+
+    // The finished download announces the switch as the next step.
+    modelUpdate.current = { ...guard, phase: "ready" };
+    await act(async () => button("令牌").click());
+    const ready = "AstrLink Guard v0.1.1 已下载，可以在「安全 → 模型」中切换。";
+    expect(mark()).toBe(ready);
+    expect(updateMocks.info).toHaveBeenCalledTimes(2);
+    expect(updateMocks.info.mock.calls[1][0]).toBe(ready);
+    expect(updateMocks.info.mock.calls[1][1].action.label).toBe("去切换");
+    await act(async () => updateMocks.info.mock.calls[1][1].action.onClick());
+    expect(workspaceHeading().textContent).toBe("隐私保护");
+    const modelsTab = [
+      ...container.querySelectorAll<HTMLElement>('[role="tab"]'),
+    ].find((tab) => tab.textContent?.trim() === "模型");
+    expect(modelsTab?.getAttribute("aria-selected")).toBe("true");
+
+    modelUpdate.current = null;
+    await act(async () => button("概览").click());
+    expect(mark()).toBeUndefined();
+    expect(updateMocks.info).toHaveBeenCalledTimes(2);
   });
 
   it("switches between overview, token manager, safety, service list, and create pages", async () => {

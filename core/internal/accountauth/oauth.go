@@ -61,14 +61,17 @@ var (
 // It defaults to the official public Codex OAuth client and registered
 // localhost callback ports.
 type OAuthConfig struct {
-	Provider              contract.SubscriptionProvider
-	AuthorizeURL          string
-	TokenURL              string
-	CodeRedirectURI       string
-	ClientID              string
-	ClientSecret          string
-	ProjectBaseURL        string
-	UserInfoURL           string
+	Provider        contract.SubscriptionProvider
+	AuthorizeURL    string
+	TokenURL        string
+	CodeRedirectURI string
+	ClientID        string
+	ClientSecret    string
+	ProjectBaseURL  string
+	UserInfoURL     string
+	// UsageURL is the provider's plan and quota endpoint read with the
+	// account's token (GitHub Copilot's /copilot_internal/user).
+	UsageURL              string
 	Issuer                string
 	APIBaseURL            string
 	Scopes                []string
@@ -107,6 +110,9 @@ func (config OAuthConfig) normalized() OAuthConfig {
 	}
 	if config.Provider == contract.SubscriptionProviderAntigravity {
 		config = normalizeAntigravityConfig(config)
+	}
+	if config.Provider == contract.SubscriptionProviderGitHubCopilot {
+		config = normalizeCopilotConfig(config)
 	}
 	if strings.TrimSpace(config.ClientID) == "" {
 		config.ClientID = DefaultCodexOAuthClientID
@@ -230,6 +236,9 @@ func (client *TokenClient) ExchangeCode(ctx context.Context, code, verifier, red
 }
 
 func (client *TokenClient) Refresh(ctx context.Context, refreshToken string) (AccountTokens, error) {
+	if client.config.Provider == contract.SubscriptionProviderGitHubCopilot {
+		return client.refreshCopilot(ctx, refreshToken)
+	}
 	values := url.Values{}
 	values.Set("grant_type", "refresh_token")
 	values.Set("refresh_token", refreshToken)

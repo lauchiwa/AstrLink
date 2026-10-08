@@ -86,6 +86,8 @@ const privacyPlaceholderPattern =
  * the point upstream but leaves the operator with no way to tell what was
  * replaced. These patterns mirror the reserved namespaces Core mints from
  * (`core/internal/privacy/placeholders.go`) so the audit panel can name them.
+ * Core no longer mints phone, card, or account stand-ins, but requests recorded
+ * by earlier builds still carry them.
  */
 const naturalPlaceholderPatterns: ReadonlyArray<
   [(typeof privacyKindOrder)[number], RegExp]

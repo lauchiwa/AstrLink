@@ -77,6 +77,25 @@ func decodeServiceModels(raw json.RawMessage) ([]string, error) {
 	return contract.NormalizeServiceModels(models)
 }
 
+// decodeServiceModelRedirects reads a provider's own redirect table; an
+// empty array clears it.
+func decodeServiceModelRedirects(raw json.RawMessage) ([]contract.ModelRedirect, error) {
+	if isJSONNull(raw) {
+		return nil, fmt.Errorf("model_redirects must be an array")
+	}
+	var redirects []contract.ModelRedirect
+	if err := strictUnmarshal(raw, &redirects); err != nil {
+		return nil, fmt.Errorf("decode model_redirects: %w", err)
+	}
+	if err := contract.ValidateModelRedirects(redirects); err != nil {
+		return nil, fmt.Errorf("model_redirects: %w", err)
+	}
+	if len(redirects) == 0 {
+		return nil, nil
+	}
+	return redirects, nil
+}
+
 func decodeServiceAuth(raw json.RawMessage) (contract.ServiceAuth, error) {
 	if isJSONNull(raw) {
 		return contract.ServiceAuth{}, fmt.Errorf("auth must be an object")

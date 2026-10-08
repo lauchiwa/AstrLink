@@ -276,7 +276,22 @@ func TestGatewayAuditUsesExistingCaptureSettings(t *testing.T) {
 						t.Fatalf("%s is raw but kept under the audit key", blob.Direction)
 					}
 				}
-				body, err := storage.OpenAuditBlob(partKey, blob.Nonce, blob.Ciphertext)
+				for _, chunk := range blob.Chunks {
+					if bytes.Contains(chunk.Ciphertext, []byte("alice@example.com")) {
+						t.Fatal("plaintext audit chunk storage")
+					}
+				}
+				var body []byte
+				if blob.Layout == storage.AuditLayoutChunks {
+					body, err = storage.OpenAuditChunks(key, blob.Chunks)
+				} else {
+					body, err = storage.OpenAuditBlob(partKey, blob.Nonce, blob.Ciphertext)
+					// A recipe refers to shared chunks, which open with the
+					// audit key.
+					if err == nil && blob.Layout == storage.AuditLayoutRecipe {
+						body, err = storage.AssembleAuditRecipe(body, key, blob.Chunks)
+					}
+				}
 				if err != nil {
 					t.Fatal(err)
 				}

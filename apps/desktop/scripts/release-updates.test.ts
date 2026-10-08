@@ -187,7 +187,25 @@ describe("release updates", () => {
       "utf8",
     );
     expect(workflow).not.toContain('TAURI_BUNDLER_DMG_IGNORE_CI: "true"');
-    expect(workflow).toContain("tauri build --verbose --ci --bundles app,dmg");
+    // Bundling is split from the build so a retry does not rebuild. Both halves
+    // must still carry the generated signing policy.
+    expect(workflow).toContain(
+      "tauri build --ci --no-bundle --config src-tauri/tauri.signing.conf.json",
+    );
+    expect(workflow).toContain(
+      "tauri bundle --ci --verbose --bundles app,dmg --config src-tauri/tauri.signing.conf.json",
+    );
+    // Keep upstream's notarization step rather than replacing it, so the next
+    // sync does not re-conflict on that hunk. The ad-hoc policy adapts by
+    // repointing macos:notarize at the fork's wrapper, which resolves the
+    // signing mode in code and fails closed on an unknown value.
+    expect(workflow).toContain("run: bun run macos:notarize");
+    const manifest = JSON.parse(
+      readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+    );
+    expect(manifest.scripts["macos:notarize"]).toBe(
+      "bun scripts/macos-release.mjs verify",
+    );
   });
 
   it("retries an existing release tag without building a moving branch", () => {

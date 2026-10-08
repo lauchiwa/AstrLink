@@ -486,7 +486,12 @@ func (reader *auditReader) open(blob storage.AuditBlob) ([]byte, contract.AuditW
 	if err != nil {
 		return nil, "", err
 	}
-	plaintext, err := storage.OpenAuditBlob(key, blob.Nonce, blob.Ciphertext)
+	var plaintext []byte
+	if blob.Layout == storage.AuditLayoutChunks {
+		plaintext, err = storage.OpenAuditChunks(key, blob.Chunks)
+	} else {
+		plaintext, err = storage.OpenAuditBlob(key, blob.Nonce, blob.Ciphertext)
+	}
 	if errors.Is(err, storage.ErrAuditDecrypt) && reader.auditKeyOrphaned() {
 		// Sealed under an audit key this device lost with its local key.
 		err = errAuditKeyMissing
@@ -536,7 +541,21 @@ func (reader *auditReader) openRawSealed(blob storage.AuditBlob) ([]byte, contra
 		// Recaptured after the approval with a new part key.
 		return nil, privacyWithheldReason(reader.record, blob), nil
 	}
-	return plaintext, "", err
+	if err != nil || blob.Layout != storage.AuditLayoutRecipe {
+		return plaintext, "", err
+	}
+	// The part key opened a recipe; what it refers to is content the
+	// session already shares, which opens with the audit key.
+	defer clear(plaintext)
+	key, err := reader.key()
+	if err != nil {
+		return nil, "", err
+	}
+	assembled, err := storage.AssembleAuditRecipe(plaintext, key, blob.Chunks)
+	if errors.Is(err, storage.ErrAuditDecrypt) && reader.auditKeyOrphaned() {
+		err = errAuditKeyMissing
+	}
+	return assembled, "", err
 }
 
 func (reader *auditReader) part(blob storage.AuditBlob) (*contract.AuditContentPart, error) {

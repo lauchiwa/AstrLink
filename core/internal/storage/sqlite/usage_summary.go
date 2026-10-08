@@ -37,8 +37,7 @@ func (store *Store) GetUsageSummary(ctx context.Context, options storage.UsageSu
     service_id, COALESCE(
         NULLIF(json_extract(NULLIF(recovery_json, ''), '$.upstream_model'), ''),
         NULLIF(json_extract(NULLIF(model_redirect_json, ''), '$.to'), ''),
-        requested_model), local_access_token_id, usage_json,
-    streaming, latency_ms, first_token_ms
+        requested_model), local_access_token_id, usage_json, latency_ms
 FROM request_records
 WHERE parent_request_id IS NULL AND started_at >= ? AND started_at < ?
   AND status IN ('succeeded', 'failed') AND input_protocol NOT IN (?, ?)`,
@@ -55,10 +54,9 @@ WHERE parent_request_id IS NULL AND started_at >= ? AND started_at < ?
 	for rows.Next() {
 		var startedAt, status string
 		var httpStatus sql.NullInt64
-		var streaming bool
-		var latency, firstToken sql.NullInt64
+		var latency sql.NullInt64
 		var service, model, localAccessTokenID, usageJSON sql.NullString
-		if err := rows.Scan(&startedAt, &status, &httpStatus, &service, &model, &localAccessTokenID, &usageJSON, &streaming, &latency, &firstToken); err != nil {
+		if err := rows.Scan(&startedAt, &status, &httpStatus, &service, &model, &localAccessTokenID, &usageJSON, &latency); err != nil {
 			return result, fmt.Errorf("scan usage summary: %w", err)
 		}
 		started, err := time.Parse(time.RFC3339Nano, startedAt)
@@ -112,13 +110,13 @@ WHERE parent_request_id IS NULL AND started_at >= ? AND started_at < ?
 			if performance[service.String] == nil {
 				performance[service.String] = &servicePerformance{}
 			}
-			performance[service.String].observe(usage, streaming, latency, firstToken)
+			performance[service.String].observe(usage, latency)
 		}
 		if _, ok := tokenWhitelist[localAccessTokenID.String]; localAccessTokenID.Valid && ok {
 			if tokenPerformance[localAccessTokenID.String] == nil {
 				tokenPerformance[localAccessTokenID.String] = &servicePerformance{}
 			}
-			tokenPerformance[localAccessTokenID.String].observe(usage, streaming, latency, firstToken)
+			tokenPerformance[localAccessTokenID.String].observe(usage, latency)
 		}
 		for _, target := range targets {
 			target.Requests++

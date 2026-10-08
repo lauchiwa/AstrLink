@@ -197,7 +197,7 @@ impl PrivacyEngine {
         }
 
         let label_count = self.decoder.label_count();
-        let mut scores = LogProbabilityAccumulator::new(ids.len(), label_count);
+        let mut scores = StitchedWindowScores::new(ids.len(), label_count);
         scores.preserve_logits = self.decoder.uses_raw_logits();
         for (start, end) in
             chunk_ranges_with(ids.len(), self.content_window_tokens, self.overlap_tokens)
@@ -506,18 +506,23 @@ fn runtime_library_candidates(executable: &Path, runtime_name: &str) -> Vec<Path
     candidates
 }
 
-struct LogProbabilityAccumulator {
-    sums: Vec<f64>,
-    coverage: Vec<u32>,
+/// Stitches overlapping windows by keeping, for each token, the row from the
+/// window where it sits farthest from a cut edge. A window that starts or ends
+/// inside the text cannot see past that edge; averaging its row in let a value
+/// cut at a window start lose its cue words and fall out of the span.
+struct StitchedWindowScores {
+    scores: Vec<f64>,
+    // Distance to the nearest cut edge of the window each row came from.
+    context: Vec<Option<usize>>,
     label_count: usize,
     preserve_logits: bool,
 }
 
-impl LogProbabilityAccumulator {
+impl StitchedWindowScores {
     fn new(token_count: usize, label_count: usize) -> Self {
         Self {
-            sums: vec![0.0; token_count * label_count],
-            coverage: vec![0; token_count],
+            scores: vec![0.0; token_count * label_count],
+            context: vec![None; token_count],
             label_count,
             preserve_logits: false,
         }
@@ -531,7 +536,7 @@ impl LogProbabilityAccumulator {
         let end = start
             .checked_add(token_count)
             .ok_or("invalid_logits_shape")?;
-        if end > self.coverage.len() {
+        if end > self.context.len() {
             return Err("invalid_logits_shape");
         }
 
@@ -558,35 +563,33 @@ impl LogProbabilityAccumulator {
             } else {
                 maximum + log_denominator
             };
-            let destination = &mut self.sums
-                [global_token * self.label_count..(global_token + 1) * self.label_count];
-            for (sum, value) in destination.iter_mut().zip(row) {
-                *sum += f64::from(*value) - normalizer;
+            // The text's own start and end hide no context.
+            let before = if start == 0 { usize::MAX } else { local_token };
+            let after = if end == self.context.len() {
+                usize::MAX
+            } else {
+                token_count - 1 - local_token
+            };
+            let context = before.min(after);
+            // Ties keep the earlier window.
+            if self.context[global_token].is_some_and(|kept| kept >= context) {
+                continue;
             }
-            self.coverage[global_token] = self.coverage[global_token]
-                .checked_add(1)
-                .ok_or("invalid_logits")?;
+            let destination = &mut self.scores
+                [global_token * self.label_count..(global_token + 1) * self.label_count];
+            for (score, value) in destination.iter_mut().zip(row) {
+                *score = f64::from(*value) - normalizer;
+            }
+            self.context[global_token] = Some(context);
         }
         Ok(())
     }
 
     fn finish(self) -> Result<Vec<f32>, &'static str> {
-        if self.coverage.contains(&0) {
+        if self.context.contains(&None) {
             return Err("incomplete_logits_coverage");
         }
-        let mut averaged = self.sums;
-        for (token, count) in self.coverage.into_iter().enumerate() {
-            let divisor = f64::from(count);
-            for value in &mut averaged[token * self.label_count..(token + 1) * self.label_count] {
-                *value /= divisor;
-            }
-        }
-        Ok(averaged.into_iter().map(|value| value as f32).collect())
-    }
-
-    #[cfg(test)]
-    fn coverage(&self) -> &[u32] {
-        &self.coverage
+        Ok(self.scores.into_iter().map(|value| value as f32).collect())
     }
 }
 
@@ -715,36 +718,88 @@ mod tests {
 
     #[test]
     fn preserves_raw_logits_for_pplx_confidence_across_windows() {
-        let mut accumulator = LogProbabilityAccumulator::new(3, 2);
-        accumulator.preserve_logits = true;
-        accumulator
-            .add_window(0, &[1.0, 3.0, 4.0, 6.0])
+        let mut scores = StitchedWindowScores::new(4, 2);
+        scores.preserve_logits = true;
+        scores
+            .add_window(0, &[1.0, 3.0, 4.0, 6.0, 5.0, 7.0])
             .expect("first");
-        accumulator
-            .add_window(1, &[2.0, 4.0, 7.0, 9.0])
+        scores
+            .add_window(1, &[2.0, 4.0, 8.0, 9.0, 7.0, 9.0])
             .expect("second");
         assert_eq!(
-            accumulator.finish().expect("scores"),
-            vec![1.0, 3.0, 3.0, 5.0, 7.0, 9.0]
+            scores.finish().expect("scores"),
+            vec![1.0, 3.0, 4.0, 6.0, 8.0, 9.0, 7.0, 9.0]
         );
     }
 
     #[test]
-    fn averages_log_softmax_scores_for_overlapping_tokens() {
-        let mut accumulator = LogProbabilityAccumulator::new(4, TEST_LABEL_COUNT);
-        let first = rows(&[(0, 0.0), (0, 0.0), (1, 2.0)]);
-        let second = rows(&[(1, 4.0), (0, 0.0)]);
-        accumulator.add_window(0, &first).expect("first window");
-        accumulator.add_window(2, &second).expect("second window");
-        assert_eq!(accumulator.coverage(), &[1, 1, 2, 1]);
+    fn keeps_each_token_from_the_window_farthest_from_a_cut_edge() {
+        let mut scores = StitchedWindowScores::new(6, TEST_LABEL_COUNT);
+        let first = rows(&[(0, 0.0), (0, 0.0), (1, 2.0), (1, 3.0)]);
+        let second = rows(&[(2, 4.0), (2, 5.0), (0, 0.0), (0, 0.0)]);
+        assert_eq!(chunk_ranges_with(6, 4, 2), vec![(0, 4), (2, 6)]);
+        scores.add_window(0, &first).expect("first window");
+        scores.add_window(2, &second).expect("second window");
 
-        let first_overlap = log_softmax(&first[2 * TEST_LABEL_COUNT..3 * TEST_LABEL_COUNT]);
-        let second_overlap = log_softmax(&second[..TEST_LABEL_COUNT]);
-        let averaged = accumulator.finish().expect("complete coverage");
-        for label in 0..TEST_LABEL_COUNT {
-            let expected = (first_overlap[label] + second_overlap[label]) / 2.0;
-            assert!((averaged[2 * TEST_LABEL_COUNT + label] - expected).abs() < 1e-6);
+        let stitched = scores.finish().expect("complete coverage");
+        let assert_row = |token: usize, expected: Vec<f32>| {
+            let row = &stitched[token * TEST_LABEL_COUNT..(token + 1) * TEST_LABEL_COUNT];
+            for (actual, expected) in row.iter().zip(expected) {
+                assert!((actual - expected).abs() < 1e-6);
+            }
+        };
+        // Token 2 is one token from the first window's cut end but at the
+        // second window's cut start; token 3 is the other way round.
+        assert_row(
+            2,
+            log_softmax(&first[2 * TEST_LABEL_COUNT..3 * TEST_LABEL_COUNT]),
+        );
+        assert_row(
+            3,
+            log_softmax(&second[TEST_LABEL_COUNT..2 * TEST_LABEL_COUNT]),
+        );
+    }
+
+    #[test]
+    fn value_cut_at_a_window_start_keeps_its_full_span() {
+        let config = serde_json::to_vec(&serde_json::json!({
+            "id2label": { "0": "O", "1": "B-account", "2": "I-account" }
+        }))
+        .expect("config");
+        let mapping =
+            std::collections::BTreeMap::from([("account".into(), Some("account".into()))]);
+        let decoder = Decoder::from_hf_json(&config, crate::manifest::TagScheme::Bio, &mapping)
+            .expect("decoder");
+        let label_count = 3;
+        let token_count = 8;
+        let offsets = (0..token_count)
+            .map(|token| (token, token + 1))
+            .collect::<Vec<_>>();
+        let ranges = chunk_ranges_with(token_count, 6, 4);
+        assert_eq!(ranges, vec![(0, 6), (2, 8)]);
+        let mut scores = StitchedWindowScores::new(token_count, label_count);
+        for (start, end) in ranges {
+            let mut logits = vec![-20.0; (end - start) * label_count];
+            for global_token in start..end {
+                let row = &mut logits[(global_token - start) * label_count
+                    ..(global_token - start + 1) * label_count];
+                // The first window sees the cue before the value at tokens
+                // 1..=3. The second starts inside the value and reads it as
+                // background, as a window without the cue words would.
+                match (start, global_token) {
+                    (0, 1) => row[1] = 2.0,
+                    (0, 2 | 3) => row[2] = 2.0,
+                    _ => row[0] = 5.0,
+                }
+            }
+            scores.add_window(start, &logits).expect("add window");
         }
+
+        let scores = scores.finish().expect("complete coverage");
+        let spans = decoder.decode(7, &scores, &offsets).expect("decode");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].label, "account");
+        assert_eq!((spans[0].start, spans[0].end), (1, 4));
     }
 
     #[test]
@@ -758,7 +813,7 @@ mod tests {
         let offsets = (0..token_count)
             .map(|token| (token, token + 1))
             .collect::<Vec<_>>();
-        let mut accumulator = LogProbabilityAccumulator::new(token_count, TEST_LABEL_COUNT);
+        let mut scores = StitchedWindowScores::new(token_count, TEST_LABEL_COUNT);
 
         for (start, end) in chunk_ranges_with(token_count, window_tokens, overlap_tokens) {
             let mut logits = vec![-20.0; (end - start) * TEST_LABEL_COUNT];
@@ -774,12 +829,10 @@ mod tests {
                     row[2] = 0.01;
                 }
             }
-            accumulator
-                .add_window(start, &logits)
-                .expect("aggregate window");
+            scores.add_window(start, &logits).expect("aggregate window");
         }
 
-        let scores = accumulator.finish().expect("complete coverage");
+        let scores = scores.finish().expect("complete coverage");
         let spans = decoder.decode(7, &scores, &offsets).expect("global decode");
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].label, "account");

@@ -247,7 +247,16 @@ type recordSession struct {
 	sessionID                contract.SessionID
 	previousResponseID       string
 	outputResponseID         string
-	inputPreview             string
+	// inputPreview is cut from the client's newest user text, so the record
+	// carries visibleInputPreview instead. protectedValues is what redact or
+	// block decisions covered, in memory only; maskedPreview is inputPreview
+	// rebuilt with those values masked.
+	inputPreview    string
+	protectedValues []string
+	maskedPreview   string
+	// continuesTurn is set when the call stays in a turn whose preview an
+	// earlier call already stored; the record then carries none.
+	continuesTurn bool
 	// fingerprinter is nil when audit storage is unavailable; text-only
 	// linking is then skipped for this request.
 	fingerprinter *convo.Fingerprinter
@@ -569,9 +578,8 @@ func (session *recordSession) recordSnapshot(
 		value := session.outputResponseID
 		record.OutputResponseID = &value
 	}
-	if session.inputPreview != "" {
-		value := session.inputPreview
-		record.InputPreview = &value
+	if preview := session.visibleInputPreview(); preview != "" {
+		record.InputPreview = &preview
 	}
 	if session.turn != nil && session.turn.Index >= 1 {
 		index, users := session.turn.Index, session.turn.UserMessages
@@ -1126,6 +1134,8 @@ func (session *recordSession) demoteCurrentAttemptToChild(
 	child.ID = childID
 	child.ParentRequestID = &parentID
 	child.ChildCount = 0
+	// The root carries the turn's preview; an attempt would only repeat it.
+	child.InputPreview = nil
 	child.Events = eventsForAttempt(session.events, session.attemptIndex)
 	child.Audit = session.upstreamAuditSummary()
 	// A failed attempt produced nothing the client will replay; only the
@@ -1356,6 +1366,11 @@ func (session *recordSession) finish(
 		session.noteStoredExposure(blob)
 	}
 	session.settleRequestExposure(ctx, blobs, logf)
+	// Every body is stored and settled; the store may now share them with
+	// the rest of the session.
+	if chunker, ok := blobs.(storage.AuditChunker); ok {
+		chunker.ChunkRequestAudit(record.ID)
+	}
 }
 
 func (session *recordSession) prepareAuditKey(
@@ -1516,6 +1531,43 @@ func (session *recordSession) settleRequestExposure(
 	session.requestExposure = next
 }
 
+// noteProtectedValues keeps what a redact or block decision covered and
+// rebuilds the masked preview from the full user text, not the cut one, so a
+// value the cut would have split is still found.
+func (session *recordSession) noteProtectedValues(values []string) {
+	if session == nil || len(values) == 0 {
+		return
+	}
+	session.protectedValues = append(session.protectedValues, values...)
+	session.maskedPreview = sanitizePreview(maskProtected(
+		session.classified.Conversation.LastUserText,
+		session.protectedValues,
+	))
+}
+
+// visibleInputPreview is the preview the record may carry: none when the call
+// continues a turn that already shows one. It is cut from the client body, so
+// it follows that body's exposure (auditExposure): as is while the body is
+// shareable, masked once a redact or block decision withheld the body, and
+// absent while a gated body has no decision.
+func (session *recordSession) visibleInputPreview() string {
+	if session.continuesTurn {
+		return ""
+	}
+	if session.classified.Conversation.LastUserText == "" {
+		// Not cut from client text: a label the gateway wrote, or nothing.
+		return session.inputPreview
+	}
+	switch session.privacyDecision {
+	case contract.PrivacyDecisionRedact, contract.PrivacyDecisionBlock:
+		return session.maskedPreview
+	}
+	if session.auditExposure(storage.AuditDirectionRequest) == storage.AuditExposureShareable {
+		return session.inputPreview
+	}
+	return ""
+}
+
 // notePrivacyOutcome keeps the structured decision beside the event summary.
 // Findings are kept only for decisions that withhold the client body; their
 // paths are reduced to structure so no request value reaches the record.
@@ -1659,8 +1711,9 @@ func (session *recordSession) resolveSession(ctx context.Context, store RequestR
 
 	lookupCtx, cancel := context.WithTimeout(ctx, sessionLookupTimeout)
 	defer cancel()
+	statuses := make(map[string]contract.RequestStatus)
 	decision, err := conversationPolicy.Resolve(
-		lookupCtx, summary, session.fingerprinter, sessionLookup(store, session.accessTokenID), time.Now(),
+		lookupCtx, summary, session.fingerprinter, sessionLookup(store, session.accessTokenID, statuses), time.Now(),
 	)
 	if err != nil {
 		logRequestRecordFailure(logf, "session_lookup", err)
@@ -1674,6 +1727,14 @@ func (session *recordSession) resolveSession(ctx context.Context, store RequestR
 			Kind:  contract.SessionCursorKind(decision.Match.Kind),
 			Value: decision.Match.Value,
 		}
+		// A turn shows its preview from the call that opened it. A call
+		// that stays in the turn of a record that succeeded would only
+		// repeat it; one after a failure or a pending call keeps its own,
+		// since that call may have stored none.
+		matched := decision.Match.Turn
+		session.continuesTurn = matched != nil && decision.Turn != nil &&
+			decision.Turn.Index == matched.Index &&
+			statuses[matchKey(decision.Match)] == contract.RequestStatusSucceeded
 	}
 	session.turn = decision.Turn
 	session.inboundCursors = contractCursors(decision.PersistentInbound())
@@ -1714,11 +1775,9 @@ func (session *recordSession) acceptedSummary() string {
 	if model == "" {
 		model = "未指定模型"
 	}
-	summary := model + " · " + string(session.classified.Protocol)
-	if session.inputPreview != "" {
-		summary += " · " + session.inputPreview
-	}
-	return summary
+	// No preview: it is written before any privacy decision, and the
+	// record's own preview already follows the client body's exposure.
+	return model + " · " + string(session.classified.Protocol)
 }
 
 func (session *recordSession) addEvent(kind contract.RequestEventKind, status contract.RequestStatus, summary string) {

@@ -94,6 +94,32 @@ describe("subscription IPC contract", () => {
     ).toThrow(/unsupported by provider/);
   });
 
+  it("accepts Copilot Device Code sessions and rejects other Copilot flows", () => {
+    const copilot = {
+      id: "authorization_copilot",
+      provider: "github_copilot",
+      status: "pending",
+      flow: "device_code",
+      service_id: "service_copilot_01",
+      device_code: {
+        verification_url: "https://github.com/login/device",
+        user_code: "COPI-LOT1",
+      },
+      expires_at: "2026-10-05T08:15:00Z",
+      created_at: timestamps.created_at,
+      updated_at: timestamps.updated_at,
+    };
+    expect(parseAuthorizationSession(copilot).provider).toBe("github_copilot");
+    expect(() =>
+      parseAuthorizationSession({
+        ...copilot,
+        flow: "browser",
+        device_code: undefined,
+        authorization_url: "https://github.com/login/oauth/authorize",
+      }),
+    ).toThrow(/unsupported by provider/);
+  });
+
   it("parses Device Code sessions and rejects mixed or terminal instructions", () => {
     const pending = {
       id: "authorization_02",

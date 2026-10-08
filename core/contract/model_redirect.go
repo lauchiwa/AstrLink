@@ -2,6 +2,7 @@ package contract
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -84,6 +85,18 @@ func ResolveModelRedirect(redirects []ModelRedirect, model string) (ModelRedirec
 		}
 	}
 	return ModelRedirect{}, false
+}
+
+var claudeReleaseDate = regexp.MustCompile(`-[0-9]{8}$`)
+
+// UndatedClaudeModel drops the release date from an Anthropic Claude id
+// (claude-haiku-4-5-20251001 becomes claude-haiku-4-5). Other models come
+// back unchanged.
+func UndatedClaudeModel(model string) string {
+	if !strings.HasPrefix(model, "claude-") {
+		return model
+	}
+	return claudeReleaseDate.ReplaceAllString(model, "")
 }
 
 // RequestModelRedirect records the redirect applied to one request: From is

@@ -217,6 +217,30 @@ func TestEngineActionsPreserveBodyUnlessRedacting(t *testing.T) {
 	}
 }
 
+func TestEngineReportsProtectedValuesForBlockAndRedactOnly(t *testing.T) {
+	const token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+	body := `{"model":"safe","input":"alice@example.com ` + token + ` alice@example.com"}`
+	engine := newTestEngine(t, nil)
+	for _, test := range []struct {
+		action Action
+		want   []string
+	}{
+		{action: ActionWarn},
+		{action: ActionBlock, want: []string{"alice@example.com", token}},
+		{action: ActionRedact, want: []string{"alice@example.com", token}},
+	} {
+		result, err := engine.Inspect(context.Background(), Policy{
+			Enabled: true, Mode: ModeRegex, Action: test.action,
+		}, contract.ProtocolOpenAIResponses, []byte(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(result.Protected, test.want) {
+			t.Fatalf("%s protected = %q, want %q", test.action, result.Protected, test.want)
+		}
+	}
+}
+
 func TestEngineDoesNotScanJSONKeysModelStreamOrBinary(t *testing.T) {
 	body := []byte(`{
 		"alice@example.com":"key only",

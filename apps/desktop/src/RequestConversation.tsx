@@ -1,4 +1,5 @@
 import {
+  isValidElement,
   memo,
   useCallback,
   useEffect,
@@ -17,10 +18,12 @@ import {
   LockKeyhole,
 } from "@/components/icons";
 import { ClientTypeIcon } from "@/components/ClientTypeIcon";
+import { FadeLine } from "@/components/FadeLine";
 import { FormMessage } from "@/components/FormMessage";
 import { IconButton } from "@/components/IconButton";
 import { MarkdownContent } from "@/components/MarkdownContent";
 import { ModelBrandIcon } from "@/components/ModelBrandIcon";
+import { ModelLabel } from "@/components/ModelLabel";
 import { StatusDot, type StatusTone } from "@/components/StatusDot";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -33,6 +36,7 @@ import type { RawSealingState } from "./raw-sealing-model";
 import {
   cancelledLabel,
   conversationTurns,
+  replyExcerpt,
   toolCountLabel,
   TOOL_TEXT_LIMIT,
   type ConversationCall,
@@ -65,6 +69,10 @@ import { useConversationContent } from "./use-conversation-content";
 const NO_SERVICES: RequestServiceMap = {};
 /** How far from the end the reader may drift and still count as following. */
 const FOLLOW_SLACK_PX = 48;
+/** The longest a session's first paint waits for the turn on screen. */
+const REVEAL_WAIT_MS = 300;
+/** Tools a turn's process line names before counting the rest. */
+const TOOL_KINDS_SHOWN = 3;
 
 /**
  * The conversation read turn by turn: what the operator asked, the agent loop
@@ -114,6 +122,32 @@ export function RequestConversation({
   );
   const latestTurnId = model[model.length - 1]?.id ?? null;
 
+  // A session paints once the turn on screen has its words. Its user text,
+  // reply and tool rows arrive a moment after the turns, and painting the
+  // turns first made them pop in as the view opened. A slow read holds the
+  // view back only briefly; once shown, the session stays shown.
+  const latest = model[model.length - 1];
+  const latestRead =
+    latest === undefined ||
+    [latest.calls[0]!, latest.calls[latest.calls.length - 1]!].every(
+      (call) =>
+        content.parsed.has(call.record.id) ||
+        content.errors.has(call.record.id),
+    );
+  const [revealedId, setRevealedId] = useState<string | null>(null);
+  const revealed = revealedId === session.id || latestRead;
+  useEffect(() => {
+    if (revealed) {
+      setRevealedId(session.id);
+      return;
+    }
+    const timer = window.setTimeout(
+      () => setRevealedId(session.id),
+      REVEAL_WAIT_MS,
+    );
+    return () => window.clearTimeout(timer);
+  }, [revealed, session.id]);
+
   // Turns the operator opened or closed by hand; the rest follow the default:
   // the latest turn and any turn still running are open.
   const [turnOverrides, setTurnOverrides] = useState<
@@ -125,6 +159,11 @@ export function RequestConversation({
   const [openRuns, setOpenRuns] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
+  // Turns that have come near the viewport. Once seen, a folded turn reads
+  // every call, so its process line names all the tools it used.
+  const [seenTurns, setSeenTurns] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [currentTurnId, setCurrentTurnId] = useState<string | null>(null);
   const [newTurns, setNewTurns] = useState(0);
@@ -133,11 +172,13 @@ export function RequestConversation({
   const turnRefs = useRef(new Map<string, HTMLElement>());
   const atBottomRef = useRef(true);
   const turnCountRef = useRef(model.length);
+  const seenObserverRef = useRef<IntersectionObserver | null>(null);
 
   useEffect(() => {
     setTurnOverrides(new Map());
     setShowAllTurns(new Set());
     setOpenRuns(new Set());
+    setSeenTurns(new Set());
     setInspectorOpen(false);
     setNewTurns(0);
     turnCountRef.current = 0;
@@ -150,20 +191,51 @@ export function RequestConversation({
     [turnOverrides, latestTurnId],
   );
 
-  // Open turns read every call; folded ones read just enough for the user
-  // text and the reply. The latest turn goes first because it is on screen.
+  useEffect(() => {
+    const scroller = scrollerRef.current;
+    if (!scroller || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const seen = entries
+          .filter((entry) => entry.isIntersecting)
+          .map((entry) => (entry.target as HTMLElement).dataset.turnId ?? "")
+          .filter(Boolean);
+        if (seen.length === 0) return;
+        setSeenTurns((current) =>
+          seen.every((id) => current.has(id))
+            ? current
+            : new Set([...current, ...seen]),
+        );
+      },
+      { root: scroller, rootMargin: "50% 0px" },
+    );
+    seenObserverRef.current = observer;
+    return () => {
+      observer.disconnect();
+      seenObserverRef.current = null;
+    };
+  }, [session.id]);
+
+  // Observing a turn twice is a no-op, so every new model just adds the turns
+  // that have appeared since.
+  useEffect(() => {
+    const observer = seenObserverRef.current;
+    if (!observer) return;
+    for (const element of turnRefs.current.values()) observer.observe(element);
+  }, [model]);
+
+  // Open turns and folded ones in view read every call; the rest read just
+  // enough for the user text and the reply, which a failed last call leaves
+  // on an earlier one. The latest turn goes first because it is on screen.
   useEffect(() => {
     const wanted: RequestRecord[] = [];
     for (const turn of [...model].reverse()) {
       const records = turn.calls.map((call) => call.record);
-      if (turnOpen(turn)) {
-        wanted.push(records[0]!, records[records.length - 1]!, ...records);
-      } else {
-        wanted.push(records[0]!, records[records.length - 1]!);
-      }
+      wanted.push(records[0]!, turn.reply.record, records[records.length - 1]!);
+      if (turnOpen(turn) || seenTurns.has(turn.id)) wanted.push(...records);
     }
     content.request(wanted);
-  }, [model, turnOpen, content.request]);
+  }, [model, turnOpen, seenTurns, content.request]);
 
   // Follow the latest turn while the reader sits at the end, as a terminal
   // does; a reader who scrolled up keeps their place and is told what landed.
@@ -324,8 +396,12 @@ export function RequestConversation({
     >
       <div className="relative flex min-h-0 min-w-0 flex-1">
         <div
+          aria-busy={!revealed}
           aria-label={t("conversation.stream")}
-          className="min-h-0 min-w-0 flex-1 overflow-y-auto overscroll-contain pr-5 [scrollbar-gutter:stable]"
+          className={cn(
+            "min-h-0 min-w-0 flex-1 overflow-y-auto overscroll-contain pr-5 [scrollbar-gutter:stable]",
+            !revealed && "invisible",
+          )}
           data-testid="conversation-stream"
           onScroll={measure}
           ref={scrollerRef}
@@ -469,6 +545,15 @@ function timeLabel(iso: string | null): string {
   });
 }
 
+/** The most used tools by name, then how many other kinds there were. */
+function toolsLabel(tools: Array<[string, number]>): string {
+  const shown = toolCountLabel(tools.slice(0, TOOL_KINDS_SHOWN));
+  const rest = tools.length - TOOL_KINDS_SHOWN;
+  return rest > 0
+    ? `${shown} · ${i18n.t("conversation.moreTools", { count: rest })}`
+    : shown;
+}
+
 function tokenLabel(tokens: TokenUsage | null): string {
   if (!tokens) return "";
   return `${formatCompactNumber(tokens.input)} / ${formatCompactNumber(tokens.output)}`;
@@ -489,6 +574,10 @@ function dotTone(tone: TrajectoryTone): StatusTone {
   }
 }
 
+/**
+ * Items marked `data-wide` only show once the conversation is wide enough;
+ * their separator hides with them.
+ */
 function Dots({ children }: { children: ReactNode[] }) {
   const items = children.filter(
     (child) => child !== null && child !== undefined && child !== false,
@@ -496,7 +585,15 @@ function Dots({ children }: { children: ReactNode[] }) {
   return (
     <>
       {items.map((child, index) => (
-        <span className="inline-flex min-w-0 items-center" key={index}>
+        <span
+          className={cn(
+            "inline-flex min-w-0 items-center",
+            isValidElement<{ "data-wide"?: boolean }>(child) &&
+              child.props["data-wide"] &&
+              "hidden @min-[720px]/conversation:inline-flex",
+          )}
+          key={index}
+        >
           {index > 0 ? (
             <span aria-hidden="true" className="mx-1.5 text-border">
               ·
@@ -552,6 +649,11 @@ const TurnView = memo(function TurnView({
     ? turn.calls.map((c) => ({ kind: "call", call: c }))
     : turn.segments;
   const userCopyKey = `conversation-user:${turn.id}`;
+  // Every call has been read, so the tools can be named rather than counted.
+  const toolsNamed =
+    !turn.stats.toolCallsPartial && turn.stats.tools.length > 0;
+  // A folded turn keeps one line of its reply under the process line.
+  const excerpt = !open && reply.text !== null ? replyExcerpt(reply.text) : "";
   // The reply hangs beneath the call that wrote it, so folding that row folds
   // the text; folding the process folds every row, the reply's included.
   const shownSegments = open ? segments : [];
@@ -590,85 +692,120 @@ const TurnView = memo(function TurnView({
       <UserBlock turn={turn} />
 
       <div className="my-3.5" data-testid="conversation-process">
-        <div className="flex h-7 items-center gap-2 text-xs text-muted-foreground">
+        <div className="flex min-h-7 items-center gap-2 text-xs text-muted-foreground">
           <Button
             aria-expanded={open}
-            className="h-7 min-w-0 flex-1 justify-start gap-1.5 px-1 font-normal text-muted-foreground hover:bg-transparent hover:text-foreground"
+            className="h-auto min-h-7 min-w-0 flex-1 flex-col items-stretch gap-0.5 px-2 py-1 font-normal text-muted-foreground hover:bg-transparent hover:text-foreground"
             onClick={() => onToggle(turn)}
             size="sm"
             type="button"
             variant="ghost"
           >
-            <ChevronRight
-              aria-hidden="true"
-              className={cn("size-3 transition-transform", open && "rotate-90")}
-            />
-            <Dots>
-              {[
-                <span key="label">{t("conversation.process")}</span>,
-                <span className="tabular-nums" key="calls">
-                  {t("conversation.calls", { count: turn.stats.calls })}
-                </span>,
-                turn.stats.toolCalls !== null ? (
-                  <span className="tabular-nums" key="tools">
-                    {t(
-                      turn.stats.toolCallsPartial
-                        ? "conversation.toolCallsPartial"
-                        : "conversation.toolCalls",
-                      { count: turn.stats.toolCalls },
-                    )}
-                  </span>
-                ) : null,
-                turn.stats.failed > 0 ? (
-                  <span
-                    className="tabular-nums text-danger-foreground"
-                    key="failed"
-                  >
-                    {t("conversation.failures", { count: turn.stats.failed })}
-                  </span>
-                ) : null,
-                turn.stats.cancelled > 0 ? (
-                  <span
-                    className="tabular-nums text-warning-foreground"
-                    data-testid="conversation-cancelled"
-                    key="cancelled"
-                  >
-                    {cancelledLabel(turn.stats)}
-                  </span>
-                ) : null,
-                <span className="tabular-nums" key="duration">
-                  {formatDuration(turn.stats.durationMs)}
-                </span>,
-                turn.stats.tokens ? (
-                  <span
-                    className="hidden tabular-nums @min-[720px]/conversation:inline"
-                    key="tokens"
-                    title={t("conversation.tokens", {
-                      input: formatCompactNumber(turn.stats.tokens.input),
-                      output: formatCompactNumber(turn.stats.tokens.output),
-                    })}
-                  >
-                    {tokenLabel(turn.stats.tokens)}
-                  </span>
-                ) : null,
-                turn.stats.pending ? (
-                  <span className="text-accent-foreground" key="live">
-                    {t("conversation.inProgress", {
-                      index:
-                        turn.calls.findIndex((c) => c.tone === "pending") + 1,
-                    })}
-                  </span>
-                ) : null,
-                open && readingHere && unread > 0 ? (
-                  <span key="reading" role="status">
-                    {t("conversation.reading", {
-                      done: turn.calls.length - unread,
-                      total: turn.calls.length,
-                    })}
-                  </span>
-                ) : null,
-              ]}
-            </Dots>
+            <span className="flex min-w-0 items-center gap-1.5">
+              <ChevronRight
+                aria-hidden="true"
+                className={cn(
+                  "size-3 transition-transform",
+                  open && "rotate-90",
+                )}
+              />
+              <Dots>
+                {[
+                  <span className="tabular-nums" key="calls">
+                    {t("conversation.calls", { count: turn.stats.calls })}
+                  </span>,
+                  // A turn that called no tools leaves the count out.
+                  !turn.stats.toolCalls ? null : toolsNamed ? (
+                    <span key="tools" title={toolCountLabel(turn.stats.tools)}>
+                      {toolsLabel(turn.stats.tools)}
+                    </span>
+                  ) : (
+                    <span className="tabular-nums" key="tools">
+                      {t("conversation.toolCalls", {
+                        count: turn.stats.toolCalls,
+                      })}
+                    </span>
+                  ),
+                  turn.stats.failed > 0 ? (
+                    <span
+                      className="tabular-nums text-danger-foreground"
+                      key="failed"
+                    >
+                      {t("conversation.failures", { count: turn.stats.failed })}
+                    </span>
+                  ) : null,
+                  turn.stats.cancelled > 0 ? (
+                    <span
+                      className="tabular-nums text-warning-foreground"
+                      data-testid="conversation-cancelled"
+                      key="cancelled"
+                    >
+                      {cancelledLabel(turn.stats)}
+                    </span>
+                  ) : null,
+                  <span className="tabular-nums" key="duration">
+                    {formatDuration(turn.stats.durationMs)}
+                  </span>,
+                  turn.stats.tokens ? (
+                    <span
+                      className="tabular-nums"
+                      data-wide
+                      key="tokens"
+                      title={t("conversation.tokens", {
+                        input: formatCompactNumber(turn.stats.tokens.input),
+                        output: formatCompactNumber(turn.stats.tokens.output),
+                      })}
+                    >
+                      {tokenLabel(turn.stats.tokens)}
+                    </span>
+                  ) : null,
+                  turn.stats.ttftMs !== null ? (
+                    <span
+                      className="tabular-nums"
+                      data-testid="conversation-ttft"
+                      data-wide
+                      key="ttft"
+                      title={t("records.averageTTFT")}
+                    >
+                      {`${t("records.ttft")} ${formatDuration(turn.stats.ttftMs)}`}
+                    </span>
+                  ) : null,
+                  turn.stats.outputTokensPerSecond !== null ? (
+                    <span
+                      className="tabular-nums"
+                      data-testid="conversation-output-speed"
+                      data-wide
+                      key="speed"
+                      title={t("records.outputSpeed")}
+                    >
+                      {`${turn.stats.outputTokensPerSecond.toFixed(1)} tok/s`}
+                    </span>
+                  ) : null,
+                  open && readingHere && unread > 0 ? (
+                    <span key="reading" role="status">
+                      {t("conversation.reading", {
+                        done: turn.calls.length - unread,
+                        total: turn.calls.length,
+                      })}
+                    </span>
+                  ) : null,
+                ]}
+              </Dots>
+            </span>
+            {excerpt ? (
+              <span
+                className="mt-1 flex min-w-0 flex-col items-start gap-1 pl-[18px] text-left"
+                data-testid="conversation-excerpt"
+              >
+                <ModelLabel
+                  className="font-medium text-text-secondary"
+                  model={reply.record.requested_model}
+                  reasoningEffort={reply.record.reasoning_effort}
+                  redirectedTo={reply.record.model_redirect?.to}
+                />
+                <FadeLine className="w-full" text={excerpt} />
+              </span>
+            ) : null}
           </Button>
           {open && turn.segments.some((segment) => segment.kind === "run") ? (
             <Button

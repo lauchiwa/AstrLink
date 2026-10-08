@@ -618,7 +618,8 @@ func TestRequestRecordCursorsRoundTripScopeAndCascade(t *testing.T) {
 	if err := store.InsertRequestRecord(ctx, consumer); err != nil {
 		t.Fatal(err)
 	}
-	if match, ok, _ := store.FindSessionLink(ctx, contract.SessionCursorExplicit, []string{"chatcmpl-a"}, storagecontract.SessionCursorScope{}); !ok || match.SessionID != sessionB || match.TurnIndex == nil || *match.TurnIndex != 1 {
+	if match, ok, _ := store.FindSessionLink(ctx, contract.SessionCursorExplicit, []string{"chatcmpl-a"}, storagecontract.SessionCursorScope{}); !ok || match.SessionID != sessionB || match.TurnIndex == nil || *match.TurnIndex != 1 ||
+		match.Status != contract.RequestStatusSucceeded {
 		t.Fatalf("producer must outrank a newer consumer: %+v", match)
 	}
 	legacyOutput := "resp_legacy_out"
@@ -637,7 +638,8 @@ func TestRequestRecordCursorsRoundTripScopeAndCascade(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if match, ok, _ := store.FindSessionLink(ctx, contract.SessionCursorExplicit, []string{legacyOutput}, storagecontract.SessionCursorScope{}); !ok || match.SessionID != sessionA || match.TurnIndex == nil || *match.TurnIndex != 1 {
+	if match, ok, _ := store.FindSessionLink(ctx, contract.SessionCursorExplicit, []string{legacyOutput}, storagecontract.SessionCursorScope{}); !ok || match.SessionID != sessionA || match.TurnIndex == nil || *match.TurnIndex != 1 ||
+		match.Status != contract.RequestStatusSucceeded {
 		t.Fatalf("legacy output column must outrank a newer previous_response_id: %+v", match)
 	}
 	if err := store.DeleteRequestRecord(ctx, consumer.ID); err != nil {

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -923,5 +924,64 @@ func TestIngressAuditCapturesClientBodyWhenNoAttemptReadsIt(t *testing.T) {
 				t.Fatalf("rejected candidates=%q, want %q", got, test.wantRejected)
 			}
 		})
+	}
+}
+
+// chunkingAuditBlobs records what the store holds when it is told a request
+// may be chunked.
+type chunkingAuditBlobs struct {
+	*memoryAuditBlobs
+	told map[contract.RequestID][]storage.AuditBlob
+}
+
+func (store *chunkingAuditBlobs) ChunkRequestAudit(id contract.RequestID) {
+	if store.told == nil {
+		store.told = map[contract.RequestID][]storage.AuditBlob{}
+	}
+	store.told[id] = slices.Clone(store.blobs)
+}
+
+func TestIngressTellsTheStoreToChunkOnceEveryBodyIsStored(t *testing.T) {
+	records := &memoryRequestRecordStore{}
+	blobs := &chunkingAuditBlobs{memoryAuditBlobs: &memoryAuditBlobs{records: records}}
+	handler := NewWithDependencies(Dependencies{
+		Resolver:       candidateResolver{candidates: []endpoint.Resolved{{Endpoint: validEndpoint(contract.ProtocolOpenAIResponses, false)}}},
+		PrivacyFilter:  testPrivacyEngine(t, privacy.Policy{}, nil),
+		RequestRecords: records,
+		AuditSettings: &memoryAuditSettings{settings: contract.AuditSettings{
+			RequestBodyEnabled: true, ResponseContentEnabled: true,
+			RequestBodyMaxBytes: 1024, ResponseContentMaxBytes: 1024,
+			MetadataRetentionDays: 30, ContentRetentionDays: 7,
+		}},
+		AuditBlobs: blobs,
+		Forwarder: forwarderFunc(func(writer http.ResponseWriter, request *http.Request, _ transport.Target) error {
+			_, _ = io.ReadAll(request.Body)
+			writer.Header().Set("Content-Type", "application/json")
+			writer.WriteHeader(http.StatusOK)
+			_, err := writer.Write([]byte(`{"id":"r"}`))
+			return err
+		}),
+	})
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"m","input":"hello"}`))
+	request.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(httptest.NewRecorder(), request)
+
+	if len(records.records) != 1 || len(blobs.told) != 1 {
+		t.Fatalf("records=%d told=%v", len(records.records), blobs.told)
+	}
+	stored, ok := blobs.told[records.records[0].ID]
+	if !ok {
+		t.Fatalf("told about %v, not %s", blobs.told, records.records[0].ID)
+	}
+	exposures := map[storage.AuditDirection]storage.AuditExposure{}
+	for _, blob := range stored {
+		exposures[blob.Direction] = blob.Exposure
+	}
+	// The client body was stored before its privacy decision and has
+	// settled; the response, written as the request finished, is stored too.
+	if exposures[storage.AuditDirectionRequest] != storage.AuditExposureShareable ||
+		exposures[storage.AuditDirectionUpstreamRequest] != storage.AuditExposureShareable ||
+		exposures[storage.AuditDirectionResponse] == "" {
+		t.Fatalf("exposures when told = %v", exposures)
 	}
 }

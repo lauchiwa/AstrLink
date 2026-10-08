@@ -5,6 +5,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -218,6 +219,18 @@ function neighborSession(
   return items[index + direction] ?? null;
 }
 
+function sessionRow(
+  scroller: HTMLElement | null,
+  sessionId: string,
+): HTMLButtonElement | null {
+  const escaped =
+    typeof CSS !== "undefined" && typeof CSS.escape === "function"
+      ? CSS.escape(sessionId)
+      : sessionId.replace(/["\\]/g, "\\$&");
+  const row = scroller?.querySelector(`[data-session-id="${escaped}"]`);
+  return row instanceof HTMLButtonElement ? row : null;
+}
+
 function sessionSummaryKey(session: RequestSession): string {
   return [
     session.id,
@@ -334,6 +347,8 @@ export function RequestRecords({
   const [loadingMore, setLoadingMore] = useState(false);
   const [syncWarning, setSyncWarning] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // A session whose detail is still on the way; see openDetail.
+  const [openingId, setOpeningId] = useState<string | null>(null);
   const [selectedTurnId, setSelectedTurnId] = useState<string | null>(null);
   const [overlaySessions, setOverlaySessions] = useState<
     Record<string, RequestSessionDetail>
@@ -379,9 +394,19 @@ export function RequestRecords({
   const atTopRef = useRef(true);
   const viewRef = useRef<RecordsView>("monitor");
   const monitorScrollRef = useRef<HTMLDivElement | null>(null);
+  // The list's offset when a session opened. WKWebView drops the offset of a
+  // size container hidden with display: none, so the list restores its own.
+  const monitorScrollTopRef = useRef<number | null>(null);
   const selectedFocusRef = useRef<string | null>(null);
+  const openGenerationRef = useRef(0);
+  const selectedIdRef = useRef(selectedId);
+  const overlaySessionsRef = useRef(overlaySessions);
+  // A session openDetail has just fetched, so selecting it need not again.
+  const freshDetailRef = useRef<string | null>(null);
 
   viewRef.current = view;
+  selectedIdRef.current = selectedId;
+  overlaySessionsRef.current = overlaySessions;
 
   const allRecords = useMemo(
     () => [...live.queued, ...live.items],
@@ -462,7 +487,9 @@ export function RequestRecords({
         /* detail view shows missing via selectedSession === null */
       }
     };
-    void load();
+    const fresh = freshDetailRef.current === selectedId;
+    freshDetailRef.current = null;
+    if (!fresh) void load();
     if (!detailIsLive) {
       return () => {
         cancelled = true;
@@ -514,6 +541,9 @@ export function RequestRecords({
     pollInFlightRef.current = false;
     atTopRef.current = true;
     viewRef.current = "monitor";
+    monitorScrollTopRef.current = null;
+    openGenerationRef.current += 1;
+    setOpeningId(null);
     setView("monitor");
     setSelectedId(null);
     setSelectedTurnId(null);
@@ -592,6 +622,7 @@ export function RequestRecords({
     pollInFlightRef.current = false;
     pollFailureRef.current = 0;
     atTopRef.current = true;
+    monitorScrollTopRef.current = null;
     if (monitorScrollRef.current) monitorScrollRef.current.scrollTop = 0;
     if (!isReady) setLive({ items: [], queued: [], nextCursor: null });
     setLoadingMore(false);
@@ -910,30 +941,74 @@ export function RequestRecords({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rawProtected]);
 
-  // Stable, so the memoized list rows skip the page's re-renders.
+  // Stable, so the memoized list rows skip the page's re-renders. A session
+  // opens once its detail is in hand: switching first blanked the whole
+  // workspace, or dropped the session being read, until the detail arrived.
   const openDetail = useCallback((sessionId: string) => {
-    selectedFocusRef.current = sessionId;
-    setSelectedId(sessionId);
-    setSelectedTurnId(null);
-    viewRef.current = "detail";
-    setView("detail");
+    const generation = ++openGenerationRef.current;
+    const show = (turnId: string | null) => {
+      if (viewRef.current === "monitor") {
+        monitorScrollTopRef.current = monitorScrollRef.current?.scrollTop ?? 0;
+      }
+      selectedFocusRef.current = sessionId;
+      setOpeningId(null);
+      setSelectedId(sessionId);
+      setSelectedTurnId(turnId);
+      viewRef.current = "detail";
+      setView("detail");
+    };
+    if (overlaySessionsRef.current[sessionId]) {
+      show(null);
+      return;
+    }
+    setOpeningId(sessionId);
+    getRequestSession(sessionId).then(
+      (detail) => {
+        if (openGenerationRef.current !== generation) return;
+        if (selectedIdRef.current !== sessionId) {
+          freshDetailRef.current = sessionId;
+        }
+        setOverlaySessions((current) => ({ ...current, [detail.id]: detail }));
+        show(detail.turns[detail.turns.length - 1]?.id ?? null);
+      },
+      (requestError: unknown) => {
+        if (openGenerationRef.current !== generation) return;
+        setOpeningId(null);
+        notify.error(messageOf(requestError, i18n.t("records.readFailed")));
+      },
+    );
   }, []);
 
+  // Before paint, so going back never flashes the top of the list.
+  useLayoutEffect(() => {
+    const scroller = monitorScrollRef.current;
+    const top = monitorScrollTopRef.current;
+    if (view !== "monitor" || !scroller || top === null) return;
+    monitorScrollTopRef.current = null;
+    scroller.scrollTop = top;
+    // Paging through sessions in the detail can leave the last one read
+    // outside the restored view.
+    const requestId = selectedFocusRef.current;
+    const row = requestId ? sessionRow(scroller, requestId) : null;
+    if (!row) return;
+    const port = scroller.getBoundingClientRect();
+    const box = row.getBoundingClientRect();
+    if (box.top < port.top) scroller.scrollTop += box.top - port.top;
+    else if (box.bottom > port.bottom) {
+      scroller.scrollTop += box.bottom - port.bottom;
+    }
+  }, [view]);
+
   const returnToMonitor = () => {
+    openGenerationRef.current += 1;
+    setOpeningId(null);
     setViewAndRef("monitor");
     window.requestAnimationFrame(() => {
       const requestId = selectedFocusRef.current;
       if (!requestId) return;
-      const escaped =
-        typeof CSS !== "undefined" && typeof CSS.escape === "function"
-          ? CSS.escape(requestId)
-          : requestId.replace(/["\\]/g, "\\$&");
-      const target = monitorScrollRef.current?.querySelector(
-        `[data-session-id="${escaped}"]`,
-      );
-      if (target instanceof HTMLButtonElement) {
-        target.focus({ preventScroll: true });
-      }
+      sessionRow(monitorScrollRef.current, requestId)?.focus({
+        preventScroll: true,
+      });
     });
   };
 
@@ -1619,7 +1694,7 @@ export function RequestRecords({
               ) : (
                 <SessionStream
                   onOpen={openDetail}
-                  selectedId={selectedId}
+                  selectedId={openingId ?? selectedId}
                   services={servicesById}
                   sessions={visibleItems}
                 />
@@ -1657,7 +1732,11 @@ export function RequestRecords({
             onBack={returnToMonitor}
             onClearDecrypted={clearDecrypted}
             onNavigate={(direction) => {
-              const next = neighborSession(visibleItems, selectedId, direction);
+              const next = neighborSession(
+                visibleItems,
+                openingId ?? selectedId,
+                direction,
+              );
               if (next) openDetail(next.id);
             }}
             onDelete={() =>

@@ -476,6 +476,143 @@ func TestPrivacyRedactRecordsHitKindsAndKeepsThemAfterPolicyChange(t *testing.T)
 	}
 }
 
+// writtenRecordStore keeps every record write, pending ones included, so a
+// test can check what reached storage at each point of a request.
+type writtenRecordStore struct {
+	memoryRequestRecordStore
+	written []contract.RequestRecord
+}
+
+func (store *writtenRecordStore) UpsertRequestRecord(ctx context.Context, record contract.RequestRecord) error {
+	store.written = append(store.written, record)
+	return store.memoryRequestRecordStore.UpsertRequestRecord(ctx, record)
+}
+
+func (store *writtenRecordStore) InsertRequestRecord(ctx context.Context, record contract.RequestRecord) error {
+	store.written = append(store.written, record)
+	return store.memoryRequestRecordStore.InsertRequestRecord(ctx, record)
+}
+
+// assertNothingWrittenContains fails if any stored record, its preview or
+// its event summaries included, carries one of the values.
+func assertNothingWrittenContains(t *testing.T, store *writtenRecordStore, values ...string) {
+	t.Helper()
+	if len(store.written) == 0 {
+		t.Fatal("no record was written")
+	}
+	for _, record := range store.written {
+		encoded, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, value := range values {
+			if strings.Contains(string(encoded), value) {
+				t.Fatalf("stored %s record carries %q: %s", record.Status, value, encoded)
+			}
+		}
+	}
+}
+
+func TestPrivacyRedactMasksProtectedValuesInStoredPreview(t *testing.T) {
+	const token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+	body := `{"model":"gpt-5","input":"` + token + ` 用这个令牌测试一下连通性，结果发给 alice@example.com"}`
+	filter := testPrivacyEngine(t, privacy.Policy{
+		Enabled: true, Mode: privacy.ModeRegex, Action: privacy.ActionRedact,
+	}, nil)
+	records := &writtenRecordStore{}
+	handler := NewWithDependencies(Dependencies{
+		Resolver: resolverFunc(func(context.Context, endpoint.ResolveRequest) (endpoint.Resolved, error) {
+			return endpoint.Resolved{Endpoint: validEndpoint(contract.ProtocolOpenAIResponses, false)}, nil
+		}),
+		PrivacyFilter:  filter,
+		RequestRecords: records,
+		Forwarder: forwarderFunc(func(writer http.ResponseWriter, _ *http.Request, _ transport.Target) error {
+			writer.Header().Set("Content-Type", "application/json")
+			writer.WriteHeader(http.StatusOK)
+			_, err := writer.Write([]byte(`{"id":"resp_1"}`))
+			return err
+		}),
+	})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	assertNothingWrittenContains(t, records, token, "alice@example.com")
+	// The first write lands before the detector has decided anything.
+	if first := records.written[0]; first.InputPreview != nil {
+		t.Fatalf("undecided preview stored: %q", *first.InputPreview)
+	}
+	final := records.records[0]
+	if final.InputPreview == nil || *final.InputPreview != "… 用这个令牌测试一下连通性，结果发给 …" {
+		t.Fatalf("preview=%v", final.InputPreview)
+	}
+}
+
+func TestPrivacyPreviewFollowsClientBodyExposure(t *testing.T) {
+	const body = `{"model":"gpt-5","input":"把合同发给 alice@example.com"}`
+	resolved := resolverFunc(func(context.Context, endpoint.ResolveRequest) (endpoint.Resolved, error) {
+		return endpoint.Resolved{Endpoint: validEndpoint(contract.ProtocolOpenAIResponses, false)}, nil
+	})
+	forward := forwarderFunc(func(writer http.ResponseWriter, _ *http.Request, _ transport.Target) error {
+		writer.WriteHeader(http.StatusOK)
+		_, err := writer.Write([]byte(`{"id":"resp_1"}`))
+		return err
+	})
+	for _, test := range []struct {
+		name     string
+		policy   privacy.Policy
+		resolver endpoint.Resolver
+		// want is the stored preview; empty means none was stored.
+		want string
+	}{
+		{
+			name:     "disabled policy shares the body and the preview",
+			policy:   privacy.Policy{},
+			resolver: resolved,
+			want:     "把合同发给 alice@example.com",
+		},
+		{
+			name:     "block masks what it matched",
+			policy:   privacy.Policy{Enabled: true, Mode: privacy.ModeRegex, Action: privacy.ActionBlock},
+			resolver: resolved,
+			want:     "把合同发给 …",
+		},
+		{
+			name:   "no decision before a failure withholds it",
+			policy: privacy.Policy{Enabled: true, Mode: privacy.ModeRegex, Action: privacy.ActionRedact},
+			resolver: resolverFunc(func(context.Context, endpoint.ResolveRequest) (endpoint.Resolved, error) {
+				return endpoint.Resolved{}, endpoint.ErrNoEndpoint
+			}),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			records := &writtenRecordStore{}
+			handler := NewWithDependencies(Dependencies{
+				Resolver:       test.resolver,
+				PrivacyFilter:  testPrivacyEngine(t, test.policy, nil),
+				RequestRecords: records,
+				Forwarder:      forward,
+			})
+			handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body)))
+			if len(records.records) != 1 {
+				t.Fatalf("records=%d", len(records.records))
+			}
+			got := ""
+			if preview := records.records[0].InputPreview; preview != nil {
+				got = *preview
+			}
+			if got != test.want {
+				t.Fatalf("preview=%q want %q", got, test.want)
+			}
+			if !strings.Contains(test.want, "alice@example.com") {
+				assertNothingWrittenContains(t, records, "alice@example.com")
+			}
+		})
+	}
+}
+
 func TestPrivacyBlockRunsBeforeCredentialLoadingAndDoesNotLeakMatch(t *testing.T) {
 	const body = `{"model":"gpt-5","input":"alice@example.com"}`
 	filter := testPrivacyEngine(t, privacy.Policy{

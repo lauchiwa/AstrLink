@@ -11,6 +11,9 @@ import {
   parseSubscriptionRiskEvents,
   serviceStatusLabel,
   subscriptionRiskLabel,
+  serviceBuiltinRedirects,
+  supportsResponsesWebSocket,
+  withClaudeCodeRedirects,
 } from "./service-model";
 
 const createdAt = "2026-07-28T12:00:00Z";
@@ -111,6 +114,97 @@ describe("service model", () => {
         updated_at: createdAt,
       }),
     ).toThrow(/provider does not match service kind/);
+  });
+
+  it("parses Copilot subscription services and keeps Responses off WebSocket", () => {
+    const copilot = parseService({
+      id: "service_copilot_personal",
+      name: "GitHub Copilot",
+      kind: "copilot_subscription",
+      enabled: true,
+      models: ["claude-sonnet-4.6", "gpt-5.4"],
+      capabilities: [
+        { protocol: "anthropic.messages", mode: "native", streaming: true },
+        { protocol: "openai.responses", mode: "native", streaming: true },
+        { protocol: "openai.chat", mode: "native", streaming: true },
+        { protocol: "openai.models", mode: "native", streaming: false },
+      ],
+      subscription: {
+        provider: "github_copilot",
+        status: "connected",
+        account_hint: "5832***31",
+        credential_ref: "local://subscription/service_copilot_personal",
+      },
+      created_at: createdAt,
+      updated_at: createdAt,
+    });
+    expect(copilot.subscription?.provider).toBe("github_copilot");
+    expect(supportsResponsesWebSocket(copilot)).toBe(false);
+  });
+
+  it("parses a provider's own redirect rules", () => {
+    const service = (extra: Record<string, unknown>) =>
+      parseService({
+        id: "service_api_redirects",
+        name: "API",
+        kind: "openai",
+        enabled: true,
+        models: ["gpt-5.4"],
+        capabilities: [
+          { protocol: "openai.chat", mode: "native", streaming: true },
+        ],
+        http: {
+          base_url: "https://api.example/v1",
+          auth: { scheme: "none" },
+        },
+        created_at: createdAt,
+        updated_at: createdAt,
+        ...extra,
+      });
+    expect(service({}).model_redirects).toBeUndefined();
+    expect(
+      service({
+        model_redirects: [{ from: "gpt-5", to: "gpt-5.4", enabled: true }],
+      }).model_redirects,
+    ).toEqual([{ from: "gpt-5", to: "gpt-5.4", enabled: true }]);
+    expect(() =>
+      service({
+        model_redirects: [
+          { from: "a", to: "b", enabled: true },
+          { from: "b", to: "c", enabled: true },
+        ],
+      }),
+    ).toThrow(/model_redirects/);
+  });
+
+  it("adds a Claude Code rule for each new Copilot Claude model without a built-in row", () => {
+    const kept = { from: "claude-opus-4-6", to: "gpt-5.4", enabled: false };
+    expect(serviceBuiltinRedirects("copilot_subscription")).toContainEqual({
+      from: "claude-sonnet-4-6",
+      defaultTo: "claude-sonnet-4.6",
+      defaultEnabled: true,
+    });
+    expect(serviceBuiltinRedirects("openai")).toEqual([]);
+    expect(
+      withClaudeCodeRedirects(
+        "copilot_subscription",
+        [kept],
+        ["claude-fable-5.9"],
+        [
+          "claude-fable-5.9",
+          "claude-fable-6.0",
+          "claude-sonnet-4.6",
+          "claude-sonnet-4",
+          "gpt-5.4",
+        ],
+      ),
+    ).toEqual([
+      kept,
+      { from: "claude-fable-6-0", to: "claude-fable-6.0", enabled: true },
+    ]);
+    expect(
+      withClaudeCodeRedirects("openai", [], [], ["claude-fable-6.0"]),
+    ).toEqual([]);
   });
 
   it("accepts sealed account credentials and still reads keystore ones", () => {

@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { i18n } from "./i18n";
-import { privacyModelOperationError } from "./privacy-model-errors";
+import {
+  privacyDryRunError,
+  privacyModelOperationError,
+} from "./privacy-model-errors";
 
 describe("privacy model operation errors", () => {
   it.each([
@@ -39,5 +42,47 @@ describe("privacy model operation errors", () => {
     expect(result.message).not.toContain(details);
     expect(result.details).toBe(details);
     expect(privacyModelOperationError(null, "Failed.").details).toBeNull();
+  });
+});
+
+describe("privacy dry-run errors", () => {
+  it.each([
+    [
+      'POST /control/v1/policies/policy_privacy_default/dry-run returned 503 Service Unavailable: {"error":{"code":"safety_engine_unavailable","message":"local safety engine is unavailable"}}',
+      "safety.dryRunErrors.engine",
+    ],
+    [
+      '{"error":{"code":"privacy_model_not_ready"}}',
+      "safety.dryRunModelNotReady",
+    ],
+    [
+      '{"error":{"code":"privacy_policy_unavailable"}}',
+      "safety.dryRunErrors.policy",
+    ],
+    [
+      '{"error":{"code":"invalid_policy_dry_run"}}',
+      "safety.dryRunErrors.sample",
+    ],
+    [
+      "error sending request: operation timed out",
+      "safety.modelErrors.timeout",
+    ],
+    [
+      "error sending request: connection refused",
+      "safety.modelErrors.connection",
+    ],
+  ])("explains %s", (details, key) => {
+    expect(privacyDryRunError(new Error(details))).toEqual({
+      message: i18n.t(key),
+      details,
+    });
+  });
+
+  it("keeps unknown diagnostics out of the primary message", () => {
+    const details = '{"error":{"code":"storage_unavailable"}}';
+    const result = privacyDryRunError(new Error(details));
+    expect(result.message).toContain(i18n.t("safety.dryRunFailed"));
+    expect(result.message).not.toContain(details);
+    expect(result.details).toBe(details);
   });
 });

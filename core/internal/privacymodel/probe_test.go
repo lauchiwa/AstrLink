@@ -284,6 +284,43 @@ func TestSuggestedCanonicalKindRecognizesBuiltinPrivateLabels(t *testing.T) {
 	}
 }
 
+func TestProbeLabelsSuggestCanonicalKindNames(t *testing.T) {
+	kinds := []contract.CanonicalKind{
+		contract.CanonicalKindEmail, contract.CanonicalKindPhone,
+		contract.CanonicalKindAccount, contract.CanonicalKindPaymentCard,
+		contract.CanonicalKindIPAddress, contract.CanonicalKindURL,
+		contract.CanonicalKindCommonSecret, contract.CanonicalKindAddress,
+		contract.CanonicalKindDate, contract.CanonicalKindPerson,
+	}
+	id2label := map[string]string{"0": "O"}
+	for index, kind := range kinds {
+		for _, label := range []string{string(kind), strings.ToUpper(string(kind))} {
+			got := suggestedCanonicalKind(label)
+			if got == nil || *got != kind {
+				t.Fatalf("suggestedCanonicalKind(%q)=%v, want %q", label, got, kind)
+			}
+		}
+		id2label[fmt.Sprintf("%d", 2*index+1)] = "B-" + string(kind)
+		id2label[fmt.Sprintf("%d", 2*index+2)] = "I-" + string(kind)
+	}
+	labels, tagScheme, complete, valid := probeLabels(id2label)
+	if !valid || !complete || tagScheme != "bio" || len(labels) != len(kinds) {
+		t.Fatalf(
+			"canonical labels valid=%t complete=%t scheme=%q count=%d, want bio/%d",
+			valid,
+			complete,
+			tagScheme,
+			len(labels),
+			len(kinds),
+		)
+	}
+	for _, label := range labels {
+		if label.SuggestedKind == nil || string(*label.SuggestedKind) != label.Label {
+			t.Fatalf("label %q suggested %v, want itself", label.Label, label.SuggestedKind)
+		}
+	}
+}
+
 func TestNymDefaultLabelMappingCoversPinnedModelLabels(t *testing.T) {
 	expected := map[string]contract.CanonicalKind{
 		"ACCOUNT_NUMBER":        contract.CanonicalKindAccount,

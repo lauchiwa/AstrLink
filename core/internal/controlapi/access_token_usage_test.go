@@ -51,7 +51,7 @@ func TestAccessTokenUsageAPI(t *testing.T) {
 	if response.Code != http.StatusOK || len(result.Items) != 1 || result.Items[0].TokenID != token || result.Items[0].TodayTokens != 42 || result.Items[0].TotalTokens != 42 || result.Items[0].TodayBilling.AmountUSD != "0.000000000" || result.Items[0].TotalBilling.AmountUSD != "0.000000000" {
 		t.Fatalf("usage status=%d body=%s", response.Code, response.Body.String())
 	}
-	if stats := result.Items[0].TodayPerformance; stats.CacheHitRate == nil || *stats.CacheHitRate != 0.5 || stats.OutputTokensPerSecond == nil || *stats.OutputTokensPerSecond != 4 || stats.SpeedSamples != 1 || stats.CacheSamples != 1 {
+	if stats := result.Items[0].TodayPerformance; stats.CacheHitRate == nil || *stats.CacheHitRate != 0.5 || stats.OutputTokensPerSecond == nil || *stats.OutputTokensPerSecond != 2 || stats.SpeedSamples != 1 || stats.CacheSamples != 1 {
 		t.Fatalf("performance missing from response: %s", response.Body.String())
 	}
 	unauthorized := httptest.NewRecorder()

@@ -6,7 +6,22 @@ import { FormMessage } from "./FormMessage";
 
 // Loading and rendering both stay inside the local boundary: a broken parser
 // must never replace the surrounding page with the app-wide error screen.
-const MarkdownRenderer = lazy(() => import("./MarkdownRenderer"));
+//
+// The parser loads with this module, not with the first reply, and renders
+// directly once loaded. A lazy component suspends on its first mount even
+// when its import has settled, and React holds that fallback for about
+// 300 ms, so the first reply on screen flashed as raw monospace text.
+type Renderer = (typeof import("./MarkdownRenderer"))["default"];
+let loadedRenderer: Renderer | null = null;
+const rendererModule = import("./MarkdownRenderer");
+rendererModule.then(
+  (module) => {
+    loadedRenderer = module.default;
+  },
+  // The lazy renderer rethrows the failure inside the boundary.
+  () => {},
+);
+const LazyRenderer = lazy(() => rendererModule);
 
 function PlainContent({
   content,
@@ -57,6 +72,7 @@ export function MarkdownContent({
   content: string;
   className?: string;
 }) {
+  const MarkdownRenderer = loadedRenderer ?? LazyRenderer;
   return (
     <div
       data-slot="markdown-content"

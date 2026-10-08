@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"strconv"
@@ -51,10 +50,10 @@ var errNamespaceExhausted = errors.New("privacy: reserved placeholder namespace 
 //   - A candidate that already occurs in the request, literally or in any
 //     spelling the response restorer recognises. Restoring would then rewrite
 //     genuine content, so the candidate is rejected and re-derived.
-//   - A kind whose reserved namespace is finite (the test IP ranges, the
-//     fictional phone block) running dry. The affected value falls back to a
-//     token placeholder rather than reusing a stand-in, because two originals
-//     sharing one placeholder cannot both be restored.
+//   - A kind whose reserved namespace is finite (the IPv4 test ranges)
+//     running dry. The affected value falls back to a token placeholder
+//     rather than reusing a stand-in, because two originals sharing one
+//     placeholder cannot both be restored.
 type placeholderAllocator struct {
 	key       []byte
 	resolve   func(Kind) KindRule
@@ -127,7 +126,7 @@ func (allocator *placeholderAllocator) allocateToken(kind Kind, value string) (s
 	for trial := range placeholderDerivationTrials {
 		suffix := allocator.derive(kind, value, trial, placeholderTokenHexLength)
 		candidate := withPlaceholderSuffix(replacementFor(kind), suffix)
-		if allocator.reserve(kind, candidate) {
+		if allocator.reserve(candidate) {
 			return candidate, nil
 		}
 	}
@@ -145,7 +144,7 @@ func (allocator *placeholderAllocator) allocateNatural(kind Kind, value string) 
 		if !ok {
 			return "", errNamespaceExhausted
 		}
-		if allocator.reserve(kind, candidate) {
+		if allocator.reserve(candidate) {
 			return candidate, nil
 		}
 	}
@@ -155,7 +154,7 @@ func (allocator *placeholderAllocator) allocateNatural(kind Kind, value string) 
 // reserve accepts a candidate only if no earlier value in this request took it
 // and no spelling the response restorer recognises already appears in the
 // request body.
-func (allocator *placeholderAllocator) reserve(kind Kind, candidate string) bool {
+func (allocator *placeholderAllocator) reserve(candidate string) bool {
 	if _, exists := allocator.used[candidate]; exists {
 		return false
 	}
@@ -163,7 +162,7 @@ func (allocator *placeholderAllocator) reserve(kind Kind, candidate string) bool
 		if allocator.bodyText == "" {
 			allocator.bodyText = string(allocator.body)
 		}
-		if restorableSpellingIn(kind, candidate, allocator.bodyText) {
+		if restorableSpellingIn(candidate, allocator.bodyText) {
 			return false
 		}
 	}
@@ -211,14 +210,6 @@ var naturalPlaceholderBuilders = map[Kind]func(value, suffix string, trial int) 
 		return "https://" + naturalPlaceholderDomain + "/r/" + suffix, true
 	},
 	KindIPAddress: naturalIPAddress,
-	KindPhone:     naturalPhone,
-	// A payment card stand-in is built to fail the Luhn checksum so it can never
-	// coincide with an issuable card, which also keeps the detector from
-	// matching it again on a later turn.
-	KindPaymentCard: naturalPaymentCard,
-	// An account stand-in carries the unassigned XX country code so it can never
-	// be a real IBAN, for the same reason.
-	KindAccount: naturalAccount,
 }
 
 // testNetPrefixes are the documentation ranges reserved by RFC 5737. They are
@@ -236,7 +227,13 @@ func naturalIPAddress(value, suffix string, trial int) (string, bool) {
 		// enough that the derived suffix alone keeps collisions negligible. The
 		// suffix is split into four-digit groups because a single group holds at
 		// most 16 bits, and a longer run would not parse as an address at all.
-		return "2001:db8::" + strings.Join(hextetGroups(suffix), ":"), true
+		// The result is written in the RFC 5952 canonical form, without leading
+		// zeros, because that is the spelling models and tools normalize to.
+		standIn := net.ParseIP("2001:db8::" + strings.Join(hextetGroups(suffix), ":"))
+		if standIn == nil {
+			return "", false
+		}
+		return standIn.String(), true
 	}
 	index, ok := suffixIndex(suffix)
 	if !ok {
@@ -249,56 +246,6 @@ func naturalIPAddress(value, suffix string, trial int) (string, bool) {
 	slot := (index + trial) % total
 	return testNetPrefixes[slot/testNetHostsPerPrefix] +
 		strconv.Itoa(slot%testNetHostsPerPrefix), true
-}
-
-// fictionalPhoneCount covers the North American 555-0100 through 555-0199 range
-// set aside for fictional use.
-const fictionalPhoneCount = 100
-
-// naturalPhone emits +1-555-555-01NN. The line range is the fictional NANP
-// block, and 555 is additionally unassigned as an area code, so the number is
-// unreachable twice over. The full ten digits matter: a shorter stand-in would
-// not be a well-formed North American number, which is the whole reason a model
-// copies it without being told to.
-func naturalPhone(_, suffix string, trial int) (string, bool) {
-	index, ok := suffixIndex(suffix)
-	if !ok {
-		return "", false
-	}
-	if trial >= fictionalPhoneCount {
-		return "", false
-	}
-	return fmt.Sprintf("+1-555-555-01%02d", (index+trial)%fictionalPhoneCount), true
-}
-
-func naturalPaymentCard(_, suffix string, trial int) (string, bool) {
-	index, ok := suffixIndex(suffix)
-	if !ok {
-		return "", false
-	}
-	return breakLuhn(fmt.Sprintf("4000000000000%03d", (index+trial)%1000)), true
-}
-
-func naturalAccount(_, suffix string, trial int) (string, bool) {
-	index, ok := suffixIndex(suffix)
-	if !ok {
-		return "", false
-	}
-	return fmt.Sprintf("XX00REDACTED%010d", (index+trial)%10_000_000_000), true
-}
-
-// breakLuhn perturbs the final digit until the checksum fails, so the result
-// cannot be a valid card number.
-func breakLuhn(digits string) string {
-	body := []byte(digits)
-	last := int(digits[len(digits)-1] - '0')
-	for offset := range 10 {
-		body[len(body)-1] = byte('0' + (last+offset)%10)
-		if !validPaymentCard(string(body)) {
-			return string(body)
-		}
-	}
-	return string(body)
 }
 
 // hextetGroups splits a hex string into IPv6 groups of at most four digits.
@@ -333,14 +280,6 @@ func isNaturalPlaceholder(kind Kind, value string) bool {
 		return isReservedInvalidHost(placeholderURLHost(value))
 	case KindIPAddress:
 		return isReservedTestNetAddress(value)
-	case KindPhone:
-		digits := string(decimalDigits(value))
-		return len(digits) == 11 && strings.HasPrefix(digits, "155555501")
-	case KindPaymentCard:
-		return strings.HasPrefix(string(decimalDigits(value)), "4000000000000")
-	case KindAccount:
-		compact := strings.ToUpper(strings.ReplaceAll(value, " ", ""))
-		return strings.HasPrefix(compact, "XX00REDACTED")
 	default:
 		return false
 	}

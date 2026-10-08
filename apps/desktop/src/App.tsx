@@ -63,6 +63,7 @@ import { LocalDataNotice } from "./LocalDataNotice";
 import { SettingsCenter } from "./SettingsCenter";
 import { About } from "./About";
 import { useAppUpdates } from "./use-app-updates";
+import { usePrivacyModelUpdate } from "./use-privacy-model-update";
 import { updateNotice } from "./update-model";
 import { toast } from "sonner";
 import {
@@ -85,7 +86,7 @@ import {
 type WorkspacePage =
   | { kind: "overview" }
   | { kind: "tokens" }
-  | { kind: "safety" }
+  | { kind: "safety"; view?: "models" }
   | { kind: "records"; tokenId?: string }
   | { kind: "routing" }
   | { kind: "checkin" }
@@ -248,6 +249,8 @@ export default function App() {
   const t = useT();
   const updates = useAppUpdates();
   const notifiedUpdate = useRef<string | null>(null);
+  const modelUpdate = usePrivacyModelUpdate();
+  const notifiedModelUpdate = useRef<string | null>(null);
   const [snapshot, setSnapshot] = useState<AppSnapshot | null>(null);
   const [isRestarting, setIsRestarting] = useState(false);
   // Hiding the unreadable-credentials notice lasts until the app restarts.
@@ -677,6 +680,29 @@ export default function App() {
     });
   }, [updateNoticeKind, updates.snapshot.release?.version, page.kind, t]);
 
+  const modelUpdateNotice =
+    modelUpdate === null
+      ? undefined
+      : t(`safety.modelUpdate.${modelUpdate.phase}.notification`, {
+          name: modelUpdate.name,
+          version: modelUpdate.version,
+        });
+  useEffect(() => {
+    if (modelUpdate === null || modelUpdateNotice === undefined) return;
+    // A finished download announces again: the next step is the switch.
+    const key = `${modelUpdate.catalog_id}:${modelUpdate.version}:${modelUpdate.phase}`;
+    if (notifiedModelUpdate.current === key) return;
+    notifiedModelUpdate.current = key;
+    // The privacy page already shows the update on the model card.
+    if (page.kind === "safety") return;
+    toast.info(modelUpdateNotice, {
+      action: {
+        label: t(`safety.modelUpdate.${modelUpdate.phase}.action`),
+        onClick: () => navigateRef.current({ kind: "safety", view: "models" }),
+      },
+    });
+  }, [modelUpdate, modelUpdateNotice, page.kind, t]);
+
   const confirmPendingNavigation = () => {
     if (pendingPage === null) return;
     setPage(pendingPage);
@@ -813,6 +839,7 @@ export default function App() {
               active={page.kind === "safety"}
               icon="shield"
               label={t("nav.safety")}
+              badge={modelUpdateNotice}
               onClick={() => navigate({ kind: "safety" })}
             />
             <NavButton
@@ -1008,6 +1035,7 @@ export default function App() {
             ) : page.kind === "safety" ? (
               <SafetyPolicy
                 coreSessionKey={coreSessionKey}
+                initialView={page.view}
                 isReady={isReady}
                 onInstallPlaceholderSkill={() =>
                   navigate({

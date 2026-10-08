@@ -103,6 +103,9 @@ func TestExecuteCandidatesDemotesFailedAttemptsIntoIndependentChildren(t *testin
 	if root.ChildCount != 2 {
 		t.Fatalf("root child_count=%d, want 2", root.ChildCount)
 	}
+	if root.InputPreview == nil || *root.InputPreview != "hi" {
+		t.Fatalf("root preview=%v", root.InputPreview)
+	}
 	if root.Usage == nil ||
 		root.Usage.InputTokens != 1 ||
 		root.Usage.OutputTokens != 2 ||
@@ -122,6 +125,9 @@ func TestExecuteCandidatesDemotesFailedAttemptsIntoIndependentChildren(t *testin
 		}
 		if child.ID == root.ID {
 			t.Fatal("child reused root id")
+		}
+		if child.InputPreview != nil {
+			t.Fatalf("child repeats the root's preview: %q", *child.InputPreview)
 		}
 		indexes[child.AttemptIndex] = true
 	}

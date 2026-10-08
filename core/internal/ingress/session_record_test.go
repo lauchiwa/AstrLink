@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/QuantumNous/astrlink/convo"
 	"github.com/QuantumNous/astrlink/core/contract"
 	"github.com/QuantumNous/astrlink/core/internal/endpoint"
 	"github.com/QuantumNous/astrlink/core/internal/transport"
@@ -188,6 +189,49 @@ func assertNewSession(t *testing.T, first, second contract.RequestRecord) {
 	}
 }
 
+// A call stays in its turn whatever happened before it; whether it repeats
+// the turn's preview depends on whether the call it continues succeeded, as
+// one that failed or is still running may have stored none.
+func TestContinuingCallStoresPreviewOnlyAfterAFailedOrPendingCall(t *testing.T) {
+	sessionID := contract.SessionID("session_turn")
+	for _, test := range []struct {
+		name        string
+		status      contract.RequestStatus
+		userCount   int
+		wantPreview bool
+	}{
+		{name: "after a success", status: contract.RequestStatusSucceeded, userCount: 1},
+		{name: "after a failure", status: contract.RequestStatusFailed, userCount: 1, wantPreview: true},
+		{name: "after a pending call", status: contract.RequestStatusPending, userCount: 1, wantPreview: true},
+		{name: "new turn", status: contract.RequestStatusSucceeded, userCount: 2, wantPreview: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			turn, users := 1, 1
+			store := &memoryRequestRecordStore{records: []contract.RequestRecord{{
+				ID: "request_prev", SessionID: &sessionID, Status: test.status,
+				TurnIndex: &turn, TurnUserMessages: &users,
+				Cursors: []contract.SessionCursor{{
+					Kind: contract.SessionCursorExplicit, Direction: contract.SessionCursorIn, Value: "thread",
+				}},
+			}}}
+			session := &recordSession{classified: Request{
+				InputPreview: "继续",
+				Conversation: convo.RequestSummary{
+					SessionCursor: "thread", HasUserMessage: true, UserTurnCount: test.userCount, LastUserText: "继续",
+				},
+			}}
+			session.resolveSession(context.Background(), store, nil)
+			if session.sessionID != sessionID {
+				t.Fatalf("session = %q", session.sessionID)
+			}
+			preview := session.recordSnapshot(nil, nil).InputPreview
+			if (preview != nil) != test.wantPreview {
+				t.Fatalf("preview = %v, want stored: %t", preview, test.wantPreview)
+			}
+		})
+	}
+}
+
 func assertTurn(t *testing.T, record contract.RequestRecord, want int) {
 	t.Helper()
 	if record.TurnIndex == nil || *record.TurnIndex != want {
@@ -239,8 +283,10 @@ func TestInferencePlaneLinksChatToolLoopIntoOneTurnAndFollowUpIntoNext(t *testin
 	if step2.SessionLink.Value != chatToolCallID {
 		t.Fatalf("step2 link value=%q", step2.SessionLink.Value)
 	}
-	if step2.InputPreview == nil || *step2.InputPreview != "帮我看看仓库里有哪些文件" {
-		t.Fatalf("tool results are not user text; preview=%v", step2.InputPreview)
+	// The turn's preview lives on the call that opened it; a call that only
+	// carries tool results back does not repeat it.
+	if step2.InputPreview != nil {
+		t.Fatalf("a continuing call must not repeat the turn's preview: %q", *step2.InputPreview)
 	}
 
 	followUp := harness.serve(

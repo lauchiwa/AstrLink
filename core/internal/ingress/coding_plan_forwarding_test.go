@@ -40,6 +40,9 @@ func TestCodingPlanForwardingPathsHeadersAndStreams(t *testing.T) {
 		{contract.ServiceKindClaudeSubscription, "claude-sonnet-4-5", "", "/v1/messages", contract.ProtocolAnthropicMessages, contract.AuthSchemeBearer, "", ""},
 		{contract.ServiceKindGrokSubscription, "grok-4.5", "", "/v1/responses", contract.ProtocolOpenAIResponses, contract.AuthSchemeBearer, "", ""},
 		{contract.ServiceKindGrokSubscription, "grok-composer-2.5-fast", "", "/v1/chat/completions", contract.ProtocolOpenAIChat, contract.AuthSchemeBearer, "", ""},
+		{contract.ServiceKindCopilotSubscription, "claude-sonnet-4.6", "", "/v1/messages", contract.ProtocolAnthropicMessages, contract.AuthSchemeBearer, "", ""},
+		{contract.ServiceKindCopilotSubscription, "gpt-5.4", "", "/v1/responses", contract.ProtocolOpenAIResponses, contract.AuthSchemeBearer, "/responses", ""},
+		{contract.ServiceKindCopilotSubscription, "gpt-4.1", "", "/v1/chat/completions", contract.ProtocolOpenAIChat, contract.AuthSchemeBearer, "/chat/completions", ""},
 		{contract.ServiceKindKimiCoding, "kimi-for-coding", "/coding", "/v1/messages", contract.ProtocolAnthropicMessages, contract.AuthSchemeAnthropicAPIKey, "", ""},
 		{contract.ServiceKindGLMCoding, "glm-5.3", "/api/anthropic", "/v1/messages", contract.ProtocolAnthropicMessages, contract.AuthSchemeBearer, "", ""},
 		{contract.ServiceKindMiniMaxCoding, "MiniMax-M3", "/anthropic", "/v1/messages", contract.ProtocolAnthropicMessages, contract.AuthSchemeBearer, "", ""},
@@ -115,6 +118,16 @@ func TestCodingPlanForwardingPathsHeadersAndStreams(t *testing.T) {
 							}
 						} else if request.Header.Get("X-XAI-Token-Auth") != "" {
 							t.Error("Grok CLI header reached another provider")
+						}
+						if test.kind == contract.ServiceKindCopilotSubscription {
+							// Copilot sees OpenCode alone: its identity, no client fingerprint.
+							if request.UserAgent() != "opencode/"+accountauth.DefaultCopilotClientVersion ||
+								request.Header.Get("X-Github-Api-Version") == "" || request.Header.Get("X-Initiator") != "user" ||
+								!strings.HasPrefix(request.Header.Get("X-Interaction-Id"), "ses_") ||
+								request.Header.Get("X-Opencode-Session") != "" ||
+								(request.Header.Get("Anthropic-Beta") != "") != (test.protocol == contract.ProtocolAnthropicMessages) {
+								t.Errorf("wrong Copilot identity: %v", request.Header)
+							}
 						}
 						if test.kind == contract.ServiceKindOpenCodeGo || test.kind == contract.ServiceKindOpenCodeZen {
 							if request.Header.Get("X-Opencode-Session") != "client-session" || request.UserAgent() != "opencode/1.0.0" {

@@ -1825,9 +1825,19 @@ impl CoreManager {
         parse_privacy_model_catalog(&body)
     }
 
-    pub async fn get_privacy_model_releases(&self) -> Result<serde_json::Value, String> {
+    /// `refresh` asks Core to skip its hour-long release cache and query the
+    /// Hub now. Only operator-initiated refreshes set it.
+    pub async fn get_privacy_model_releases(
+        &self,
+        refresh: bool,
+    ) -> Result<serde_json::Value, String> {
+        let path = if refresh {
+            format!("{PRIVACY_MODEL_RELEASES_PATH}?refresh=1")
+        } else {
+            PRIVACY_MODEL_RELEASES_PATH.to_string()
+        };
         let (_, body) = self
-            .authenticated_control(Method::GET, PRIVACY_MODEL_RELEASES_PATH, None, None)
+            .authenticated_control(Method::GET, &path, None, None)
             .await?;
         parse_privacy_model_catalog(&body)
     }
@@ -4536,7 +4546,13 @@ pub(crate) fn validate_resource_id(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-const SUBSCRIPTION_PROVIDERS: &[&str] = &["openai_codex", "claude_code", "xai_grok", "antigravity"];
+const SUBSCRIPTION_PROVIDERS: &[&str] = &[
+    "openai_codex",
+    "claude_code",
+    "xai_grok",
+    "antigravity",
+    "github_copilot",
+];
 const AUTHORIZATION_SESSION_STATUSES: &[&str] =
     &["pending", "completed", "cancelled", "expired", "failed"];
 const AUTHORIZATION_FLOWS: &[&str] = &["browser", "device_code", "authorization_code"];
@@ -4733,7 +4749,7 @@ fn parse_authorization_session_value(
     if provider == "antigravity" && flow != "browser" {
         return Err("authorization flow is unsupported by provider".to_string());
     }
-    if provider == "xai_grok" && flow != "device_code" {
+    if (provider == "xai_grok" || provider == "github_copilot") && flow != "device_code" {
         return Err("authorization flow is unsupported by provider".to_string());
     }
     let service_id = object
@@ -5080,9 +5096,9 @@ fn validate_audit_settings_patch(patch: &serde_json::Value) -> Result<(), String
                 let parsed = value.as_u64().ok_or_else(|| {
                     "audit settings patch request_body_max_bytes must be an integer".to_string()
                 })?;
-                if !(1024..=16_777_216).contains(&parsed) {
+                if !(1024..=67_108_864).contains(&parsed) {
                     return Err(
-                        "audit settings patch request_body_max_bytes must be between 1024 and 16777216"
+                        "audit settings patch request_body_max_bytes must be between 1024 and 67108864"
                             .to_string(),
                     );
                 }
@@ -5725,6 +5741,15 @@ mod tests {
         grok_browser["provider"] = serde_json::json!("xai_grok");
         assert!(parse_authorization_session_value(&grok_browser).is_err());
 
+        let mut copilot = device.clone();
+        copilot["provider"] = serde_json::json!("github_copilot");
+        copilot["device_code"]["verification_url"] =
+            serde_json::json!("https://github.com/login/device");
+        assert!(parse_authorization_session_value(&copilot).is_ok());
+        let mut copilot_browser = browser.clone();
+        copilot_browser["provider"] = serde_json::json!("github_copilot");
+        assert!(parse_authorization_session_value(&copilot_browser).is_err());
+
         device["authorization_url"] = serde_json::json!("https://auth.openai.com/oauth/authorize");
         assert!(parse_authorization_session_value(&device).is_err());
         device.as_object_mut().unwrap().remove("authorization_url");
@@ -5897,6 +5922,13 @@ mod tests {
         );
         assert_eq!(
             control_request_timeout(&Method::GET, PRIVACY_MODEL_RELEASES_PATH),
+            PRIVACY_MODEL_METADATA_TIMEOUT
+        );
+        assert_eq!(
+            control_request_timeout(
+                &Method::GET,
+                &format!("{PRIVACY_MODEL_RELEASES_PATH}?refresh=1")
+            ),
             PRIVACY_MODEL_METADATA_TIMEOUT
         );
         assert_eq!(
