@@ -1,0 +1,21 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Check-in isolation probe",
+  "version": "0.0.0",
+  "identifier": "test.local.checkin-isolation-probe",
+  "build": {
+    "frontendDist": "assets"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [],
+    "security": {
+      "capabilities": ["main-capability"],
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost ws://localhost:1420 ws://127.0.0.1:1420; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self'; script-src 'self' 'unsafe-eval'"
+    }
+  },
+  "bundle": {
+    "active": false,
+    "icon": ["../../icons/icon.png"]
+  }
+}

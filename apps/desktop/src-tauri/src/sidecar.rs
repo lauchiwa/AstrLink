@@ -19,6 +19,9 @@ use tauri_plugin_shell::{
 };
 use zeroize::Zeroizing;
 
+// Check-in extension transport; reuses the control client unchanged.
+mod fork_checkin;
+
 // Legacy installation migration and ordinary startup filesystem work can still
 // take longer on slow disks even though model weights are verified lazily.
 const READY_TIMEOUT: Duration = Duration::from_secs(120);

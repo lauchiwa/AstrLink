@@ -3,6 +3,7 @@ import { isTauri } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   Activity,
+  CircleCheck,
   CircleHelp,
   Bot,
   Home as House,
@@ -15,6 +16,10 @@ import {
 } from "@/components/icons";
 
 import { WorkspaceSnapshotProvider } from "./workspace-snapshots";
+import {
+  CheckinWorkspaceEntry,
+  checkinNavLabel,
+} from "./features/fork-checkin/entry";
 import { ValueTransition } from "./components/ValueTransition";
 import { AppShell } from "@/components/AppShell";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
@@ -83,6 +88,7 @@ type WorkspacePage =
   | { kind: "safety" }
   | { kind: "records"; tokenId?: string }
   | { kind: "routing" }
+  | { kind: "checkin" }
   | { kind: "agentTools"; preselectSkill?: AgentSkillId }
   | { kind: "settings" }
   | { kind: "about" }
@@ -92,6 +98,7 @@ type IconName =
   | "about"
   | "activity"
   | "bot"
+  | "checkin"
   | "home"
   | "key"
   | "route"
@@ -164,6 +171,7 @@ const icons: Record<IconName, AnimatedIcon> = {
   about: CircleHelp,
   activity: Activity,
   bot: Bot,
+  checkin: CircleCheck,
   home: House,
   key: KeyRound,
   route: Route,
@@ -819,6 +827,12 @@ export default function App() {
               label={t("nav.routing")}
               onClick={() => navigate({ kind: "routing" })}
             />
+            <NavButton
+              active={page.kind === "checkin"}
+              icon="checkin"
+              label={checkinNavLabel()}
+              onClick={() => navigate({ kind: "checkin" })}
+            />
 
             <span className="mt-4 px-2 pb-1.5 text-xs font-medium tracking-[0.08em] text-muted-foreground uppercase max-[960px]:mx-2 max-[960px]:mt-3 max-[960px]:mb-2 max-[960px]:h-px max-[960px]:bg-border max-[960px]:p-0 max-[960px]:text-transparent">
               {t("nav.system")}
@@ -888,6 +902,7 @@ export default function App() {
                 "records",
                 "safety",
                 "routing",
+                "checkin",
                 "agentTools",
                 "settings",
               ].includes(page.kind)
@@ -1015,6 +1030,13 @@ export default function App() {
                 services={catalog.items}
                 isReady={isReady}
                 onDirtyChange={handleEditorDirtyChange}
+              />
+            ) : page.kind === "checkin" ? (
+              <CheckinWorkspaceEntry
+                coreSessionKey={coreSessionKey}
+                isReady={isReady}
+                services={catalog.items}
+                servicesReady={catalog.status === "ready" && !catalog.stale}
               />
             ) : page.kind === "agentTools" ? (
               <AgentDebugSettings preselectSkill={page.preselectSkill} />

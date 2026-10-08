@@ -105,6 +105,12 @@ vi.mock("sonner", async (importOriginal) => {
 
 vi.mock("./bridge", () => bridgeMocks);
 
+const checkinMocks = vi.hoisted(() => ({ loadCheckinAvailability: vi.fn() }));
+vi.mock("./features/fork-checkin/bridge", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./features/fork-checkin/bridge")>()),
+  ...checkinMocks,
+}));
+
 import App from "./App";
 import type { AppSnapshot } from "./core-model";
 import { defaultTrayPreferences } from "./preferences-model";
@@ -292,6 +298,9 @@ describe("App workspace navigation", () => {
     updateMocks.get.mockReset().mockResolvedValue(browserUpdateSnapshot());
     updateMocks.listen.mockReset().mockResolvedValue(() => {});
     updateMocks.info.mockReset();
+    checkinMocks.loadCheckinAvailability
+      .mockReset()
+      .mockResolvedValue({ kind: "unavailable" });
 
     localStorage.removeItem(ONBOARDING_STORAGE_KEY);
     (
@@ -527,6 +536,21 @@ describe("App workspace navigation", () => {
       await Promise.resolve();
     });
   }
+
+  it("loads check-in only when visited and contains an older Core's missing extension", async () => {
+    await renderApp();
+    expect(checkinMocks.loadCheckinAvailability).not.toHaveBeenCalled();
+    await act(async () => {
+      button("签到").click();
+      await vi.dynamicImportSettled();
+    });
+    expect(checkinMocks.loadCheckinAvailability).toHaveBeenCalledTimes(1);
+    expect(workspaceHeading().textContent).toBe("中转站签到");
+    expect(container.textContent).toContain("当前网关不包含签到功能");
+    await act(async () => button("概览").click());
+    expect(workspaceHeading().textContent).not.toBe("中转站签到");
+    expect(checkinMocks.loadCheckinAvailability).toHaveBeenCalledTimes(1);
+  });
 
   it("opens About independently of gateway readiness and settings", async () => {
     await renderApp();
