@@ -7,9 +7,6 @@ mod data_hygiene;
 #[cfg(debug_assertions)]
 mod dev_reload;
 mod failure_policy;
-// Check-in extension: C01 admission probe and the C08 operation bridge. The
-// login window is not wired into the app yet.
-mod fork_checkin;
 mod host_files;
 mod i18n;
 mod kek_store;
@@ -2070,7 +2067,6 @@ pub fn run() {
         .manage(Arc::new(model_updates::PrivacyModelUpdates::default()))
         .manage(provider_import::ProviderImports::default())
         .invoke_handler(tauri::generate_handler![
-            fork_checkin::fork_checkin_operation,
             client_updates::local_client_status,
             provider_import::pending_provider_import,
             provider_import::dismiss_provider_import,

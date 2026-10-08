@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/guides/upstream-sync-thinking-guide.md", "reason": "校验共享文件相对上游的差异只减少签到行、未误伤其他二开"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "校验 Core 残留引用与测试"}
+{"file": ".trellis/spec/frontend/quality-guidelines.md", "reason": "校验前端残留引用与测试"}

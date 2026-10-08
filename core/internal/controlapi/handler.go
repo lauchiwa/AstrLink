@@ -40,8 +40,6 @@ const (
 	PrivacyModelsPath            = "/control/v1/privacy-models"
 	PrivacyModelProbePath        = PrivacyModelsPath + "/probe"
 	PrivacyModelLocalProbePath   = PrivacyModelsPath + "/local/probe"
-	// CheckinExtensionPath is mounted only with Dependencies.CheckinExtension.
-	CheckinExtensionPath = "/control/v1/extensions/checkin"
 )
 
 type Dependencies struct {
@@ -81,9 +79,6 @@ type Dependencies struct {
 	NewServiceID     func() (contract.ServiceID, error)
 	ConversionEngine relaykitbridge.ConversionEngine
 	Shutdown         context.CancelFunc
-	// CheckinExtension serves the private check-in extension namespace.
-	// Optional; nil leaves that namespace 404, as on a Core without it.
-	CheckinExtension http.Handler
 }
 
 // CodingPlanUsage is satisfied by *codingplan.Fetcher.
@@ -278,13 +273,6 @@ func newHandler(version contract.VersionResponse, dependencies Dependencies) (*H
 	}
 	if handler.clientIdentities != nil {
 		handler.registerClientIdentityRoutes()
-	}
-	if dependencies.CheckinExtension != nil {
-		// Every extension operation, reads included, is operator-only: a
-		// check-in account identifies a paid relay account.
-		extension := handler.authenticatedBy(dependencies.CheckinExtension.ServeHTTP, func(*http.Request) Role { return RoleOperator })
-		handler.mux.HandleFunc(CheckinExtensionPath, extension)
-		handler.mux.HandleFunc(CheckinExtensionPath+"/", extension)
 	}
 	handler.mux.HandleFunc("/", func(writer http.ResponseWriter, _ *http.Request) {
 		writeError(writer, http.StatusNotFound, "not_found", "control API path not found")
