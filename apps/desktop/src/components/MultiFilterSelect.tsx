@@ -21,6 +21,7 @@ export function MultiFilterSelect({
   allLabel,
   ariaLabel,
   className,
+  contentClassName,
   clearLabel,
   disabled,
   emptyMessage,
@@ -35,6 +36,8 @@ export function MultiFilterSelect({
   allLabel: string;
   ariaLabel: string;
   className?: string;
+  /** Portal layer override when the selector is used inside a dialog. */
+  contentClassName?: string;
   clearLabel: string;
   disabled?: boolean;
   emptyMessage: string;
@@ -53,19 +56,26 @@ export function MultiFilterSelect({
   const filtered = useMemo(() => {
     const query = search.trim().toLocaleLowerCase();
     if (!query) return options;
-    return options.filter((option) => option.label.toLocaleLowerCase().includes(query));
+    return options.filter((option) =>
+      option.label.toLocaleLowerCase().includes(query),
+    );
   }, [options, search]);
-  const allSelected = options.length > 0 && options.every((option) => selected.has(option.value));
-  const triggerText = value.length === 0
-    ? allLabel
-    : value.length === 1
-      ? options.find((option) => option.value === value[0])?.label ?? selectedCountLabel(1)
-      : selectedCountLabel(value.length);
+  const allSelected =
+    options.length > 0 && options.every((option) => selected.has(option.value));
+  const triggerText =
+    value.length === 0
+      ? allLabel
+      : value.length === 1
+        ? (options.find((option) => option.value === value[0])?.label ??
+          selectedCountLabel(1))
+        : selectedCountLabel(value.length);
 
   function toggle(option: string): void {
-    onChange(selected.has(option)
-      ? value.filter((item) => item !== option)
-      : [...value, option]);
+    onChange(
+      selected.has(option)
+        ? value.filter((item) => item !== option)
+        : [...value, option],
+    );
   }
 
   function toggleAll(): void {
@@ -92,15 +102,22 @@ export function MultiFilterSelect({
           variant="outline"
         >
           <span className="flex min-w-0 items-center gap-2">
-            <span className="shrink-0 font-normal text-muted-foreground">{label}</span>
-            <span className="min-w-0 truncate" title={triggerText}>{triggerText}</span>
+            <span className="shrink-0 font-normal text-muted-foreground">
+              {label}
+            </span>
+            <span className="min-w-0 truncate" title={triggerText}>
+              {triggerText}
+            </span>
           </span>
           <ChevronDown aria-hidden="true" className="size-3.5 opacity-60" />
         </Button>
       </PopoverTrigger>
       <PopoverContent
         align="start"
-        className="w-(--radix-popover-trigger-width) min-w-56 p-2"
+        className={cn(
+          "w-(--radix-popover-trigger-width) min-w-56 p-2",
+          contentClassName,
+        )}
         // Keep focus inside the panel: Radix's default autofocus target is the
         // content wrapper, so let it open unfocused and move focus to the search
         // input instead. Otherwise Tab would walk out to the trigger's siblings.
@@ -132,21 +149,31 @@ export function MultiFilterSelect({
             {selectedCountLabel(value.length)}
           </span>
         </div>
-        <div className="mt-1 max-h-56 overflow-y-auto" role="listbox" aria-label={ariaLabel}>
-          {filtered.length > 0 ? filtered.map((option) => (
-            <label
-              className="flex cursor-pointer items-center gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent"
-              key={option.value}
-            >
-              <Checkbox
-                aria-label={option.label}
-                checked={selected.has(option.value)}
-                onCheckedChange={() => toggle(option.value)}
-              />
-              <span className="min-w-0 truncate" title={option.label}>{option.label}</span>
-            </label>
-          )) : (
-            <p className="px-2 py-3 text-xs text-muted-foreground">{emptyMessage}</p>
+        <div
+          className="mt-1 max-h-56 overflow-y-auto"
+          role="listbox"
+          aria-label={ariaLabel}
+        >
+          {filtered.length > 0 ? (
+            filtered.map((option) => (
+              <label
+                className="flex cursor-pointer items-center gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent"
+                key={option.value}
+              >
+                <Checkbox
+                  aria-label={option.label}
+                  checked={selected.has(option.value)}
+                  onCheckedChange={() => toggle(option.value)}
+                />
+                <span className="min-w-0 truncate" title={option.label}>
+                  {option.label}
+                </span>
+              </label>
+            ))
+          ) : (
+            <p className="px-2 py-3 text-xs text-muted-foreground">
+              {emptyMessage}
+            </p>
           )}
         </div>
       </PopoverContent>
