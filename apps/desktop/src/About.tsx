@@ -1,4 +1,4 @@
-import { useId, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import { isTauri } from "@tauri-apps/api/core";
 import { Panel, PanelBody, PanelHeader } from "@/components/Panel";
 import { DataField, DataRow } from "@/components/DataRow";
@@ -38,10 +38,11 @@ import {
 } from "./update-bridge";
 import {
   updateBusy,
+  updateRetryWait,
   type UpdatePreferences,
   type UpdateSnapshot,
 } from "./update-model";
-import { useT } from "./i18n";
+import { i18n, useT } from "./i18n";
 import logo from "./assets/astrlink-logo.svg";
 
 export function About({
@@ -61,8 +62,21 @@ export function About({
   const [error, setError] = useState<string | null>(null);
   const [confirm, setConfirm] = useState(false);
   const [preferencesOpen, setPreferencesOpen] = useState<boolean | null>(null);
+  const [now, setNow] = useState(() => Date.now());
   const native = isTauri();
   const working = busy || updateBusy(snapshot);
+  const retryWait = updateRetryWait(snapshot, now);
+  const retryAt = snapshot.retry_at;
+  useEffect(() => {
+    if (!retryAt) return;
+    setNow(Date.now());
+    const timer = setInterval(() => {
+      const current = Date.now();
+      setNow(current);
+      if (current >= Date.parse(retryAt)) clearInterval(timer);
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [retryAt]);
   const expanded = preferencesOpen ?? false;
   const preferencesDisabled =
     !native || busy || snapshot.phase === "installing";
@@ -143,7 +157,7 @@ export function About({
       size={snapshot.release ? "icon" : "default"}
       aria-label={t("about.check")}
       title={t("about.check")}
-      disabled={!native || working}
+      disabled={!native || working || retryWait > 0}
       onClick={() => void run(checkAppUpdate)}
     >
       <RefreshCw
@@ -270,6 +284,11 @@ export function About({
               {snapshot.error_code ? (
                 <FormMessage tone="error">
                   <p>{t(`about.errors.${snapshot.error_code}`)}</p>
+                  {retryWait > 0 ? (
+                    <p>
+                      {t("about.retryAt", { time: formatRetryWait(retryWait) })}
+                    </p>
+                  ) : null}
                   {snapshot.error_detail ? (
                     <details className="mt-1 text-xs">
                       <summary className="cursor-pointer">
@@ -305,7 +324,7 @@ export function About({
                   ) : null}
                   {hasDownload ? (
                     <Button
-                      disabled={working}
+                      disabled={working || retryWait > 0}
                       onClick={() =>
                         void run(
                           [
@@ -487,4 +506,14 @@ export function About({
       />
     </>
   );
+}
+
+function formatRetryWait(seconds: number) {
+  const [value, unit] =
+    seconds < 60
+      ? [seconds, "second" as const]
+      : seconds < 3600
+        ? [Math.ceil(seconds / 60), "minute" as const]
+        : [Math.ceil(seconds / 3600), "hour" as const];
+  return new Intl.RelativeTimeFormat(i18n.language).format(value, unit);
 }

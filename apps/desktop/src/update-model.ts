@@ -50,6 +50,8 @@ export interface UpdateSnapshot {
   last_checked_at: string | null;
   error_code: string | null;
   error_detail: string | null;
+  /** When the host accepts the next check after a GitHub rate limit. */
+  retry_at: string | null;
 }
 function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value))
@@ -94,7 +96,12 @@ export function parseUpdateSnapshot(value: unknown): UpdateSnapshot {
     typeof v.latest_version !== "string"
   )
     throw new Error("Invalid update latest_version");
-  for (const key of ["last_checked_at", "error_code", "error_detail"])
+  for (const key of [
+    "last_checked_at",
+    "error_code",
+    "error_detail",
+    "retry_at",
+  ])
     if (v[key] !== null && typeof v[key] !== "string")
       throw new Error(`Invalid update ${key}`);
   parseUpdatePreferences(v.preferences);
@@ -148,9 +155,15 @@ export const browserUpdateSnapshot = (): UpdateSnapshot => ({
   last_checked_at: null,
   error_code: null,
   error_detail: null,
+  retry_at: null,
 });
 export function updateBusy(snapshot: UpdateSnapshot): boolean {
   return ["checking", "downloading", "installing"].includes(snapshot.phase);
+}
+/** Whole seconds until the host accepts another check; 0 once it does. */
+export function updateRetryWait(snapshot: UpdateSnapshot, now: number) {
+  const until = snapshot.retry_at ? Date.parse(snapshot.retry_at) : NaN;
+  return until > now ? Math.ceil((until - now) / 1000) : 0;
 }
 export type UpdateNotice = "available" | "manual" | "ready";
 /** Mirrors the host's native-notification rule; `available` only counts while

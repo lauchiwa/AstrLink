@@ -2961,6 +2961,7 @@
     "manualInstall": "This version needs a manual update. Download and run the latest installer.",
     "unconfigured": "This version cannot install updates automatically. Download the latest installer manually.",
     "lastChecked": "Last checked: {{time}}",
+    "retryAt": "You can check again {{time}}.",
     "install": "Install and restart",
     "download": "Download update",
     "retry": "Retry",

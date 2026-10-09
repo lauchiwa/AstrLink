@@ -138,6 +138,34 @@ describe("About updates", () => {
     });
     expect(receive).toHaveBeenCalled();
   });
+  it("holds retries until GitHub's rate limit lifts", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    try {
+      vi.setSystemTime(Date.parse("2026-10-07T04:00:00Z"));
+      const limited: UpdateSnapshot = {
+        ...ready,
+        phase: "error",
+        error_code: "rate_limit",
+        error_detail: "GitHub HTTP 403 Forbidden; 0 of 60 requests left",
+        retry_at: "2026-10-07T04:01:30Z",
+      };
+      await render(limited);
+      expect(button("重试").disabled).toBe(true);
+      expect(
+        container.querySelector('button[aria-label="检查更新"]'),
+      ).toHaveProperty("disabled", true);
+      expect(container.textContent).toContain("2分钟后可以再次检查。");
+      await act(async () => vi.advanceTimersByTime(60_000));
+      expect(container.textContent).toContain("30秒钟后可以再次检查。");
+      await act(async () => vi.advanceTimersByTime(30_000));
+      expect(container.textContent).not.toContain("可以再次检查");
+      mocks.checkAppUpdate.mockResolvedValue(ready);
+      await act(async () => button("重试").click());
+      expect(mocks.checkAppUpdate).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
   it("reports command failures and retries checks", async () => {
     mocks.checkAppUpdate.mockRejectedValue(new Error("offline"));
     await render({ ...ready, phase: "idle", release: null });

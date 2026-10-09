@@ -15,6 +15,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   collectRelease,
   macOSSigningMode,
+  newestStable,
   publishingRepository,
   releaseRepository,
   releaseVersion,
@@ -312,6 +313,30 @@ describe("release updates", () => {
     ])
       expect(() => releaseVersion(tag)).toThrow();
   });
+  it("marks only the highest stable version as GitHub's latest release", () => {
+    const published = (tag_name: string, extra = {}) => ({
+      tag_name,
+      draft: false,
+      prerelease: false,
+      ...extra,
+    });
+    const releases = [
+      published("v0.9.0"),
+      published("v0.10.0"),
+      published("v1.0.0-rc.1", { prerelease: true }),
+      published("v2.0.0", { draft: true }),
+      published("v3.0.0", { prerelease: true }),
+      published("latest"),
+    ];
+    expect(newestStable("v0.10.1", releases)).toBe(true);
+    expect(newestStable("v1.0.0", releases)).toBe(true);
+    expect(newestStable("v0.10.0", releases)).toBe(true);
+    // A patch for an older line must not move stable clients backwards.
+    expect(newestStable("v0.9.1", releases)).toBe(false);
+    expect(newestStable("v1.1.0-beta.1", releases)).toBe(false);
+    expect(newestStable("v1.0.0", [])).toBe(true);
+  });
+
   it("stamps all desktop versions without changing dependencies", () => {
     const dir = directory();
     mkdirSync(path.join(dir, "src-tauri"));

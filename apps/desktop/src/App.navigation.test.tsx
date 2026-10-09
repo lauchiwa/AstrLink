@@ -224,6 +224,11 @@ async function chooseKindCard(option: string): Promise<void> {
     card.click();
     await Promise.resolve();
   });
+  // The closed dialog returns focus in a timeout. Let it land now: on a slow
+  // runner it could land after a popover opens and close it as focus outside.
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
 }
 
 /** A raw password unless `overrides` says otherwise. */

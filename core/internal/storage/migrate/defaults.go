@@ -852,8 +852,21 @@ WHERE id = 'policy_privacy_default'
     DELETE FROM audit_chunks WHERE id = OLD.chunk_id
       AND NOT EXISTS (SELECT 1 FROM audit_part_chunks WHERE chunk_id = OLD.chunk_id);
 END`,
-			`ALTER TABLE audit_blobs ADD COLUMN layout TEXT NOT NULL DEFAULT 'whole'
-CHECK(layout IN ('whole', 'chunks', 'recipe'))`,
+			// SQLite verifies a CHECK on an added column against every existing
+			// row, reading each row's overflow pages. With gigabytes of inline
+			// captures from before shared payloads, that outlasted the desktop's
+			// ready timeout, so triggers enforce the layouts instead. Databases
+			// that applied the first form of this migration have a column CHECK
+			// in place of these triggers.
+			`ALTER TABLE audit_blobs ADD COLUMN layout TEXT NOT NULL DEFAULT 'whole'`,
+			`CREATE TRIGGER audit_blob_layout_check_insert BEFORE INSERT ON audit_blobs
+WHEN NEW.layout NOT IN ('whole', 'chunks', 'recipe') BEGIN
+    SELECT RAISE(ABORT, 'audit_blobs.layout must be whole, chunks, or recipe');
+END`,
+			`CREATE TRIGGER audit_blob_layout_check_update BEFORE UPDATE OF layout ON audit_blobs
+WHEN NEW.layout NOT IN ('whole', 'chunks', 'recipe') BEGIN
+    SELECT RAISE(ABORT, 'audit_blobs.layout must be whole, chunks, or recipe');
+END`,
 			`CREATE TRIGGER audit_blob_layout_whole AFTER UPDATE OF layout ON audit_blobs
 WHEN NEW.layout = 'whole' AND OLD.layout <> 'whole' BEGIN
     DELETE FROM audit_part_chunks WHERE request_id = NEW.request_id AND direction = NEW.direction;

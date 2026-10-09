@@ -22,6 +22,13 @@ mod release_repository;
 
 const REPOSITORY: &str = env!("ASTRLINK_RELEASE_REPOSITORY");
 const RELEASE_API: &str = env!("ASTRLINK_RELEASE_API");
+// Fork: derived from the release repository like REPOSITORY, so a fork build
+// reads its own stable manifest instead of upstream's.
+const LATEST_MANIFEST: &str = concat!(
+    "https://github.com/",
+    env!("ASTRLINK_RELEASE_REPOSITORY"),
+    "/releases/latest/download/latest.json"
+);
 const EVENT: &str = "app-update-status";
 const PUBLIC_KEY: &str = env!("TAURI_UPDATER_PUBLIC_KEY");
 const INTERVAL: Duration = Duration::from_secs(3 * 60 * 60);
@@ -82,13 +89,16 @@ pub struct UpdateSnapshot {
     last_checked_at: Option<String>,
     error_code: Option<String>,
     error_detail: Option<String>,
+    /// When GitHub accepts the next check after a rate limit.
+    retry_at: Option<String>,
 }
 
 struct Inner {
     snapshot: UpdateSnapshot,
     generation: u64,
     pending: Option<Update>,
-    retry_after: Option<Instant>,
+    /// Wall-clock time, so a sleeping Mac ends the wait when the UI says it does.
+    retry_after: Option<chrono::DateTime<chrono::Utc>>,
     /// The last `(notice, version)` announced, so periodic checks do not repeat it.
     notified: Option<(&'static str, String)>,
 }
@@ -106,6 +116,12 @@ pub struct UpdateManager {
 struct ReleaseAsset {
     name: String,
     browser_download_url: String,
+}
+#[derive(Clone, Debug, Deserialize)]
+struct LatestManifest {
+    version: String,
+    notes: Option<String>,
+    pub_date: Option<String>,
 }
 #[derive(Clone, Debug, Deserialize)]
 struct GithubRelease {
@@ -220,10 +236,152 @@ pub fn verify_package(bytes: &[u8], signature: &str, key: &str) -> Result<(), St
         .map_err(|e| e.to_string())
 }
 
+/// Passes a successful response through. A 429, or a 403 carrying GitHub's
+/// rate-limit signals, also reports how many seconds to wait.
+async fn github_status(
+    response: reqwest::Response,
+    retry_after: &mut Option<u64>,
+) -> Result<reqwest::Response, (&'static str, String)> {
+    let status = response.status();
+    if !matches!(status.as_u16(), 403 | 429) {
+        return response
+            .error_for_status()
+            .map_err(|e| ("network", e.to_string()));
+    }
+    let (exhausted, wait, detail) = {
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+        };
+        let exhausted = header("x-ratelimit-remaining") == Some("0");
+        let wait = header("retry-after")
+            .and_then(|v| v.parse::<u64>().ok())
+            .or_else(|| {
+                let reset = header("x-ratelimit-reset")?.parse::<i64>().ok()?;
+                exhausted.then(|| (reset - chrono::Utc::now().timestamp()).max(1) as u64)
+            });
+        let quota = header("x-ratelimit-limit")
+            .zip(header("x-ratelimit-remaining"))
+            .map(|(limit, left)| format!("; {left} of {limit} requests left"))
+            .unwrap_or_default();
+        (exhausted, wait, format!("GitHub HTTP {status}{quota}"))
+    };
+    // GitHub's message names the caller's IP address, so it stays out of the detail.
+    let message = response.text().await.unwrap_or_default();
+    if status.as_u16() == 403
+        && wait.is_none()
+        && !exhausted
+        && !message.to_ascii_lowercase().contains("rate limit")
+    {
+        return Err(("network", detail));
+    }
+    // Without a hint, GitHub asks clients to wait at least a minute.
+    *retry_after = Some(wait.unwrap_or(60).clamp(1, 86400));
+    Err(("rate_limit", detail))
+}
+
+/// The tag of a `latest.json` asset URL in this repository's releases.
+fn manifest_tag(url: &reqwest::Url) -> Option<String> {
+    manifest_tag_for_repository(url, REPOSITORY)
+}
+
+// Fork: the repository is a parameter, as in github_asset_for_repository, so a
+// fork build accepts its own manifest redirect rather than upstream's path.
+fn manifest_tag_for_repository(url: &reqwest::Url, repository: &str) -> Option<String> {
+    let path = url.path().replace("%2B", "+").replace("%2b", "+");
+    let tag = path
+        .strip_prefix(&format!("/{repository}/releases/download/"))?
+        .strip_suffix("/latest.json")?;
+    (!tag.is_empty()
+        && !tag.contains('/')
+        && github_asset_for_repository(url.as_str(), tag, repository))
+    .then(|| tag.to_owned())
+}
+
+/// Reads the stable release through GitHub's latest-release download, which is
+/// served outside the API quota that shared network addresses often exhaust.
+async fn fetch_latest(
+    client: &reqwest::Client,
+    direct: &reqwest::Client,
+    endpoint: &str,
+    retry_after: &mut Option<u64>,
+) -> Result<Vec<GithubRelease>, (&'static str, String)> {
+    let response = direct
+        .get(endpoint)
+        .send()
+        .await
+        .map_err(|e| ("network", e.to_string()))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(Vec::new());
+    }
+    let location = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| response.url().join(v).ok());
+    if !response.status().is_redirection() {
+        github_status(response, retry_after).await?;
+        return Err((
+            "manifest",
+            "GitHub did not redirect to the latest release".into(),
+        ));
+    }
+    let (url, tag) = location
+        .and_then(|url| manifest_tag(&url).map(|tag| (url, tag)))
+        .ok_or((
+            "manifest",
+            "Latest release redirect is not a release manifest".into(),
+        ))?;
+    let response = client
+        .get(url.clone())
+        .send()
+        .await
+        .map_err(|e| ("network", e.to_string()))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err((
+            "missing_artifact",
+            "Release has no latest.json update manifest".into(),
+        ));
+    }
+    let manifest = github_status(response, retry_after)
+        .await?
+        .json()
+        .await
+        .map_err(|e| ("manifest", e.to_string()))?;
+    latest_release(url, tag, manifest).map(|release| vec![release])
+}
+
+fn latest_release(
+    url: reqwest::Url,
+    tag: String,
+    manifest: LatestManifest,
+) -> Result<GithubRelease, (&'static str, String)> {
+    if version(&manifest.version).is_none() || version(&manifest.version) != version(&tag) {
+        return Err((
+            "manifest",
+            "Update manifest does not match the latest release".into(),
+        ));
+    }
+    Ok(GithubRelease {
+        tag_name: tag,
+        draft: false,
+        prerelease: false,
+        body: manifest.notes,
+        published_at: manifest.pub_date,
+        assets: vec![ReleaseAsset {
+            name: "latest.json".into(),
+            browser_download_url: url.into(),
+        }],
+    })
+}
+
 async fn fetch_releases(
     client: &reqwest::Client,
     endpoint: &str,
-    retry_after: &mut Option<Instant>,
+    retry_after: &mut Option<u64>,
 ) -> Result<Vec<GithubRelease>, (&'static str, String)> {
     let mut releases = Vec::new();
     // Page through all public releases; GitHub's date ordering is not SemVer ordering.
@@ -235,30 +393,8 @@ async fn fetch_releases(
             .send()
             .await
             .map_err(|e| ("network", e.to_string()))?;
-        if matches!(response.status().as_u16(), 403 | 429) {
-            let seconds = response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok())
-                .or_else(|| {
-                    response
-                        .headers()
-                        .get("x-ratelimit-reset")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|v| v.parse::<i64>().ok())
-                        .map(|v| (v - chrono::Utc::now().timestamp()).max(1) as u64)
-                })
-                .unwrap_or(3600);
-            *retry_after = Some(Instant::now() + Duration::from_secs(seconds.min(86400)));
-            return Err((
-                "rate_limit",
-                format!("GitHub HTTP {}; retry in {seconds}s", response.status()),
-            ));
-        }
-        let mut batch: Vec<GithubRelease> = response
-            .error_for_status()
-            .map_err(|e| ("network", e.to_string()))?
+        let mut batch: Vec<GithubRelease> = github_status(response, retry_after)
+            .await?
             .json()
             .await
             .map_err(|e| ("manifest", e.to_string()))?;
@@ -307,6 +443,7 @@ impl UpdateManager {
                     last_checked_at: None,
                     error_code: None,
                     error_detail: None,
+                    retry_at: None,
                 },
                 generation: 0,
                 pending: None,
@@ -407,6 +544,9 @@ impl UpdateManager {
         if changed_channel {
             inner.generation += 1;
             inner.pending = None;
+            // Each channel reads its own GitHub source, so a rate limit does not carry over.
+            inner.retry_after = None;
+            inner.snapshot.retry_at = None;
             inner.snapshot.release = None;
             inner.snapshot.latest_version = None;
             inner.snapshot.phase = "idle".into();
@@ -452,15 +592,18 @@ impl UpdateManager {
         if self
             .lock()
             .retry_after
-            .is_some_and(|until| until > Instant::now())
+            .is_some_and(|until| until > chrono::Utc::now())
         {
-            return Err("GitHub rate limit: retry later".into());
+            // The snapshot already reports the rate limit and when it lifts.
+            return Ok(self.snapshot());
         }
         self.publish(app, |i| {
             i.pending = None;
+            i.retry_after = None;
             i.snapshot.phase = "checking".into();
             i.snapshot.error_code = None;
             i.snapshot.error_detail = None;
+            i.snapshot.retry_at = None;
         });
         let result = tokio::select! { result = self.check_inner(app, generation) => result, _ = &mut cancel => return Ok(self.snapshot()) };
         if let Err((code, error)) = result {
@@ -477,18 +620,36 @@ impl UpdateManager {
         generation: u64,
     ) -> Result<(), (&'static str, String)> {
         let prefs = app.state::<Arc<PreferencesStore>>().snapshot().values;
-        let mut builder = reqwest::Client::builder()
-            .user_agent("tauri-updater")
-            .timeout(Duration::from_secs(30));
-        if !prefs.use_system_proxy {
-            builder = builder.no_proxy();
-        }
-        let client = builder.build().map_err(|e| ("network", e.to_string()))?;
+        let client = |redirect| {
+            let mut builder = reqwest::Client::builder()
+                .user_agent("tauri-updater")
+                .timeout(Duration::from_secs(30))
+                .redirect(redirect);
+            if !prefs.use_system_proxy {
+                builder = builder.no_proxy();
+            }
+            builder.build().map_err(|e| ("network", e.to_string()))
+        };
+        let follow = client(reqwest::redirect::Policy::default())?;
         let mut retry_after = None;
-        let releases = match fetch_releases(&client, RELEASE_API, &mut retry_after).await {
+        let fetched = match prefs.updates.channel {
+            UpdateChannel::Stable => {
+                let direct = client(reqwest::redirect::Policy::none())?;
+                fetch_latest(&follow, &direct, LATEST_MANIFEST, &mut retry_after).await
+            }
+            UpdateChannel::Preview => fetch_releases(&follow, RELEASE_API, &mut retry_after).await,
+        };
+        let releases = match fetched {
             Ok(releases) => releases,
             Err(error) => {
-                self.lock().retry_after = retry_after;
+                if let Some(seconds) = retry_after {
+                    let until = chrono::Utc::now() + chrono::TimeDelta::seconds(seconds as i64);
+                    let mut inner = self.lock();
+                    if inner.generation == generation {
+                        inner.retry_after = Some(until);
+                        inner.snapshot.retry_at = Some(until.to_rfc3339());
+                    }
+                }
                 return Err(error);
             }
         };
@@ -896,23 +1057,58 @@ mod tests {
             .timeout(Duration::from_secs(3))
             .build()
             .unwrap();
-        for (status, body, expected) in [
-            ("200 OK", "[]", None),
-            ("500 Internal Server Error", "{}", Some("network")),
-            ("200 OK", "invalid", Some("manifest")),
-            ("429 Too Many Requests", "{}", Some("rate_limit")),
-            ("403 Forbidden", "{}", Some("rate_limit")),
+        let reset = chrono::Utc::now().timestamp() + 600;
+        let exhausted = format!(
+            "X-RateLimit-Limit: 60\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: {reset}\r\n"
+        );
+        for (status, headers, body, expected) in [
+            ("200 OK", "", "[]", None),
+            (
+                "500 Internal Server Error",
+                "",
+                "{}",
+                Some(("network", None)),
+            ),
+            ("200 OK", "", "invalid", Some(("manifest", None))),
+            (
+                "429 Too Many Requests",
+                "Retry-After: 60\r\n",
+                "{}",
+                Some(("rate_limit", Some(60..=60))),
+            ),
+            (
+                "403 Forbidden",
+                exhausted.as_str(),
+                "{}",
+                Some(("rate_limit", Some(590..=600))),
+            ),
+            (
+                "403 Forbidden",
+                "",
+                r#"{"message":"You have exceeded a secondary rate limit"}"#,
+                Some(("rate_limit", Some(60..=60))),
+            ),
+            // A blocked network or a revoked repository is not worth waiting on.
+            (
+                "403 Forbidden",
+                "X-RateLimit-Remaining: 59\r\nX-RateLimit-Reset: 1\r\n",
+                r#"{"message":"Forbidden"}"#,
+                Some(("network", None)),
+            ),
         ] {
-            let (url, server) = response_server(status, "Retry-After: 60\r\n", body);
+            let (url, server) = response_server(status, headers, body);
             let mut retry = None;
             let result = fetch_releases(&client, &url, &mut retry).await;
             server.join().unwrap();
             match expected {
-                Some(code) => assert_eq!(result.unwrap_err().0, code),
+                Some((code, wait)) => {
+                    assert_eq!(result.unwrap_err().0, code, "{status} {body}");
+                    assert_eq!(retry.is_some(), wait.is_some(), "{status} {body}");
+                    if let Some(range) = wait {
+                        assert!(range.contains(&retry.unwrap()), "{retry:?}");
+                    }
+                }
                 None => assert!(result.unwrap().is_empty()),
-            }
-            if expected == Some("rate_limit") {
-                assert!(retry.unwrap() > Instant::now());
             }
         }
         let mut retry = None;
@@ -923,6 +1119,110 @@ mod tests {
                 .0,
             "network"
         );
+        assert!(retry.is_none());
+    }
+
+    #[tokio::test]
+    async fn stable_checks_follow_only_the_latest_release_manifest_redirect() {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let elsewhere = "Location: https://example.org/latest.json\r\n";
+        let other_repository =
+            "Location: https://github.com/someone/AstrLink/releases/download/v1.0.0/latest.json\r\n";
+        for (status, headers, expected) in [
+            ("404 Not Found", "", None),
+            ("302 Found", elsewhere, Some("manifest")),
+            ("302 Found", other_repository, Some("manifest")),
+            ("200 OK", "", Some("manifest")),
+            (
+                "429 Too Many Requests",
+                "Retry-After: 30\r\n",
+                Some("rate_limit"),
+            ),
+        ] {
+            let (url, server) = response_server(status, headers, "{}");
+            let mut retry = None;
+            let result = fetch_latest(&client, &client, &url, &mut retry).await;
+            server.join().unwrap();
+            match expected {
+                Some(code) => assert_eq!(result.unwrap_err().0, code, "{status} {headers}"),
+                None => assert!(result.unwrap().is_empty()),
+            }
+            assert_eq!(retry.is_some(), expected == Some("rate_limit"));
+        }
+    }
+
+    #[test]
+    fn latest_manifests_must_name_the_release_they_were_published_in() {
+        // Fork: every manifest_tag case runs for both repositories, and a
+        // manifest from one repository is rejected for the other.
+        for (repository, other) in [
+            ("Calcium-Ion/AstrLink", "lauchiwa/AstrLink"),
+            ("lauchiwa/AstrLink", "Calcium-Ion/AstrLink"),
+        ] {
+            let parse = |raw: String| reqwest::Url::parse(&raw).unwrap();
+            let url = |tag: &str| {
+                parse(format!(
+                    "https://github.com/{repository}/releases/download/{tag}/latest.json"
+                ))
+            };
+            let tag = |url: &reqwest::Url| manifest_tag_for_repository(url, repository);
+            assert_eq!(tag(&url("v0.1.8")).as_deref(), Some("v0.1.8"));
+            assert_eq!(
+                tag(&url("v1.0.0%2Bbuild.1")).as_deref(),
+                Some("v1.0.0+build.1")
+            );
+            for wrong in [
+                format!("https://github.com/{repository}/releases/download/v0.1.8/a.json"),
+                format!("https://github.com/{repository}/releases/download/a/b/latest.json"),
+                format!("https://github.com/{repository}/releases/download//latest.json"),
+                format!(
+                    "https://github.com.evil/{repository}/releases/download/v0.1.8/latest.json"
+                ),
+                format!("http://github.com/{repository}/releases/download/v0.1.8/latest.json"),
+                format!("https://github.com/{other}/releases/download/v0.1.8/latest.json"),
+            ] {
+                assert_eq!(tag(&parse(wrong)), None);
+            }
+        }
+        // The rest checks this build's own repository end to end.
+        let url = |tag: &str| {
+            reqwest::Url::parse(&format!(
+                "https://github.com/{REPOSITORY}/releases/download/{tag}/latest.json"
+            ))
+            .unwrap()
+        };
+        assert_eq!(manifest_tag(&url("v0.1.8")).as_deref(), Some("v0.1.8"));
+        let manifest = |version: &str| LatestManifest {
+            version: version.into(),
+            notes: Some("notes".into()),
+            pub_date: None,
+        };
+        let release = latest_release(url("v0.1.8"), "v0.1.8".into(), manifest("0.1.8")).unwrap();
+        assert_eq!(release.tag_name, "v0.1.8");
+        assert_eq!(release.body.as_deref(), Some("notes"));
+        assert!(
+            release.assets[0].name == "latest.json"
+                && github_asset(&release.assets[0].browser_download_url, "v0.1.8")
+        );
+        assert_eq!(
+            select_release(&[release], UpdateChannel::Stable)
+                .unwrap()
+                .tag_name,
+            "v0.1.8"
+        );
+        for wrong in ["0.1.7", "invalid"] {
+            assert_eq!(
+                latest_release(url("v0.1.8"), "v0.1.8".into(), manifest(wrong))
+                    .unwrap_err()
+                    .0,
+                "manifest"
+            );
+        }
     }
 
     #[test]
@@ -964,6 +1264,10 @@ mod tests {
         assert_eq!(
             RELEASE_API,
             format!("https://api.github.com/repos/{REPOSITORY}/releases")
+        );
+        assert_eq!(
+            LATEST_MANIFEST,
+            format!("https://github.com/{REPOSITORY}/releases/latest/download/latest.json")
         );
         for repository in ["Calcium-Ion/AstrLink", "lauchiwa/AstrLink"] {
             let base = format!("https://github.com/{repository}/releases/download/v1.0.0");

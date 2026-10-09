@@ -84,6 +84,27 @@ export function releaseVersion(tag) {
   return { version, prerelease: version.split("+")[0].includes("-") };
 }
 
+/** Desktop stable checks read GitHub's latest release, so only the highest stable version may hold it. */
+export function newestStable(tag, releases) {
+  const { version, prerelease } = releaseVersion(tag);
+  if (prerelease) return false;
+  const core = (value) => value.split(/[-+]/)[0].split(".").map(Number);
+  const newer = (a, b) => {
+    const [x, y] = [core(a), core(b)];
+    const index = x.findIndex((part, i) => part !== y[i]);
+    return index >= 0 && x[index] > y[index];
+  };
+  return !releases.some((release) => {
+    if (release.draft || release.prerelease) return false;
+    try {
+      const other = releaseVersion(release.tag_name);
+      return !other.prerelease && newer(other.version, version);
+    } catch {
+      return false;
+    }
+  });
+}
+
 export function stampVersion(root, tag) {
   const { version } = releaseVersion(tag);
   for (const filename of ["package.json", "src-tauri/tauri.conf.json"]) {
@@ -417,7 +438,7 @@ export function publishRelease(input, output, tag, env = process.env) {
     repository,
     "--draft=false",
     `--prerelease=${prerelease}`,
-    `--latest=${!prerelease}`,
+    `--latest=${newestStable(tag, releases)}`,
     "--notes-file",
     notesFile,
   ]);

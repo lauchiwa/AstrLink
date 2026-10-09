@@ -2961,6 +2961,7 @@
     "manualInstall": "当前版本需要手动更新，请下载新版安装包后安装。",
     "unconfigured": "当前版本不支持自动安装，请手动下载新版安装包。",
     "lastChecked": "上次检查：{{time}}",
+    "retryAt": "{{time}}可以再次检查。",
     "install": "安装并重启",
     "download": "下载更新",
     "retry": "重试",
