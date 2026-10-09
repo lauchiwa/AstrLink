@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/guides/upstream-sync-thinking-guide.md", "reason": "上游优先、fork 适配放在 fork 自有间接层；合并后差异逐行可解释"}
+{"file": ".trellis/spec/guides/version-naming-guide.md", "reason": "v0.1.9-rc.0 的前提、stable 过滤与默认 preview 不可放宽"}

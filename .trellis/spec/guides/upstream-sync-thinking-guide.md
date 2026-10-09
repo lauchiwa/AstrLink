@@ -66,10 +66,42 @@ expired, not an upstream regression.
 
 ### Before merging
 
+- [ ] Confirm `upstream/main` is current. A `git fetch` can time out, and in a
+      pipeline (`git fetch … | tail -1`) `$?` reports the **last** command, so a
+      failed fetch reads as success and every later comparison silently uses a
+      stale ref. Check the fetch's own exit code, then verify the ref matches
+      upstream's newest release:
+      `gh api repos/Calcium-Ion/AstrLink/commits/<tag> --jq .sha`.
 - [ ] Quantify the conflict surface first:
       `git diff --name-only HEAD...upstream/main`
 - [ ] Trial-merge in a disposable worktree, never by stashing the working tree
 - [ ] Check for **schema migration version collisions** — the highest-risk class
+
+### After merging: upstream code that bypasses a fork indirection
+
+Where the fork replaced an upstream constant with an indirection (release
+repository, endpoint, path prefix), upstream's **new** code still hardcodes the
+original value. Git merges it cleanly because the fork never edited those lines,
+so the build succeeds and the defect only shows at runtime.
+
+- [ ] Grep the merged tree for the values the indirection replaced, e.g.
+      `rg -n 'Calcium-Ion' apps/desktop/src apps/desktop/src-tauri/src apps/desktop/scripts`.
+      Production code should hold none; test occurrences belong in cases that
+      assert both repositories.
+- [ ] Adapt through the pattern the fork already uses — add a `*_for_repository`
+      parameterized form and keep the no-argument wrapper — rather than
+      inventing a second mechanism.
+- [ ] Assert the derived value against the build's own configuration
+      (`assert_eq!(LATEST_MANIFEST, format!("…/{REPOSITORY}/…"))`). Verify the
+      assertion fails when the constant is hardcoded again; otherwise it proves
+      nothing.
+- [ ] Run the fork's own tests under upstream's configuration too
+      (`ASTRLINK_RELEASE_REPOSITORY=Calcium-Ion/AstrLink cargo test --lib`), so
+      the adaptation does not assume the fork's value.
+
+Found in the v0.1.9 sync: upstream's new `manifest_tag` kept
+`/Calcium-Ion/AstrLink/releases/download/`, which would have rejected the fork's
+own `latest.json` once the fork published a stable release.
 
 ### Schema migrations
 
