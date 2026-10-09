@@ -29,3 +29,28 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 2: 同步上游 v0.1.9 并发布 v0.1.9-rc.0
+<!-- trellis-session: v=2 fp=7662f17b64e08074 -->
+
+**Date**: 2026-10-09
+**Task**: 同步上游 v0.1.9 并发布 v0.1.9-rc.0
+**Branch**: `main`
+
+### Summary
+
+升级 Go 到 1.26.9 修掉 govulncheck 的 9 个标准库漏洞（x/net 等仅模块级命中，未升级以缩小与上游差异）；纳入 Claude/Codex/Pi 的 Trellis 配置与 skills；同步上游 v0.1.9，三处文本冲突取并集、updates.rs 常量保留 fork 构建期注入，另修上游新增 manifest_tag 写死上游仓库路径的语义冲突（改为 manifest_tag_for_repository，双仓库单测 + LATEST_MANIFEST 断言，变异验证断言有效）；同步指南补充 fetch 退出码核对与 fork 间接层绕过检查；CI 全绿后发布 v0.1.9-rc.0，三平台 13 个产物、latest.json 四平台签名齐全、标记为 Pre-release。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `f1ed709` | fix(core): 升级 Go 到 1.26.9，修复 govulncheck 报出的 9 个标准库漏洞 |
+| `01e0b81` | chore(trellis): 纳入 Claude、Codex、Pi 的 Trellis 平台配置与共享 skills |
+| `cfde46b` | merge(upstream): 同步上游 v0.1.9 |
+| `12ee687` | docs(trellis): 同步指南补充 fetch 核对与 fork 间接层绕过的检查 |
+
+### Status
+
+[OK] **Completed**
