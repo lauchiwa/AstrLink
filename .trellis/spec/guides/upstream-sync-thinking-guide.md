@@ -156,3 +156,62 @@ git diff upstream/main -- <path>
 
 Every remaining difference should be either a fork feature or an annotated
 deviation. Anything you cannot explain is an accident.
+
+---
+
+## Environment Blockers Are Not Code Defects
+
+A sync is verifiable only to the extent the local toolchain allows. Separate
+"upstream broke something" from "this machine cannot run the check", and never
+mark an unrun check as passing.
+
+### Prove the toolchain works before blaming the code
+
+`cargo clippy` failing in `apps/desktop/src-tauri` says nothing on its own: the
+crate's `build.rs` calls `tauri_build::try_build`, which validates every
+`tauri.conf.json` `externalBin` path and panics when a sidecar binary is absent.
+There is no documented skip flag, and `ASTRLINK_REUSE_WINDOWS_WORKERS=1`
+(`apps/desktop/scripts/build-sidecar.mjs`) needs a populated CI worker cache, so
+it does not help on a machine that has never built one.
+
+Run the same check on `apps/privacy-worker` and `apps/classifier-worker` first.
+If Clippy passes there, the Rust toolchain is sound end to end and the desktop
+failure is a missing build prerequisite, not a type error. Record it that way.
+
+Do not manufacture a path around the gate: a placeholder file in `binaries/`
+leaves a fake executable behind and hides the real problem, and an unverified
+binary pulled from a release is worse.
+
+### Check disk and linker facts before rewriting code
+
+Two failures in this family look like compiler errors and are not:
+
+- `failed to build archive ...: 磁盘空间不足 (os error 112)` means the volume
+  holding `target/` is full. Confirm with `df -h` before touching source. Go
+  caches may sit on another volume (`GOCACHE`, `GOMODCACHE`), so Go tests can
+  keep passing while Rust builds fail. Deleting a multi-gigabyte `target/` is
+  the user's call; it forces a long rebuild.
+- `LNK1120: unresolved external` naming `__std_*` symbols (`__std_find_end_1`,
+  `__std_mismatch_8`, `__std_min_element_f`, ...) from `libort_sys` is an MSVC
+  STL toolset mismatch: the prebuilt ONNX Runtime static library was compiled
+  against vectorized STL helpers newer than the installed toolset. Report the
+  installed version as a fact; do not assert a required minimum the repository
+  never documents. Symbol spelunking with `strings` or `dumpbin /SYMBOLS` on
+  `libcpmt.lib` produced zero hits even for control symbols, so it proves
+  nothing.
+
+### Verify a tool exists, not just its launcher
+
+On a rustup-managed install, `cargo-fmt` and `cargo-clippy` shims can resolve on
+`PATH` while the components are absent. Confirm with `cargo fmt --version` and
+`cargo clippy --version` rather than `command -v`, and install with
+`rustup component add rustfmt clippy` before concluding a format gate is
+unrunnable.
+
+### `git status` noise on Windows
+
+With `core.autocrlf=true`, `git status --porcelain` can list many files as `M`
+while `git diff` is empty. Verify with `git diff --name-only` and by comparing
+`git ls-files -s` against `git hash-object` per file; equal hashes mean zero
+content change and the entries are stat-cache artifacts. Do not "fix" them with
+a renormalizing commit during a merge.
