@@ -186,14 +186,14 @@ func publicURL(raw string) bool {
 }
 
 func (executor Executor) search(ctx context.Context, config contract.BuiltinTool, call Invocation) (Result, error) {
-	if err := checkOptions(call.Options, "type search_context_size filters external_web_access user_location"); err != nil {
+	// Codex declares search_content_types for image-capable models and
+	// indexed_web_access in its indexed mode. Tavily searches the live web
+	// for every request, including Codex's default cached-only mode.
+	if err := checkOptions(call.Options, "type search_context_size filters external_web_access indexed_web_access search_content_types user_location"); err != nil {
 		return Result{}, err
 	}
 	if call.Options["user_location"] != nil {
 		return Result{}, fmt.Errorf("Tavily backend does not support precise user_location")
-	}
-	if call.Options["external_web_access"] == false {
-		return Result{}, fmt.Errorf("Tavily backend does not support offline search")
 	}
 	action := String(call.Arguments["action"])
 	if action == "" {
@@ -355,26 +355,24 @@ func (executor Executor) image(ctx context.Context, config contract.BuiltinTool,
 	for _, raw := range Array(response["data"]) {
 		entry := Map(raw)
 		encoded := String(entry["b64_json"])
-		format := String(payload["output_format"])
-		if format == "" {
-			format = "png"
-		}
 		if encoded == "" && entry["url"] != nil {
-			var mime string
-			encoded, mime, err = relaykitbridge.ResolveImageData(ctx, String(entry["url"]))
-			format = strings.TrimPrefix(mime, "image/")
+			encoded, _, err = relaykitbridge.ResolveImageData(ctx, String(entry["url"]))
 		}
 		if err != nil {
 			return Result{}, fmt.Errorf("could not load generated image")
 		}
 		data, decodeErr := base64.StdEncoding.DecodeString(encoded)
-		if decodeErr != nil || len(data) == 0 || len(data) > MaxImageBytes || !strings.HasPrefix(http.DetectContentType(data), "image/") {
+		mime := http.DetectContentType(data)
+		if decodeErr != nil || len(data) == 0 || len(data) > MaxImageBytes || !strings.HasPrefix(mime, "image/") {
 			return Result{}, fmt.Errorf("invalid or oversized generated image")
 		}
+		// The bytes decide the format: MiniMax, for one, answers with JPEG
+		// whatever output_format asked for.
+		format := strings.TrimPrefix(mime, "image/")
 		id := ID("ig_")
 		item := Object{"id": id, "type": "image_generation_call", "status": "completed", "result": encoded, "output_format": format, "revised_prompt": entry["revised_prompt"]}
 		result.Items = append(result.Items, item)
-		result.Images = append(result.Images, "data:image/"+format+";base64,"+encoded)
+		result.Images = append(result.Images, "data:"+mime+";base64,"+encoded)
 	}
 	if len(result.Items) == 0 {
 		return Result{}, fmt.Errorf("image backend returned no image")

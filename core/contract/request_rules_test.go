@@ -48,6 +48,8 @@ func TestClassifyRequestHeaderProtectsGatewayOwnedFields(t *testing.T) {
 		// The local namespace is stripped before forwarding.
 		{"X-AstrLink-Reachable", bearer, HeaderClassGatewayReserved},
 		{"x-astrlink-anything", bearer, HeaderClassGatewayReserved},
+		{"X-Openai-Actor-Authorization", bearer, HeaderClassGatewayReserved},
+		{"x-openai-actor-authorization", ServiceAuth{Scheme: AuthSchemeNone}, HeaderClassGatewayReserved},
 		// Identity and compatibility fields a rule legitimately sets.
 		{"User-Agent", bearer, HeaderClassOverridable},
 		{"Originator", bearer, HeaderClassOverridable},
@@ -96,6 +98,8 @@ func TestValidateRequestRulesRejectsUnsafeConfiguration(t *testing.T) {
 		{"transport rule", nil, []ModelRule{{Match: "m", Headers: map[string]string{"Content-Length": "1"}}}, "transport_reserved"},
 		{"session rule", nil, []ModelRule{{Match: "m", Headers: map[string]string{"Session-Id": "s"}}}, "session_reserved"},
 		{"gateway rule", nil, []ModelRule{{Match: "m", Headers: map[string]string{"X-AstrLink-Debug": "1"}}}, "gateway_reserved"},
+		{"actor default", map[string]string{"X-Openai-Actor-Authorization": "1"}, nil, "gateway_reserved"},
+		{"actor rule", nil, []ModelRule{{Match: "m", Headers: map[string]string{"x-openai-actor-authorization": "1"}}}, "gateway_reserved"},
 		{"empty match", nil, []ModelRule{{Match: ""}}, "must not be empty"},
 		{"glob suffix", nil, []ModelRule{{Match: "gpt-6-*"}}, "unsupported pattern syntax"},
 		{"glob question", nil, []ModelRule{{Match: "gpt-?"}}, "unsupported pattern syntax"},

@@ -1,3 +1,5 @@
+import { isWebEdition } from "./edition";
+import { webInvoke, RAW_CHANGED } from "./web-transport";
 import {
   parseIdentityCapture,
   parseIdentityProfilePage,
@@ -36,7 +38,9 @@ import type { UsageSummary, UsageWindow } from "./usage-range";
 import {
   browserSnapshot,
   parseAppSnapshot,
+  parseNetworkAddresses,
   type AppSnapshot,
+  type NetworkAddressesResponse,
 } from "./core-model";
 import {
   parseServicePage,
@@ -188,6 +192,11 @@ async function invoke<T>(
   ...call: Parameters<typeof invokeCommand>
 ): Promise<T> {
   try {
+    if (isWebEdition)
+      return await webInvoke<T>(
+        call[0],
+        call[1] as Record<string, unknown> | undefined,
+      );
     return await invokeCommand<T>(...call);
   } catch (error) {
     if (typeof error === "string") {
@@ -219,7 +228,7 @@ async function invokeDesktopRead(
 }
 
 export async function getCoreStatus(): Promise<AppSnapshot> {
-  if (!hasNativeBridge()) {
+  if (!isWebEdition && !hasNativeBridge()) {
     return browserSnapshot();
   }
 
@@ -285,7 +294,7 @@ export async function trayPopoverHide(): Promise<void> {
 }
 
 function requireNativeBridge(): void {
-  if (!hasNativeBridge()) {
+  if (!isWebEdition && !hasNativeBridge()) {
     throw new Error(i18n.t("bridge.desktopOnly"));
   }
 }
@@ -856,6 +865,10 @@ export async function lockRaw(): Promise<RawSealingStatus> {
 export async function listenRawSealingChanged(
   onChange: () => void,
 ): Promise<() => void> {
+  if (isWebEdition) {
+    window.addEventListener(RAW_CHANGED, onChange);
+    return () => window.removeEventListener(RAW_CHANGED, onChange);
+  }
   if (!hasNativeBridge()) return () => {};
   return listen("raw-sealing-changed", () => onChange());
 }
@@ -902,6 +915,12 @@ export async function getLocalDataStatus(): Promise<LocalDataStatus> {
 export async function listAccessTokens(): Promise<AccessTokenPage> {
   requireNativeBridge();
   return parseAccessTokenPage(await invoke<unknown>("list_access_tokens"));
+}
+
+/** Addresses other devices reach this machine by, read from Core on each call. */
+export async function listNetworkAddresses(): Promise<NetworkAddressesResponse> {
+  requireNativeBridge();
+  return parseNetworkAddresses(await invoke<unknown>("list_network_addresses"));
 }
 
 export async function listAccessTokenUsage(

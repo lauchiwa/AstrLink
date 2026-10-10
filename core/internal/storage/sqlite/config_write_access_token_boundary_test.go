@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -11,7 +12,7 @@ import (
 	storagecontract "github.com/QuantumNous/astrlink/core/internal/storage"
 )
 
-func TestCreateAccessTokenRetryRecountsConcurrentLimit(t *testing.T) {
+func TestCreateAccessTokenCountsConcurrentLimitAfterLock(t *testing.T) {
 	store, actor, barrier, _ := configContentionFixture(t)
 	manager, err := accesstoken.NewManager(store)
 	if err != nil {
@@ -35,7 +36,7 @@ func TestCreateAccessTokenRetryRecountsConcurrentLimit(t *testing.T) {
 	}
 	var injected atomic.Bool
 	barrier.readCount.Store(0)
-	barrier.afterRead = func() {
+	barrier.beforeTokenLock = func() {
 		if injected.CompareAndSwap(false, true) {
 			if _, err := competitor.Create(ctx, "concurrent last slot"); err != nil {
 				t.Error(err)
@@ -44,12 +45,12 @@ func TestCreateAccessTokenRetryRecountsConcurrentLimit(t *testing.T) {
 	}
 	created, err := manager.Create(ctx, "must not exceed the limit")
 	if !errors.Is(err, accesstoken.ErrTokenLimit) || created.Value != "" || created.Token.ID != "" {
-		t.Fatalf("retry must recount and refuse the full limit: %v", err)
+		t.Fatalf("write-first count must refuse the full limit: %v", err)
 	}
-	if barrier.readCount.Load() != 2 {
-		t.Fatalf("limit retry reads=%d", barrier.readCount.Load())
+	if barrier.readCount.Load() != 1 {
+		t.Fatalf("limit reads=%d", barrier.readCount.Load())
 	}
-	barrier.afterRead = nil
+	barrier.beforeTokenLock = nil
 	got, err := manager.List(ctx)
 	if err != nil || len(got) != storagecontract.AccessTokenLimit {
 		t.Fatalf("limit changed after concurrent creation: count=%d err=%v", len(got), err)
@@ -61,7 +62,7 @@ func TestCreateAccessTokenRetryRecountsConcurrentLimit(t *testing.T) {
 	}
 }
 
-func TestCreateAccessTokenRetryUsesCurrentNameConflict(t *testing.T) {
+func TestCreateAccessTokenUsesCurrentNameAfterLock(t *testing.T) {
 	for _, change := range []string{"insert", "delete"} {
 		t.Run(change, func(t *testing.T) {
 			store, actor, barrier, _ := configContentionFixture(t)
@@ -83,7 +84,7 @@ func TestCreateAccessTokenRetryUsesCurrentNameConflict(t *testing.T) {
 			}
 			var injected atomic.Bool
 			barrier.readCount.Store(0)
-			barrier.afterRead = func() {
+			barrier.beforeTokenLock = func() {
 				if !injected.CompareAndSwap(false, true) {
 					return
 				}
@@ -103,8 +104,8 @@ func TestCreateAccessTokenRetryUsesCurrentNameConflict(t *testing.T) {
 			} else if err != nil || created.Token.ID == "" {
 				t.Fatalf("stale snapshot reported a conflict after concurrent deletion: %v", err)
 			}
-			if barrier.readCount.Load() != 2 {
-				t.Fatalf("name retry reads=%d", barrier.readCount.Load())
+			if barrier.readCount.Load() != 1 {
+				t.Fatalf("name reads=%d", barrier.readCount.Load())
 			}
 		})
 	}
@@ -133,23 +134,36 @@ func TestCreateAccessTokenRetryFailureDoesNotPublishOrReplay(t *testing.T) {
 			}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			if mode == "cancel_after_rollback" {
-				barrier.afterRollback = cancel
+			// Establish a real competing writer before any count is read.
+			if _, err := store.db.Exec(`PRAGMA busy_timeout = 0`); err != nil {
+				t.Fatal(err)
 			}
-			var injected atomic.Bool
-			barrier.readCount.Store(0)
-			barrier.afterRead = func() {
-				if injected.CompareAndSwap(false, true) || mode == "attempt_limit" {
-					if _, err := actor.Exec(`UPDATE config_write_noise SET value = value + 1`); err != nil {
+			if _, err := actor.Exec(`BEGIN IMMEDIATE`); err != nil {
+				t.Fatal(err)
+			}
+			var once sync.Once
+			release := func() {
+				once.Do(func() {
+					if _, err := actor.Exec(`ROLLBACK`); err != nil {
 						t.Error(err)
 					}
+				})
+			}
+			t.Cleanup(release)
+			barrier.afterRollback = func() {
+				if mode != "attempt_limit" {
+					release()
+				}
+				if mode == "cancel_after_rollback" {
+					cancel()
 				}
 			}
+			barrier.readCount.Store(0)
 			created, err := manager.Create(ctx, "unsuccessful token")
 			if err == nil || created.Value != "" || created.Token.ID != "" {
 				t.Fatal("failed create published a token or swallowed its error")
 			}
-			wantReads, wantRows := int32(2), len(before)
+			wantReads, wantLocks, wantRows := int32(1), int32(2), len(before)
 			switch mode {
 			case "commit_response_lost":
 				wantRows++ // The commit happened, but its response was lost.
@@ -157,17 +171,17 @@ func TestCreateAccessTokenRetryFailureDoesNotPublishOrReplay(t *testing.T) {
 					t.Fatalf("lost commit response changed its error: %v", err)
 				}
 			case "cancel_after_rollback":
-				wantReads = 1
+				wantReads, wantLocks = 0, 1
 				if !errors.Is(err, context.Canceled) {
 					t.Fatalf("cancellation was lost: %v", err)
 				}
 			case "attempt_limit":
-				wantReads = configWriteMaxAttempts
+				wantReads, wantLocks = 0, configWriteMaxAttempts
 			}
-			if barrier.readCount.Load() != wantReads {
-				t.Fatalf("unsafe replay or wrong retry bound: reads=%d want=%d", barrier.readCount.Load(), wantReads)
+			if barrier.readCount.Load() != wantReads || barrier.tokenLockCount.Load() != wantLocks {
+				t.Fatalf("unsafe replay or wrong retry bound: reads=%d/%d locks=%d/%d", barrier.readCount.Load(), wantReads, barrier.tokenLockCount.Load(), wantLocks)
 			}
-			barrier.afterRead = nil
+			release()
 			after, err := manager.List(context.Background())
 			if err != nil || len(after) != wantRows {
 				t.Fatalf("token metadata committed partially or more than once: rows=%d want=%d err=%v", len(after), wantRows, err)

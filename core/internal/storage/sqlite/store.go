@@ -359,9 +359,13 @@ func (store *Store) CreateAccessToken(ctx context.Context, candidate storagecont
 	if err := validateNewAccessToken(candidate); err != nil {
 		return record, fmt.Errorf("%w: %v", storagecontract.ErrInvalidArgument, err)
 	}
-	// The limit check reads before inserting, so concurrent writers can make
-	// the upgrade fail with SQLITE_BUSY(_SNAPSHOT); retry recounts from scratch.
 	return retryConfigWrite(ctx, store.db, func(ctx context.Context, transaction *sql.Tx) (storagecontract.AccessTokenMetadata, error) {
+		// Write first, before insertAccessTokenTx reads the count, so another
+		// connection's write makes this wait on busy_timeout instead of failing
+		// a deferred read transaction upgrade with SQLITE_BUSY.
+		if _, err := transaction.ExecContext(ctx, `UPDATE local_access_tokens SET id = id WHERE 0`); err != nil {
+			return storagecontract.AccessTokenMetadata{}, fmt.Errorf("lock access tokens: %w", err)
+		}
 		return store.insertAccessTokenTx(ctx, transaction, candidate, store.now().UTC())
 	})
 }

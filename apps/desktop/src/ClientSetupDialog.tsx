@@ -1,3 +1,5 @@
+import { isWebEdition } from "./edition";
+import { WebClientSetup } from "./WebClientSetup";
 import {
   useCallback,
   useEffect,
@@ -104,7 +106,7 @@ const claudeTiers = [
 ] as const;
 
 const stateTones: Record<
-  Exclude<ClientConfigState, "not_configured">,
+  Exclude<ClientConfigState, "not_configured" | "cc_switch">,
   StatusTone
 > = {
   configured: "positive",
@@ -162,7 +164,17 @@ function failure(message: string, cause: unknown): Failure {
   };
 }
 
-export function ClientSetupDialog({
+export function ClientSetupDialog(
+  props: Parameters<typeof DesktopClientSetupDialog>[0],
+) {
+  return isWebEdition ? (
+    <WebClientSetup onClose={props.onClose} />
+  ) : (
+    <DesktopClientSetupDialog {...props} />
+  );
+}
+
+function DesktopClientSetupDialog({
   token,
   tokens = [],
   inferenceURL,
@@ -576,11 +588,14 @@ export function ClientSetupDialog({
             : "clientSetup.unsupported",
         );
       case "direct":
-        return card && card.state !== "not_configured" ? (
+        if (!card || card.state === "not_configured") return null;
+        // Reads like the clients only CC Switch configures.
+        if (card.state === "cc_switch") return t("clientSetup.state.cc_switch");
+        return (
           <StatusBadge tone={stateTones[card.state]}>
             {t(`clientSetup.state.${card.state}`)}
           </StatusBadge>
-        ) : null;
+        );
     }
   };
 
@@ -706,6 +721,10 @@ export function ClientSetupDialog({
                 <FormMessage tone="warning">
                   {t("clientSetup.modifiedHint")}
                 </FormMessage>
+              ) : status?.state === "cc_switch" ? (
+                <FormMessage tone="notice">
+                  {t("clientSetup.ccSwitchManagedHint", { client: label })}
+                </FormMessage>
               ) : status?.token_id != null && status.token_id !== token.id ? (
                 <FormMessage tone="notice">
                   {otherToken
@@ -797,8 +816,14 @@ export function ClientSetupDialog({
               {mode === "direct" && isDirectClient(client) ? (
                 <HelpDisclosure title={t("clientSetup.limitsTitle")}>
                   <p>{t(`clientSetup.limits.${client}`)}</p>
+                  {client === "codex" ? (
+                    <p>{t("clientSetup.codexTools")}</p>
+                  ) : null}
                   {offersCCSwitch ? (
                     <p>{t("clientSetup.ccSwitchOverwrites")}</p>
+                  ) : null}
+                  {offersCCSwitch && client === "codex" ? (
+                    <p>{t("clientSetup.codexToolsCCSwitch")}</p>
                   ) : null}
                 </HelpDisclosure>
               ) : null}

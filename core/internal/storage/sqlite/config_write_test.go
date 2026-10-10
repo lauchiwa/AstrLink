@@ -22,13 +22,15 @@ import (
 // transaction to a writer. A second real connection creates the conflict.
 // Every test owns its connector; no global driver hooks or sleeps are needed.
 type configBarrierDriver struct {
-	base          driver.Driver
-	dsn           string
-	afterRead     func()
-	afterRollback func()
-	commitError   error
-	rollbackError error
-	readCount     atomic.Int32
+	base            driver.Driver
+	dsn             string
+	afterRead       func()
+	beforeTokenLock func()
+	tokenLockCount  atomic.Int32
+	afterRollback   func()
+	commitError     error
+	rollbackError   error
+	readCount       atomic.Int32
 }
 
 func (d *configBarrierDriver) Open(name string) (driver.Conn, error) {
@@ -59,6 +61,12 @@ func (c *configBarrierConn) BeginTx(ctx context.Context, opts driver.TxOptions) 
 	return &configBarrierTx{Tx: tx, owner: c.owner}, nil
 }
 func (c *configBarrierConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	if query == "UPDATE local_access_tokens SET id = id WHERE 0" {
+		c.owner.tokenLockCount.Add(1)
+		if c.owner.beforeTokenLock != nil {
+			c.owner.beforeTokenLock()
+		}
+	}
 	return c.Conn.(driver.ExecerContext).ExecContext(ctx, query, args)
 }
 func (c *configBarrierConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {

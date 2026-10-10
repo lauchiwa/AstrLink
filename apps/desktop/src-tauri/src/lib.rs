@@ -80,6 +80,8 @@ struct PreferencesInput {
     core_auto_recover: bool,
     use_system_proxy: bool,
     inference_port: u16,
+    #[serde(default)]
+    inference_listen: preferences::InferenceListen,
     max_concurrent_inspections: u16,
     response_start_timeout_seconds: u32,
     max_request_body_mib: u32,
@@ -101,6 +103,7 @@ impl From<PreferencesInput> for Preferences {
             core_auto_recover: input.core_auto_recover,
             use_system_proxy: input.use_system_proxy,
             inference_port: input.inference_port,
+            inference_listen: input.inference_listen,
             max_concurrent_inspections: input.max_concurrent_inspections,
             response_start_timeout_seconds: input.response_start_timeout_seconds,
             max_request_body_mib: input.max_request_body_mib,
@@ -1698,6 +1701,13 @@ async fn list_access_tokens(
 }
 
 #[tauri::command]
+async fn list_network_addresses(
+    manager: State<'_, Arc<CoreManager>>,
+) -> Result<serde_json::Value, String> {
+    manager.list_network_addresses().await
+}
+
+#[tauri::command]
 async fn get_usage_summary(
     from: String,
     to: String,
@@ -1764,7 +1774,8 @@ async fn open_cc_switch_import(
     inference_url: String,
     manager: State<'_, Arc<CoreManager>>,
 ) -> Result<(), String> {
-    cc_switch::open_import(&manager, &token_id, client, &models, &inference_url).await
+    let home = control_session::user_home()?;
+    cc_switch::open_import(&manager, home, &token_id, client, &models, &inference_url).await
 }
 
 /// Read-only: reports whether the system proxy keeps Codex from reaching
@@ -2142,6 +2153,7 @@ pub fn run() {
             update_audit_settings,
             local_data_status,
             list_access_tokens,
+            list_network_addresses,
             list_access_token_usage,
             get_usage_summary,
             create_access_token,
@@ -2658,6 +2670,7 @@ mod tests {
                 capabilities: None,
                 last_error: None,
                 inference_port_fallback: None,
+                inference_listen_active: None,
                 recovery_attempt: 0,
                 recovery_scheduled_in_ms: None,
             },

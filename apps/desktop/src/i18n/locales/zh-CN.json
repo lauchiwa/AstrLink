@@ -355,6 +355,25 @@
     "portDirty": "有未保存的入口修改。",
     "portNeedsRestart": "入口修改尚未生效；重启网关后切换到已保存设置。",
     "portControlHint": "控制面始终使用仅桌面可知的 127.0.0.1 临时端口。",
+    "listenField": "监听地址",
+    "listenOptions": {
+      "loopback": "仅本机",
+      "all_interfaces": "全部网卡"
+    },
+    "listenHints": {
+      "loopback": "127.0.0.1，只有这台电脑上的程序能连接。",
+      "all_interfaces": "0.0.0.0，同一网络里的其他设备凭访问令牌连接。"
+    },
+    "listenConfirmTitle": "对网络开放推理入口？",
+    "listenConfirmBody": "保存并重启网关后，同一网络里的任何设备都能连到端口 {{port}}。每个请求都必须带访问令牌，没有令牌的请求会被拒绝；还没有令牌的话，先在「访问令牌」页创建。系统防火墙可能询问是否允许 AstrLink 接收网络连接，需要选择允许。",
+    "listenConfirm": "对网络开放",
+    "listenKeepLoopback": "保持仅本机",
+    "listenExposedNotice": "网关正在对网络开放，端口 {{port}}。其他设备用下面任一地址加访问令牌即可连接。",
+    "listenExposedNoAddresses": "暂时没有读到可供其他设备连接的地址，请检查网络连接。",
+    "listenExposedAddressesFailed": "读取本机网络地址失败：{{error}}",
+    "listenRevert": "改回仅本机",
+    "listenReverting": "正在改回…",
+    "listenAddressCopy": "复制地址",
     "concurrencyField": "检查并发",
     "concurrencySaved": "已保存",
     "concurrencyHint": "同时解析与分类的请求路数，范围 4–128。并行调用排队时可调高。",
@@ -964,6 +983,7 @@
     "kindPickerTitle": "选择 API 提供商类型",
     "kindPickerDescription": "保存后无法更改类型。",
     "kindPickerNewapiHint": "New API 生态面板",
+    "kindPickerMagpieHint": "本机多账号模型网关",
     "kindPickerCustomHint": "手动声明协议能力",
     "serviceName": "API 提供商名称",
     "enableThis": "启用这个 API 提供商",
@@ -975,6 +995,7 @@
       "cn": "国内站",
       "global": "国际站",
       "official": "官方地址",
+      "local": "本机地址",
       "custom": "自定义地址"
     },
     "headerName": "认证 Header 名称",
@@ -1167,6 +1188,7 @@
     "minimax_coding": "MiniMax Coding Plan",
     "codex_subscription": "Codex 订阅",
     "newapi": "New API",
+    "magpie": "Magpie",
     "openai": "OpenAI API",
     "anthropic": "Anthropic API",
     "gemini": "Gemini API",
@@ -1218,6 +1240,7 @@
     "qualityFair": "转换质量一般",
     "qualityDiscouraged": "不推荐转换",
     "newapiDescription": "外部网关首选。适用于 New API 生态面板，自动启用全部兼容协议。",
+    "magpieDescription": "接入本机运行的 Magpie 网关，由它统一管理各家账号并在额度用尽时自动换下一个。默认地址 http://127.0.0.1:3425；本机访问时 API Key 可填任意值，局域网访问需填写 Magpie 签发的网关密钥。",
     "openaiCompatible": "OpenAI 兼容（Chat / Completions）",
     "openaiCompatibleDescription": "适用于提供标准 OpenAI Chat、Completions 与 Models 接口的 API 提供商。",
     "openaiCompatibleName": "OpenAI 兼容 API 提供商",
@@ -2821,11 +2844,13 @@
       "configured": "已配置",
       "outdated": "端口待更新",
       "modified": "配置已被改动",
+      "cc_switch": "通过 CC Switch",
       "invalid": "无法读取配置"
     },
     "usesToken": "{{client}} 当前使用“{{name}}”，更新后改用“{{current}}”。",
     "usesOtherToken": "{{client}} 当前使用其他令牌，更新后改用“{{current}}”。",
     "modifiedHint": "这份配置在 AstrLink 写入后被改动过，端口变化时不会再自动更新。重新写入即可恢复。",
+    "ccSwitchManagedHint": "{{client}} 现在由 CC Switch 管理。网关端口变化后，需要在 CC Switch 中更新地址。要改回由 AstrLink 管理，点击「写入配置」。",
     "invalidHint": "配置文件格式有误，AstrLink 不会改动它。修正后再写入。",
     "configFile": "配置文件",
     "write": "写入配置",
@@ -2847,6 +2872,8 @@
     "ccSwitchOpened": "已请求打开 CC Switch，请在其中确认导入。",
     "ccSwitchFailed": "无法打开 CC Switch。请确认已安装并注册 ccswitch:// 协议，且网关和令牌仍可用，然后重试。",
     "ccSwitchOverwrites": "在 CC Switch 中切换供应商会覆盖这里写入的配置。",
+    "codexTools": "写入后，Codex 会显示自带的生图和联网搜索工具。Codex 调用它们时，网关先按「路由 → 模型与工具 → 内置工具」的设置执行。那里关着的工具会交给当前对话所用的 API 提供商。Codex 订阅可以处理这两个工具。OpenAI API、OpenAI 兼容和 New API 可以处理生图。其他情况下，Codex 会收到开启方法。",
+    "codexToolsCCSwitch": "用 CC Switch 导入的配置里没有这项设置，Codex 中不会出现这两个工具。",
     "limitsTitle": "使用限制",
     "limits": {
       "claude": "只写入用户级的 ~/.claude/settings.json。项目里的 .claude/settings.json 或 .claude/settings.local.json 设置了相同的环境变量时，以项目为准。设置了 CLAUDE_CONFIG_DIR 时 Claude Code 读取其他目录，请改用手动配置。",
@@ -2917,9 +2944,9 @@
     "serviceImages": "提供商的 Images API",
     "imagesApi": "自定义 Images API",
     "upstreamHint": "使用所选提供商的 Responses API，由下方执行模型调用同类型的内置工具，再把结果交回原请求的主模型。",
-    "externalSearchHint": "使用 Tavily 兼容 API 完成搜索、网页读取和文字查找。连接使用下方填写的 API 基础地址和单独保存的密钥。",
+    "externalSearchHint": "使用 Tavily 兼容 API 完成搜索、网页读取和文字查找。连接使用下方填写的 API 基础地址和单独保存的密钥。Codex 要求只用缓存结果时，Tavily 仍会实时抓取网页。",
     "externalImagesHint": "使用 OpenAI Images 兼容 API 生成或编辑图片。连接使用下方填写的 API 基础地址和单独保存的密钥。",
-    "serviceImagesHint": "使用所选提供商的 Images API 生成或编辑图片，复用该提供商已配置的密钥和代理。",
+    "serviceImagesHint": "使用所选提供商自带的生图接口生成或编辑图片，复用该提供商已配置的密钥和代理。MiniMax 收到参考图时，会保留图中人物的特征，重新生成一张图。",
     "provider": "API 提供商",
     "providerFor": "{{tool}}提供商",
     "model": "执行模型",
@@ -2943,9 +2970,9 @@
     "keySaved": "密钥状态已更新。",
     "failed": "工具操作失败。",
     "keyStatusFailed": "无法读取密钥状态。",
-    "description": "匹配 OpenAI Responses 请求中 tools 数组的 type 字段。开启后，网关把对应工具声明转换为函数供主模型调用，再交给这里选定的模型或 API 执行，结果交回主模型继续回答。主模型须支持函数调用。",
+    "description": "匹配 OpenAI Responses 请求中 tools 数组的 type 字段。开启后，网关把对应工具声明转换为函数供主模型调用，再交给这里选定的模型或 API 执行，结果交回主模型继续回答。主模型须支持函数调用。Codex 自带的生图和联网搜索工具也按这里的设置执行。这里关闭时，Codex 订阅等自带这两个工具的 API 提供商会直接处理。",
     "noProviders": "暂无支持原生 Responses 的已启用提供商。请先在 API 提供商中配置。",
-    "noImageProviders": "暂无已启用的 OpenAI、OpenAI 兼容或 New API 提供商。请先在 API 提供商中配置。"
+    "noImageProviders": "暂无已启用的 OpenAI、OpenAI 兼容、New API 或 MiniMax 提供商。请先在 API 提供商中配置。"
   },
   "about": {
     "title": "关于",
@@ -3073,6 +3100,7 @@
       "timeout": "操作超时，请检查网络后重试。",
       "changed": "安装位置已改变，请刷新后再更新。",
       "unchanged": "没有安装成功，请点击“查看详情”了解原因后重试。",
+      "damaged": "安装不完整或文件已损坏，无法启动。请重新安装后重试。",
       "proxy": "无法读取或使用系统代理，请检查代理设置。"
     }
   },

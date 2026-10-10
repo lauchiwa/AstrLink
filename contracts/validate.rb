@@ -327,6 +327,8 @@ public_operations = %w[/control/v1/health /control/v1/version /control/v1/capabi
 # A full identity fingerprint describes the client an operator chose to
 # present upstream, and arming a capture window is consent, so every method
 # on these paths is operator-only including the reads.
+# Host addresses tell a client where to reach the gateway from another
+# machine; only the operator who exposes the gateway needs them.
 operator_reads = %w[
   /control/v1/access-tokens/{token_id}/secret
   /control/v1/services/{service_id}/authorization
@@ -335,6 +337,7 @@ operator_reads = %w[
   /control/v1/services/{service_id}/identity-profiles
   /control/v1/services/{service_id}/identity-profiles/{profile_id}
   /control/v1/services/{service_id}/identity-capture
+  /control/v1/network-addresses
 ]
 # An agent may ask for raw access and give up its own grant; only the
 # operator can approve it.

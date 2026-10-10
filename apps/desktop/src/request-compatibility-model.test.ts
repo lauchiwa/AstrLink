@@ -76,6 +76,15 @@ describe("request compatibility", () => {
     { extra_headers: { "User-Agent": "one", "user-agent": "two" } },
     { extra_headers: { Authorization: "fake-key" } },
     { extra_headers: { "X-AstrLink-Test": "fake-value" } },
+    { extra_headers: { "X-Openai-Actor-Authorization": "local-switch" } },
+    {
+      model_rules: [
+        {
+          match: "*",
+          headers: { "x-openai-actor-authorization": "local-switch" },
+        },
+      ],
+    },
     { extra_headers: { "Content-Type": "text/plain" } },
     { extra_headers: { "Session-Id": "fixed" } },
     { extra_headers: { "X-Test": "fake\r\ninjected" } },

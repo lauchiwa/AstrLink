@@ -43,8 +43,8 @@ const (
 	// HeaderClassSessionReserved covers per-session and per-request binding
 	// markers that must describe the actual request, not configuration.
 	HeaderClassSessionReserved HeaderClass = "session_reserved"
-	// HeaderClassGatewayReserved covers the local X-AstrLink-* namespace, which
-	// is stripped before forwarding and must never be configurable.
+	// HeaderClassGatewayReserved covers local gateway controls, including the
+	// X-AstrLink-* namespace and the Codex actor switch. They must not forward.
 	HeaderClassGatewayReserved HeaderClass = "gateway_reserved"
 )
 
@@ -110,7 +110,7 @@ var sessionReservedHeaders = map[string]struct{}{
 // stored one, so a custom auth header can never be reachable by configuration.
 func ClassifyRequestHeader(name string, auth ServiceAuth) HeaderClass {
 	canonical := http.CanonicalHeaderKey(strings.TrimSpace(name))
-	if strings.HasPrefix(canonical, "X-Astrlink-") {
+	if strings.HasPrefix(canonical, "X-Astrlink-") || canonical == "X-Openai-Actor-Authorization" {
 		return HeaderClassGatewayReserved
 	}
 	if auth.Scheme == AuthSchemeCustomHeader && auth.HeaderName != "" &&

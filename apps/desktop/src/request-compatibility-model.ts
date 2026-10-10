@@ -130,6 +130,7 @@ function headersAt(
         seen.has(lower) ||
         reservedHeaders.has(lower) ||
         lower.startsWith("x-astrlink-") ||
+        lower === "x-openai-actor-authorization" ||
         (auth.scheme === "custom_header" &&
           lower === auth.header_name?.toLowerCase())
       )

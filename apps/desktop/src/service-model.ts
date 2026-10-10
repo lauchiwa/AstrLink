@@ -30,6 +30,7 @@ export type HTTPServiceKind =
   | "glm_coding"
   | "minimax_coding"
   | "newapi"
+  | "magpie"
   | "openai"
   | "anthropic"
   | "gemini"
@@ -389,6 +390,7 @@ const httpKinds = new Set<HTTPServiceKind>([
   "glm_coding",
   "minimax_coding",
   "newapi",
+  "magpie",
   "openai",
   "anthropic",
   "gemini",

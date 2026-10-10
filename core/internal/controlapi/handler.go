@@ -79,6 +79,9 @@ type Dependencies struct {
 	NewServiceID     func() (contract.ServiceID, error)
 	ConversionEngine relaykitbridge.ConversionEngine
 	Shutdown         context.CancelFunc
+	// ConsoleSessions is set by the server edition, whose web console signs
+	// in with the raw password. See ConsoleSessions.
+	ConsoleSessions ConsoleSessions
 }
 
 // CodingPlanUsage is satisfied by *codingplan.Fetcher.
@@ -144,6 +147,7 @@ type Handler struct {
 	privacyMu         sync.Mutex
 	shutdown          context.CancelFunc
 	observers         *observerTracker
+	consoleSessions   ConsoleSessions
 }
 
 func New(version contract.VersionResponse) *Handler {
@@ -209,6 +213,7 @@ func newHandler(version contract.VersionResponse, dependencies Dependencies) (*H
 		observerToken:   []byte(dependencies.ObserverToken),
 		newServiceID:    dependencies.NewServiceID,
 		shutdown:        dependencies.Shutdown,
+		consoleSessions: dependencies.ConsoleSessions,
 		mux:             http.NewServeMux(),
 		observers:       newObserverTracker(),
 	}
@@ -228,6 +233,7 @@ func newHandler(version contract.VersionResponse, dependencies Dependencies) (*H
 	handler.mux.HandleFunc(CapabilitiesPath, handler.getOnly(func(writer http.ResponseWriter, _ *http.Request) {
 		writeJSON(writer, http.StatusOK, handler.capabilities)
 	}))
+	handler.mux.HandleFunc(NetworkAddressesPath, handler.authenticated(handler.getOnly(handler.getNetworkAddresses), RoleOperator))
 	if handler.shutdown != nil {
 		handler.mux.HandleFunc(ShutdownPath, handler.authenticated(func(writer http.ResponseWriter, request *http.Request) {
 			if request.Method != http.MethodPost {

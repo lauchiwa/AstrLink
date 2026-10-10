@@ -18,6 +18,9 @@ export default defineConfig({
     define: {
       "process.env.ASTRLINK_RELEASE_REPOSITORY":
         JSON.stringify(releaseRepository()),
+      "process.env.PUBLIC_ASTRLINK_EDITION": JSON.stringify(
+        process.env.PUBLIC_ASTRLINK_EDITION === "web" ? "web" : "desktop",
+      ),
     },
     entry: {
       index: "./src/main.tsx",
@@ -28,8 +31,11 @@ export default defineConfig({
     favicon: "./src/assets/astrlink-logo.svg",
   },
   output: {
+    ...(process.env.PUBLIC_ASTRLINK_EDITION === "web"
+      ? { dataUriLimit: 0 }
+      : {}),
     distPath: {
-      root: "dist",
+      root: process.env.PUBLIC_ASTRLINK_EDITION === "web" ? "dist-web" : "dist",
     },
   },
   server: {
