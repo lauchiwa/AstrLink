@@ -1,0 +1,6 @@
+{"file":"AGENTS.md","reason":"Repository quality gates, forwarding identity, database safety and desktop UI requirements"}
+{"file":".trellis/spec/guides/upstream-sync-thinking-guide.md","reason":"Preserve stable upstream behavior and adapt fork-owned seams; review silent bypasses"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Shared startup dependencies, console authorization and final upstream header boundaries"}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Reuse existing identity, configuration-write and release repository policies"}
+{"file":".trellis/tasks/10-10-sync-upstream-latest/research/stable-conflicts.md","reason":"Five stable-only conflicts, SQLite test premise changes and frozen target evidence"}
+{"file":".trellis/tasks/10-10-sync-upstream-latest/research/persistent-core-identity.md","reason":"Persistent-core identity wiring, lifecycle, dependency-copy ordering and regression plan"}

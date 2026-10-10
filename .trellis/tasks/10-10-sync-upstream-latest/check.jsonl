@@ -1,0 +1,5 @@
+{"file":"AGENTS.md","reason":"Full-scope formatting, lint, tests, forwarding identity and native UI validation requirements"}
+{"file":".trellis/spec/guides/upstream-sync-thinking-guide.md","reason":"Audit remaining fork delta, migrations, release indirection and upstream behavior preservation"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Validate real control, ingress, discovery, server and transport data flow"}
+{"file":".trellis/tasks/10-10-sync-upstream-latest/research/stable-conflicts.md","reason":"Stable target ancestry, conflict solutions, transaction locking and contract risks"}
+{"file":".trellis/tasks/10-10-sync-upstream-latest/research/persistent-core-identity.md","reason":"Check actual composition and final headers rather than optional dependency or CRUD-only tests"}
