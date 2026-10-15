@@ -138,6 +138,8 @@ pub enum TrayPage {
 pub struct TrayUsagePreferences {
     pub today: bool,
     pub cost: bool,
+    /// What the privacy policy replaced, restored and blocked today.
+    pub privacy: bool,
     pub subscription_windows: bool,
     pub top_model: bool,
     pub compare_yesterday: bool,
@@ -152,6 +154,7 @@ impl Default for TrayUsagePreferences {
         Self {
             today: true,
             cost: true,
+            privacy: true,
             subscription_windows: true,
             top_model: true,
             compare_yesterday: false,
@@ -172,6 +175,7 @@ impl TrayUsagePreferences {
     pub fn needs_anything(&self) -> bool {
         self.needs_usage_summary()
             || self.cost
+            || self.privacy
             || self.subscription_windows
             || self.top_client
             || self.last_request
@@ -249,7 +253,7 @@ impl Default for Preferences {
             core_auto_start: true,
             core_auto_recover: true,
             use_system_proxy: true,
-            inference_port: DEFAULT_INFERENCE_PORT,
+            inference_port: crate::instance::default_inference_port(),
             inference_listen: InferenceListen::Loopback,
             max_concurrent_inspections: DEFAULT_MAX_CONCURRENT_INSPECTIONS,
             response_start_timeout_seconds: DEFAULT_RESPONSE_START_TIMEOUT_SECONDS,
@@ -326,7 +330,7 @@ impl PreferencesStore {
             inference_port: if has_existing_data {
                 LEGACY_INFERENCE_PORT
             } else {
-                DEFAULT_INFERENCE_PORT
+                crate::instance::default_inference_port()
             },
             ..Preferences::default()
         };
@@ -578,6 +582,7 @@ mod tests {
         let store = load(&directory);
         let mut stale_general = store.snapshot().values;
         let updates = crate::updates::UpdatePreferences {
+            official_mirror: false,
             auto_check: false,
             auto_download: false,
             channel: crate::updates::UpdateChannel::Preview,

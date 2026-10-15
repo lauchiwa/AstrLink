@@ -217,7 +217,7 @@ func websocketSkip(candidate endpoint.Resolved, routingModel string) contract.Ro
 	if upstreamModel == "" {
 		upstreamModel = routingModel
 	}
-	if native := service.Kind.ModelNativeProtocol(upstreamModel); native != "" && native != contract.ProtocolOpenAIResponses {
+	if format := service.ModelProtocol(upstreamModel); format != "" && format != contract.ProtocolOpenAIResponses {
 		return contract.RoutingSkipWebSocketUnsupported
 	}
 	for _, capability := range service.Capabilities {

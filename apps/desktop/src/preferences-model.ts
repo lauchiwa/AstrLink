@@ -48,6 +48,7 @@ export type TrayPage = (typeof TRAY_PAGES)[number];
 export const TRAY_USAGE_KEYS = [
   "today",
   "cost",
+  "privacy",
   "subscription_windows",
   "top_model",
   "compare_yesterday",
@@ -76,6 +77,7 @@ export function defaultTrayPreferences(): TrayPreferences {
     usage: {
       today: true,
       cost: true,
+      privacy: true,
       subscription_windows: true,
       top_model: true,
       compare_yesterday: false,

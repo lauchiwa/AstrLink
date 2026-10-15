@@ -35,7 +35,12 @@ const bridgeMocks = vi.hoisted(() => ({
   updateServiceOrder: vi.fn(),
   installAgentDebug: vi.fn(),
   isCCSwitchInstalled: vi.fn().mockResolvedValue(false),
-  getClientConfigStatus: vi.fn().mockResolvedValue([]),
+  getClientConfigStatus: vi.fn().mockResolvedValue({
+    clients: [],
+    wsl_unchecked: [],
+    wsl_localhost: false,
+    cc_switch_wsl: { claude: null, codex: null },
+  }),
   previewClientConfigSnippet: vi.fn().mockResolvedValue("{}"),
   copyClientConfigSnippet: vi.fn(),
   uninstallAgentDebug: vi.fn(),
@@ -83,6 +88,8 @@ const bridgeMocks = vi.hoisted(() => ({
   lockRaw: vi.fn(),
   setRawPassword: vi.fn(),
   unlockRaw: vi.fn(),
+  setMainWindowUnsaved: vi.fn().mockResolvedValue(undefined),
+  takeTrayNavigation: vi.fn().mockResolvedValue(null),
 }));
 
 const updateMocks = vi.hoisted(() => ({
@@ -105,6 +112,9 @@ vi.mock("sonner", async (importOriginal) => {
 
 vi.mock("./bridge", () => bridgeMocks);
 
+const eventMocks = vi.hoisted(() => ({ listen: vi.fn() }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: eventMocks.listen }));
+
 const modelUpdate = vi.hoisted(() => ({
   current: null as
     | import("./use-privacy-model-update").PrivacyModelUpdate
@@ -114,13 +124,14 @@ vi.mock("./use-privacy-model-update", () => ({
   usePrivacyModelUpdate: () => modelUpdate.current,
 }));
 
-import App from "./App";
+import App, { followTrayNavigation, trayNavigationTarget } from "./App";
 import type { AppSnapshot } from "./core-model";
 import { defaultTrayPreferences } from "./preferences-model";
 import { defaultFailurePolicy } from "./failure-policy-model";
 import { defaultPrivacyKindRules } from "./privacy-policy-model";
 import { ONBOARDING_STORAGE_KEY } from "./use-onboarding";
 import { routingAutosaveDelay } from "./RoutingSettingsPanel";
+import { settleClosedLayer } from "./lib/test-layer-settle";
 
 const readySnapshot: AppSnapshot = {
   app_version: "0.1.0",
@@ -169,6 +180,7 @@ const readySnapshot: AppSnapshot = {
   last_error: null,
   inference_port_fallback: null,
   inference_listen_active: null,
+  restart_pending: false,
   recovery_attempt: 0,
   recovery_scheduled_in_ms: null,
 };
@@ -227,9 +239,7 @@ async function chooseKindCard(option: string): Promise<void> {
   });
   // The closed dialog returns focus in a timeout. Let it land now: on a slow
   // runner it could land after a popover opens and close it as focus outside.
-  await act(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 0));
-  });
+  await settleClosedLayer();
 }
 
 /** A raw password unless `overrides` says otherwise. */
@@ -298,6 +308,66 @@ async function pressEscape(): Promise<void> {
     );
   });
 }
+
+describe("tray navigation targets", () => {
+  it("opens known pages and today's failed requests and ignores the rest", () => {
+    expect(trayNavigationTarget("records")).toEqual({ kind: "records" });
+    expect(trayNavigationTarget("settings")).toEqual({ kind: "settings" });
+    expect(trayNavigationTarget("privacyOverview")).toEqual({
+      kind: "safety",
+      view: "overview",
+    });
+    const now = new Date(2026, 9, 12, 15, 30);
+    expect(trayNavigationTarget("failedToday", now)).toEqual({
+      kind: "records",
+      failedWithin: {
+        from: new Date(2026, 9, 12).toISOString(),
+        to: new Date(2026, 9, 13).toISOString(),
+      },
+    });
+    for (const payload of [
+      "explode",
+      "failed",
+      "",
+      null,
+      3,
+      { kind: "records" },
+    ]) {
+      expect(trayNavigationTarget(payload)).toBeNull();
+    }
+  });
+
+  it("takes the page left before the window listened, then each one announced", async () => {
+    let announce = () => {};
+    eventMocks.listen.mockImplementationOnce(
+      async (_event: string, handler: () => void) => {
+        announce = handler;
+        return () => {};
+      },
+    );
+    bridgeMocks.takeTrayNavigation
+      .mockResolvedValueOnce("records")
+      .mockResolvedValueOnce("settings")
+      .mockResolvedValueOnce(null);
+    const open = vi.fn();
+    const stop = followTrayNavigation(open);
+
+    await vi.waitFor(() =>
+      expect(open).toHaveBeenCalledWith({ kind: "records" }),
+    );
+    announce();
+    await vi.waitFor(() =>
+      expect(open).toHaveBeenLastCalledWith({ kind: "settings" }),
+    );
+    // Another take already answered this announcement.
+    announce();
+    await vi.waitFor(() =>
+      expect(bridgeMocks.takeTrayNavigation).toHaveBeenCalledTimes(3),
+    );
+    expect(open).toHaveBeenCalledTimes(2);
+    stop();
+  });
+});
 
 describe("App workspace navigation", () => {
   let container: HTMLDivElement;
@@ -491,6 +561,7 @@ describe("App workspace navigation", () => {
       tools: [
         {
           id: "cursor",
+          wsl: null,
           detected: true,
           skills: agentSkills(false),
           cli_access: "prompt",
@@ -500,6 +571,7 @@ describe("App workspace navigation", () => {
         },
         {
           id: "claude",
+          wsl: null,
           detected: false,
           skills: agentSkills(false),
           cli_access: "allow_rules",
@@ -509,6 +581,7 @@ describe("App workspace navigation", () => {
         },
         {
           id: "codex",
+          wsl: null,
           detected: true,
           skills: agentSkills(true),
           cli_access: "exec_policy",
@@ -518,6 +591,7 @@ describe("App workspace navigation", () => {
         },
       ],
       shared_paths: [],
+      wsl_unchecked: [],
     });
     container = document.createElement("div");
     document.body.append(container);
@@ -1009,7 +1083,7 @@ describe("App workspace navigation", () => {
       {
         nav: "路由",
         read: bridgeMocks.getRoutingSettings,
-        content: "Codex 自动审查",
+        content: "请求图片压缩",
       },
       {
         nav: "安全",
@@ -1515,7 +1589,14 @@ describe("App workspace navigation", () => {
       [...container.querySelectorAll('[role="tab"]')].map(
         (tab) => tab.textContent,
       ),
-    ).toEqual(["模型与工具", "恢复与重试", "错误规则", "会话粘性", "转发身份"]);
+    ).toEqual([
+      "请求改写",
+      "重定向",
+      "恢复与重试",
+      "错误规则",
+      "会话粘性",
+      "转发身份",
+    ]);
     expect(container.textContent).not.toContain("mmBERT");
     expect(bridgeMocks.listServices).toHaveBeenCalledTimes(serviceCalls);
     expect(bridgeMocks.getUsageSummary).toHaveBeenCalledTimes(requestCalls);
@@ -1770,6 +1851,8 @@ describe("App workspace navigation", () => {
     });
     await chooseKindCard("Codex 订阅");
     await setInput("#service-name", "Unfinished service");
+    // Unsaved edits keep the window when it is hidden to the tray.
+    expect(bridgeMocks.setMainWindowUnsaved).toHaveBeenLastCalledWith(true);
 
     const back = container.querySelector<HTMLButtonElement>(
       'button[aria-label="返回 API 提供商列表"]',
@@ -1798,6 +1881,7 @@ describe("App workspace navigation", () => {
     });
     expect(document.querySelector('[role="alertdialog"]')).toBeNull();
     expect(workspaceHeading().textContent).toBe("路由");
+    expect(bridgeMocks.setMainWindowUnsaved).toHaveBeenLastCalledWith(false);
   });
   it("settles routing autosave before allowing navigation", async () => {
     vi.useFakeTimers();
@@ -1829,7 +1913,8 @@ describe("App workspace navigation", () => {
   });
 
   it("protects default-policy drafts when leaving routing", async () => {
-    // Keep the autosave deadline from depending on the CI runner's speed.
+    // The routing panel autosaves 500 ms after an edit. The draft must stay
+    // unsaved however slowly a runner moves through the steps below.
     vi.useFakeTimers();
     await renderApp();
     await act(async () => button("路由").click());

@@ -68,8 +68,10 @@ const (
 )
 
 // serveSearch answers Codex's /v1/alpha/search. The web search configured
-// under built-in tools comes first. With it turned off, a search in a turn a
-// Codex subscription served goes to that subscription.
+// under built-in tools comes first; a provider's own search API configured
+// there gets the request as it is, with the configured model. With it turned
+// off, a search in a turn a Codex subscription or New API served goes to that
+// provider.
 //
 // Codex ends the whole turn when this request fails, so every outcome after
 // authentication is a 200 whose output tells the model what happened. The
@@ -101,21 +103,43 @@ func (handler *Handler) serveSearch(writer http.ResponseWriter, request *http.Re
 	if settings.BuiltinTools != nil {
 		config = settings.BuiltinTools.WebSearch
 	}
+	ref := codexTurnFromHeader(request.Header)
+	if ref.sessionID == "" {
+		var id string
+		_ = json.Unmarshal(original["id"], &id)
+		ref.sessionID = codexTurnID(id)
+	}
 	if !config.Enabled || config.Validate("web_search") != nil {
-		ref := codexTurnFromHeader(request.Header)
-		if ref.sessionID == "" {
-			var id string
-			_ = json.Unmarshal(original["id"], &id)
-			ref.sessionID = codexTurnID(id)
-		}
 		candidate, binding, ok := handler.codexToolProvider(request.Context(), ref, "web_search")
 		if !ok {
 			failed("web_search_disabled", "web search is turned off",
-				"Web search is turned off for this gateway, so nothing was searched. It can be turned on under Routing → Models & tools → Built-in tools. Answer without web results, and tell the user if the answer needs them.")
+				"Web search is turned off for this gateway, so nothing was searched. It can be turned on under Routing → Redirects → Responses tool mapping. Answer without web results, and tell the user if the answer needs them.")
 			return
 		}
 		replaceRecoveryRequestBody(request, raw)
-		handler.forwardCodexSearch(writer, request, classified, settings, candidate, binding, reply, failed)
+		handler.forwardCodexSearch(writer, request, classified, settings, contract.BuiltinTool{Backend: "provider", ServiceID: candidate.CanonicalService().ID}, candidate, binding, reply, failed)
+		return
+	}
+	if config.Backend == "service_search" {
+		candidate, err := handler.searchService(request.Context(), config.ServiceID)
+		if err != nil {
+			session.noteBuiltinTool("web_search", config, time.Now(), builtintools.Result{}, err)
+			failed("web_search_failed", err.Error(),
+				"The web search failed ("+err.Error()+"), so no results came back. Answer without web results, and tell the user if the answer needs them.")
+			return
+		}
+		// The search keeps the Codex client's own identity only when its
+		// turn reached the same subscription with it.
+		binding := codexTurnBinding{service: config.ServiceID, model: config.Model}
+		principal, _ := AccessTokenIDFromContext(request.Context())
+		if turn, found := handler.codexTurns.lookup(string(principal), ref, time.Now()); found && turn.service == config.ServiceID {
+			binding.official = turn.official
+		}
+		if config.Model != classified.Model {
+			session.noteModelRedirect(request.Context(), classified.Model, config.Model)
+		}
+		replaceRecoveryRequestBody(request, raw)
+		handler.forwardCodexSearch(writer, request, classified, settings, config, candidate, binding, reply, failed)
 		return
 	}
 	// The built-in search never forwards the conversation Codex attaches, so
@@ -127,7 +151,7 @@ func (handler *Handler) serveSearch(writer http.ResponseWriter, request *http.Re
 		return
 	}
 	replaceRecoveryRequestBody(request, stripped)
-	finishPrivacy, _, err := handler.applyPrivacy(writer, request, classified, config.ServiceID)
+	finishPrivacy, _, err := handler.applyPrivacy(writer, request, classified, handler.builtinToolService(request.Context(), config))
 	defer finishPrivacy()
 	if err != nil {
 		handler.searchPrivacyFailure(request, err, reply)
@@ -224,15 +248,17 @@ func (handler *Handler) searchPrivacyFailure(request *http.Request, err error, r
 // subscription; Codex itself keeps only what fits the model's budget.
 const maxCodexSearchResponseBytes = 8 << 20
 
-// forwardCodexSearch sends a search to the Codex subscription that served the
-// turn, naming the model that served it. A valid answer goes back as is. A
-// failure becomes a 200 that tells the model, because a failed search ends
-// the whole Codex turn.
+// forwardCodexSearch sends a search to a provider's own search API: the
+// provider that served the turn, naming the model that served it, or the one
+// configured for web search, naming the configured model. config is what the
+// record shows. A valid answer goes back as is. A failure becomes a 200 that
+// tells the model, because a failed search ends the whole Codex turn.
 func (handler *Handler) forwardCodexSearch(
 	writer http.ResponseWriter,
 	request *http.Request,
 	classified Request,
 	settings contract.RoutingSettings,
+	config contract.BuiltinTool,
 	candidate endpoint.Resolved,
 	binding codexTurnBinding,
 	reply func(string),
@@ -240,7 +266,7 @@ func (handler *Handler) forwardCodexSearch(
 ) {
 	session := recordSessionFromContext(request.Context())
 	service := candidate.CanonicalService()
-	finishPrivacy, _, err := handler.applyPrivacy(writer, request, classified, service.ID)
+	finishPrivacy, _, err := handler.applyPrivacy(writer, request, classified, service)
 	defer finishPrivacy()
 	if err != nil {
 		handler.searchPrivacyFailure(request, err, reply)
@@ -259,9 +285,10 @@ func (handler *Handler) forwardCodexSearch(
 	if binding.model != "" {
 		fields["model"], _ = json.Marshal(binding.model)
 	}
-	// The turn's session ID was scoped to this account the same way.
+	// A subscription's turns scoped their session ID to the account the
+	// same way.
 	var id string
-	if settings.SubscriptionSessionIsolation && json.Unmarshal(fields["id"], &id) == nil && id != "" {
+	if service.Kind == contract.ServiceKindCodexSubscription && settings.SubscriptionSessionIsolation && json.Unmarshal(fields["id"], &id) == nil && id != "" {
 		fields["id"], _ = json.Marshal(accountauth.ScopedSessionID(service.ID, id))
 	}
 	if body, err = json.Marshal(fields); err != nil {
@@ -289,13 +316,17 @@ func (handler *Handler) forwardCodexSearch(
 		answer = data
 		return nil
 	})
-	session.noteBuiltinTool("web_search", contract.BuiltinTool{Backend: "provider", ServiceID: service.ID}, started, builtintools.Result{}, err)
+	session.noteBuiltinTool("web_search", config, started, builtintools.Result{}, err)
 	if request.Context().Err() != nil {
 		return
 	}
 	if err != nil {
+		through := "the configured search provider"
+		if config.Backend == "provider" {
+			through = "this conversation's provider"
+		}
 		failed("web_search_failed", err.Error(),
-			"The web search through this conversation's provider failed ("+err.Error()+"), so no results came back. Answer without web results, and tell the user if the answer needs them.")
+			"The web search through "+through+" failed ("+err.Error()+"), so no results came back. Answer without web results, and tell the user if the answer needs them.")
 		return
 	}
 	header := writer.Header()

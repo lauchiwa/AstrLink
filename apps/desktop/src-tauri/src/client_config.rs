@@ -7,7 +7,7 @@
 //! 0.159.2, and Pi 0.99.2.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -22,6 +22,7 @@ use sha2::{Digest, Sha256};
 use toml_edit::{DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
 use crate::{
+    agent_home::{Home, OwnedHome},
     control_session::astrlink_home,
     host_files::{self, WriteOptions},
     sidecar::{CoreManager, CorePhase},
@@ -32,8 +33,12 @@ const CODEX_PROVIDER: &str = "astrlink";
 const CODEX_PROVIDER_PREFIX: &str = "model_providers.astrlink.";
 const PI_PROVIDER: &str = "astrlink";
 const PI_PROVIDER_PREFIX: &str = "providers.astrlink.";
-/// Pi's model list for the provider, written as `[{"id": <model>}]`.
+/// Pi's model list for the provider, written as `[{"id": <model>}]` plus
+/// the model's reasoning levels when the official catalog lists them.
 const PI_MODELS_KEY: &str = "providers.astrlink.models";
+/// Pi's thinking levels, weakest first. Pi treats a custom model as one that
+/// cannot think unless its entry says it reasons.
+const PI_THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 /// The model Pi starts with, which its `/model` picker can save over.
 const PI_STARTUP_KEYS: [&str; 2] = ["defaultProvider", "defaultModel"];
 /// Codex shows its own image generation and web search tools only for a
@@ -44,6 +49,14 @@ const PI_STARTUP_KEYS: [&str; 2] = ["defaultProvider", "defaultModel"];
 const CODEX_HEADERS_KEY: &str = "model_providers.astrlink.http_headers";
 const CODEX_TOOLS_HEADER: &str = "x-openai-actor-authorization";
 const CODEX_TOOLS_HEADER_VALUE: &str = "codex-imagegen";
+/// Claude Code's model settings, by the `Models` field each comes from.
+const CLAUDE_MODEL_KEYS: [(&str, &str); 5] = [
+    ("model", "env.ANTHROPIC_MODEL"),
+    ("haikuModel", "env.ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+    ("sonnetModel", "env.ANTHROPIC_DEFAULT_SONNET_MODEL"),
+    ("opusModel", "env.ANTHROPIC_DEFAULT_OPUS_MODEL"),
+    ("fableModel", "env.ANTHROPIC_DEFAULT_FABLE_MODEL"),
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -79,11 +92,11 @@ impl Client {
         }
     }
 
-    fn detected(self, home: &Path) -> bool {
+    fn detected(self, home: Home) -> bool {
         match self {
-            Self::Claude => home.join(".claude").is_dir() || home.join(".claude.json").is_file(),
-            Self::Codex => home.join(".codex").is_dir(),
-            Self::Pi => home.join(".pi").is_dir(),
+            Self::Claude => home.claude_detected(),
+            Self::Codex => home.codex_dir().is_dir(),
+            Self::Pi => home.pi_detected(),
             Self::Gemini | Self::Opencode | Self::Openclaw => false,
         }
     }
@@ -97,7 +110,7 @@ impl Client {
         }
     }
 
-    fn config_paths(self, home: &Path) -> Vec<PathBuf> {
+    fn config_paths(self, home: Home) -> Vec<PathBuf> {
         self.files().iter().map(|file| file.path(home)).collect()
     }
 
@@ -160,11 +173,11 @@ enum ConfigFile {
 }
 
 impl ConfigFile {
-    fn path(self, home: &Path) -> PathBuf {
-        let pi = home.join(".pi").join("agent");
+    fn path(self, home: Home) -> PathBuf {
+        let pi = home.pi_agent_dir();
         match self {
-            Self::Claude => home.join(".claude").join("settings.json"),
-            Self::Codex => home.join(".codex").join("config.toml"),
+            Self::Claude => home.claude_dir().join("settings.json"),
+            Self::Codex => home.codex_dir().join("config.toml"),
             Self::PiModels => pi.join("models.json"),
             Self::PiSettings => pi.join("settings.json"),
         }
@@ -202,9 +215,32 @@ pub struct Models {
     pub sonnet_model: Option<String>,
     pub opus_model: Option<String>,
     pub fable_model: Option<String>,
+    /// Pi only: the context window and output limit its entry names.
+    pub context_window: Option<u64>,
+    pub max_tokens: Option<u64>,
 }
 
+/// The largest limit a Pi entry takes, in tokens.
+const MAX_PI_LIMIT: u64 = 100_000_000;
+
 impl Models {
+    /// The context window and output limit for Pi's entry.
+    fn pi_limits(&self, client: Client) -> Result<(Option<u64>, Option<u64>), String> {
+        let limits = (self.context_window, self.max_tokens);
+        if client != Client::Pi {
+            return match limits {
+                (None, None) => Ok(limits),
+                _ => Err("context and output limits apply to Pi only".into()),
+            };
+        }
+        for (name, limit) in [("contextWindow", limits.0), ("maxTokens", limits.1)] {
+            if limit.is_some_and(|limit| limit == 0 || limit > MAX_PI_LIMIT) {
+                return Err(format!("invalid {name}"));
+            }
+        }
+        Ok(limits)
+    }
+
     /// The filled-in models, trimmed and named by their camelCase field.
     /// Claude Code takes every tier; other clients take one required model.
     pub fn fields(&self, client: Client) -> Result<Vec<(&'static str, String)>, String> {
@@ -222,7 +258,7 @@ impl Models {
             let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
                 continue;
             };
-            if value.chars().count() > 256 || value.chars().any(char::is_control) {
+            if !valid_model(value) {
                 return Err(format!("invalid {key}"));
             }
             values.push((key, value.to_string()));
@@ -232,6 +268,11 @@ impl Models {
         }
         Ok(values)
     }
+}
+
+/// Whether a trimmed, non-empty model name fits in a client config.
+fn valid_model(value: &str) -> bool {
+    value.chars().count() <= 256 && !value.chars().any(char::is_control)
 }
 
 /// `http://127.0.0.1:<port>` or `http://localhost:<port>` for the gateway's
@@ -297,6 +338,34 @@ pub async fn token_summary(
         .ok_or_else(|| "access token not found".to_string())
 }
 
+/// The ids of the gateway's access tokens. Every AstrLink on this computer
+/// writes the same client configs, and one written with a token the gateway
+/// lacks belongs to another AstrLink, such as the instance `make dev` runs
+/// beside an installed one. Token ids are random, so no two gateways share
+/// one.
+#[derive(Debug)]
+pub struct Tokens(BTreeSet<String>);
+
+impl Tokens {
+    pub async fn of(manager: &CoreManager) -> Result<Self, String> {
+        let page = manager.list_access_tokens().await?;
+        let items = page["items"]
+            .as_array()
+            .ok_or_else(|| "access token list is invalid".to_string())?;
+        Ok(Self(
+            items
+                .iter()
+                .filter_map(|item| item["id"].as_str())
+                .map(str::to_string)
+                .collect(),
+        ))
+    }
+
+    fn own(&self, record: &ClientRecord) -> bool {
+        self.0.contains(&record.token_id)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClientState {
@@ -304,6 +373,8 @@ pub enum ClientState {
     Configured,
     /// Still AstrLink's, pointing at a port the gateway no longer uses.
     Outdated,
+    /// Another AstrLink's, pointing at its own address.
+    Elsewhere,
     /// A connection key changed since AstrLink wrote it.
     Modified,
     /// Moved to CC Switch, and the connection is not the one AstrLink wrote.
@@ -315,19 +386,45 @@ pub enum ClientState {
 #[derive(Debug, Serialize)]
 pub struct ClientStatus {
     pub client: Client,
+    /// The WSL distribution the client runs in; `None` for the desktop user's.
+    pub wsl: Option<String>,
     pub detected: bool,
     pub paths: Vec<String>,
     pub state: ClientState,
     pub token_id: Option<String>,
+    /// The models a config AstrLink wrote holds now, by `Models` field.
+    pub models: BTreeMap<&'static str, String>,
+}
+
+/// Client configs across the desktop user's home and WSL homes.
+#[derive(Debug, Serialize)]
+pub struct ClientOverview {
+    pub clients: Vec<ClientStatus>,
+    /// WSL distributions whose clients were not checked.
+    pub wsl_unchecked: Vec<String>,
+    /// Whether WSL clients reach the gateway at `localhost`.
+    pub wsl_localhost: bool,
+    /// Where CC Switch's import writes Claude Code and Codex.
+    pub cc_switch_wsl: CcSwitchWsl,
+}
+
+/// The WSL distribution whose config CC Switch writes, by client; `None` for
+/// the desktop user's.
+#[derive(Debug, Serialize)]
+pub struct CcSwitchWsl {
+    pub claude: Option<String>,
+    pub codex: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ApplyOutcome {
     Applied,
-    /// Nothing was written: these keys hold values AstrLink did not write.
+    /// Nothing was written: `keys` hold values AstrLink did not write, or
+    /// the config connects to another AstrLink at the `gateway` base URL.
     NeedsConfirmation {
         keys: Vec<String>,
+        gateway: Option<String>,
     },
 }
 
@@ -379,16 +476,25 @@ impl Records {
     }
 
     /// Once the user moved a client to CC Switch, a connection AstrLink did
-    /// not write is CC Switch's, not a change to its own config.
+    /// not write is CC Switch's, not a change to its own config. Without the
+    /// gateway's `tokens`, another AstrLink's config reads as outdated.
     fn state(
         &self,
         client: Client,
         existing: &[Option<&str>],
         origin: Option<&str>,
+        tokens: Option<&Tokens>,
     ) -> ClientState {
         match inspect(client, existing, self.get(client), origin) {
             ClientState::NotConfigured | ClientState::Modified if self.handed_over(client) => {
                 ClientState::CcSwitch
+            }
+            ClientState::Outdated
+                if tokens
+                    .zip(self.get(client))
+                    .is_some_and(|(tokens, record)| !tokens.own(record)) =>
+            {
+                ClientState::Elsewhere
             }
             state => state,
         }
@@ -493,21 +599,218 @@ fn json_parent(object: &CstObject, parents: &[&str]) -> Option<CstObject> {
         .try_fold(object.clone(), |parent, name| parent.object_value(name))
 }
 
-/// The model a Pi model list names when it is exactly `[{"id": <model>}]`;
-/// any other list is not one AstrLink wrote.
-fn single_model(value: &CstNode) -> Option<String> {
-    let entries = value.as_array()?.elements();
-    let [entry] = entries.as_slice() else {
-        return None;
-    };
-    let properties = entry.as_object()?.properties();
-    let [id] = properties.as_slice() else {
-        return None;
-    };
-    if id.decoded_name()? != "id" {
-        return None;
+/// The one entry of a Pi model list AstrLink wrote: the model, and the
+/// reasoning flag and thinking level map AstrLink adds. A list with more
+/// entries or other fields is not one AstrLink wrote.
+#[derive(Debug, PartialEq, Eq)]
+struct PiModel {
+    id: String,
+    reasoning: Option<bool>,
+    /// Pi's thinking levels in `PI_THINKING_LEVELS` order, each with the
+    /// effort it sends or `None` where the model lacks the level.
+    thinking: Option<Vec<(&'static str, Option<String>)>>,
+    context_window: Option<u64>,
+    max_tokens: Option<u64>,
+}
+
+/// What AstrLink writes into Pi's entry for the model besides its id.
+#[derive(Default)]
+struct PiDetails {
+    /// The official reasoning levels; `None` when the catalog lists no
+    /// reasoning for the model. A model with no levels to choose keeps Pi's
+    /// default range.
+    reasoning: Option<Vec<String>>,
+    context_window: Option<u64>,
+    max_tokens: Option<u64>,
+}
+
+impl PiModel {
+    fn new(id: &str, details: &PiDetails) -> Self {
+        let mut model = Self::from_id(id);
+        model.context_window = details.context_window;
+        model.max_tokens = details.max_tokens;
+        let Some(levels) = &details.reasoning else {
+            return model;
+        };
+        model.reasoning = Some(true);
+        model.thinking = (!levels.is_empty()).then(|| {
+            PI_THINKING_LEVELS
+                .iter()
+                .map(|level| {
+                    let effort = if *level == "off" { "none" } else { level };
+                    (
+                        *level,
+                        levels
+                            .iter()
+                            .any(|known| known == effort)
+                            .then(|| effort.to_string()),
+                    )
+                })
+                .collect()
+        });
+        model
     }
-    id.value()?.as_string_lit()?.decoded_value().ok()
+
+    fn from_id(id: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            reasoning: None,
+            thinking: None,
+            context_window: None,
+            max_tokens: None,
+        }
+    }
+
+    /// An entry with only the fields AstrLink writes.
+    fn from_json(value: &serde_json::Value) -> Option<Self> {
+        let entry = value.as_object()?;
+        let mut model = Self::from_id(entry.get("id")?.as_str()?);
+        for (key, value) in entry {
+            match key.as_str() {
+                "id" => {}
+                "reasoning" => model.reasoning = Some(value.as_bool()?),
+                "thinkingLevelMap" => {
+                    let map = value.as_object()?;
+                    if map
+                        .keys()
+                        .any(|level| !PI_THINKING_LEVELS.contains(&level.as_str()))
+                    {
+                        return None;
+                    }
+                    let mut thinking = Vec::new();
+                    for level in PI_THINKING_LEVELS {
+                        let Some(effort) = map.get(level) else {
+                            continue;
+                        };
+                        let effort = match effort {
+                            serde_json::Value::Null => None,
+                            effort => Some(effort.as_str()?.to_string()),
+                        };
+                        thinking.push((level, effort));
+                    }
+                    model.thinking = Some(thinking);
+                }
+                "contextWindow" => model.context_window = Some(value.as_u64()?),
+                "maxTokens" => model.max_tokens = Some(value.as_u64()?),
+                _ => return None,
+            }
+        }
+        Some(model)
+    }
+
+    /// The entry a list holding exactly one names.
+    fn read(list: &CstNode) -> Option<Self> {
+        let entries = list.as_array()?.elements();
+        let [entry] = entries.as_slice() else {
+            return None;
+        };
+        Self::from_json(&cst_json(entry)?)
+    }
+
+    /// Reads `value`.
+    fn parse(value: &str) -> Self {
+        serde_json::from_str(value)
+            .ok()
+            .and_then(|value| Self::from_json(&value))
+            .unwrap_or_else(|| Self::from_id(value))
+    }
+
+    /// The key's value: the id alone for `[{"id": <model>}]`, the form
+    /// configs from released builds were recorded with, else the entry as
+    /// JSON with sorted keys, so reformatting the file changes nothing.
+    fn value(&self) -> String {
+        if self.reasoning.is_none()
+            && self.thinking.is_none()
+            && self.context_window.is_none()
+            && self.max_tokens.is_none()
+        {
+            return self.id.clone();
+        }
+        let mut entry = serde_json::Map::new();
+        entry.insert("id".into(), self.id.clone().into());
+        if let Some(reasoning) = self.reasoning {
+            entry.insert("reasoning".into(), reasoning.into());
+        }
+        if let Some(thinking) = &self.thinking {
+            let map = thinking
+                .iter()
+                .map(|(level, effort)| ((*level).to_string(), effort.clone().into()))
+                .collect();
+            entry.insert("thinkingLevelMap".into(), serde_json::Value::Object(map));
+        }
+        if let Some(tokens) = self.context_window {
+            entry.insert("contextWindow".into(), tokens.into());
+        }
+        if let Some(tokens) = self.max_tokens {
+            entry.insert("maxTokens".into(), tokens.into());
+        }
+        serde_json::Value::Object(entry).to_string()
+    }
+
+    /// The list as written, with the levels in Pi's order.
+    fn input(&self) -> CstInputValue {
+        let mut entry = vec![("id".to_string(), CstInputValue::String(self.id.clone()))];
+        if let Some(reasoning) = self.reasoning {
+            entry.push(("reasoning".into(), CstInputValue::Bool(reasoning)));
+        }
+        if let Some(thinking) = &self.thinking {
+            let map = thinking
+                .iter()
+                .map(|(level, effort)| {
+                    let effort = match effort {
+                        Some(effort) => CstInputValue::String(effort.clone()),
+                        None => CstInputValue::Null,
+                    };
+                    ((*level).to_string(), effort)
+                })
+                .collect();
+            entry.push(("thinkingLevelMap".into(), CstInputValue::Object(map)));
+        }
+        if let Some(tokens) = self.context_window {
+            entry.push((
+                "contextWindow".into(),
+                CstInputValue::Number(tokens.to_string()),
+            ));
+        }
+        if let Some(tokens) = self.max_tokens {
+            entry.push((
+                "maxTokens".into(),
+                CstInputValue::Number(tokens.to_string()),
+            ));
+        }
+        CstInputValue::Array(vec![CstInputValue::Object(entry)])
+    }
+}
+
+/// The value of a node from a file Pi reads.
+fn cst_json(node: &CstNode) -> Option<serde_json::Value> {
+    if let Some(object) = node.as_object() {
+        let mut map = serde_json::Map::new();
+        for property in object.properties() {
+            map.insert(property.decoded_name()?, cst_json(&property.value()?)?);
+        }
+        return Some(serde_json::Value::Object(map));
+    }
+    if let Some(array) = node.as_array() {
+        return array
+            .elements()
+            .iter()
+            .map(cst_json)
+            .collect::<Option<_>>()
+            .map(serde_json::Value::Array);
+    }
+    if let Some(text) = node.as_string_lit() {
+        return text.decoded_value().ok().map(serde_json::Value::String);
+    }
+    if let Some(boolean) = node.as_boolean_lit() {
+        return Some(serde_json::Value::Bool(boolean.value()));
+    }
+    if let Some(number) = node.as_number_lit() {
+        return serde_json::from_str::<serde_json::Number>(&number.to_string())
+            .ok()
+            .map(serde_json::Value::Number);
+    }
+    node.as_null_keyword().map(|_| serde_json::Value::Null)
 }
 
 /// Rejects what the client itself cannot read. Claude Code and Pi's
@@ -694,7 +997,10 @@ impl Document {
                 let (parents, name) = json_key(path);
                 let value = json_parent(object, parents)?.get(name)?.value();
                 Some(if path == PI_MODELS_KEY {
-                    value.as_ref().and_then(single_model)
+                    value
+                        .as_ref()
+                        .and_then(PiModel::read)
+                        .map(|model| model.value())
                 } else {
                     value
                         .and_then(|value| value.as_string_lit())
@@ -817,10 +1123,7 @@ impl Document {
                         .ok_or_else(|| format!("has a {segment} value that is not an object"))?;
                 }
                 let value = if path == PI_MODELS_KEY {
-                    CstInputValue::Array(vec![CstInputValue::Object(vec![(
-                        "id".into(),
-                        CstInputValue::String(value.into()),
-                    )])])
+                    PiModel::parse(value).input()
                 } else {
                     CstInputValue::String(value.into())
                 };
@@ -1092,7 +1395,8 @@ pub struct Connection<'a> {
     pub models: &'a [(&'static str, String)],
 }
 
-fn desired_keys(client: Client, connection: &Connection) -> Vec<(String, String)> {
+/// `pi` is what Pi's entry for the model says besides its id.
+fn desired_keys(client: Client, connection: &Connection, pi: &PiDetails) -> Vec<(String, String)> {
     let base_url = client.base_url(connection.origin);
     let model = |field: &str| {
         connection
@@ -1131,7 +1435,8 @@ fn desired_keys(client: Client, connection: &Connection) -> Vec<(String, String)
                 keys.push((format!("{PI_PROVIDER_PREFIX}{key}"), value.into()));
             }
             if let Some(model) = model("model") {
-                keys.push((PI_MODELS_KEY.into(), model.clone()));
+                let entry = PiModel::new(&model, pi);
+                keys.push((PI_MODELS_KEY.into(), entry.value()));
                 keys.push(("defaultProvider".into(), PI_PROVIDER.into()));
                 keys.push(("defaultModel".into(), model));
             }
@@ -1141,15 +1446,9 @@ fn desired_keys(client: Client, connection: &Connection) -> Vec<(String, String)
             // AUTH_TOKEN, not API_KEY: an API key asks for approval in the
             // interactive client and conflicts with a login.
             keys.push(("env.ANTHROPIC_AUTH_TOKEN".into(), connection.token.into()));
-            for (field, key) in [
-                ("model", "ANTHROPIC_MODEL"),
-                ("haikuModel", "ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-                ("sonnetModel", "ANTHROPIC_DEFAULT_SONNET_MODEL"),
-                ("opusModel", "ANTHROPIC_DEFAULT_OPUS_MODEL"),
-                ("fableModel", "ANTHROPIC_DEFAULT_FABLE_MODEL"),
-            ] {
+            for (field, path) in CLAUDE_MODEL_KEYS {
                 if let Some(model) = model(field) {
-                    keys.push((format!("env.{key}"), model));
+                    keys.push((path.into(), model));
                 }
             }
         }
@@ -1182,8 +1481,25 @@ pub fn plan_write(
     connection: &Connection,
     previous: Option<&ClientRecord>,
 ) -> Result<WritePlan, FileError> {
+    plan_write_with(
+        client,
+        existing,
+        connection,
+        &PiDetails::default(),
+        previous,
+    )
+}
+
+/// `plan_write` with what Pi's entry for the model says besides its id.
+fn plan_write_with(
+    client: Client,
+    existing: &[Option<&str>],
+    connection: &Connection,
+    pi: &PiDetails,
+    previous: Option<&ClientRecord>,
+) -> Result<WritePlan, FileError> {
     let mut config = Config::parse(client, existing)?;
-    let desired = desired_keys(client, connection);
+    let desired = desired_keys(client, connection, pi);
     let mut conflicts = Vec::new();
     for (path, value) in config.group() {
         let wanted = desired.iter().find(|(key, _)| *key == path);
@@ -1280,6 +1596,67 @@ pub fn inspect(
         Some(origin) if record.base_url != client.base_url(origin) => ClientState::Outdated,
         _ => ClientState::Configured,
     }
+}
+
+/// The models a client's config holds now, by the `Models` field each would
+/// be written from. The client may have picked them itself since, like with
+/// Codex's `/model`. Names AstrLink could not write back are left out.
+fn current_models(client: Client, existing: &[Option<&str>]) -> BTreeMap<&'static str, String> {
+    let Ok(config) = Config::parse(client, existing) else {
+        return BTreeMap::new();
+    };
+    let read = |path: &str| {
+        config
+            .get(path)
+            .flatten()
+            .map(|value| {
+                if path == PI_MODELS_KEY {
+                    PiModel::parse(&value).id
+                } else {
+                    value
+                }
+            })
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty() && valid_model(value))
+    };
+    let models = match client {
+        Client::Codex => vec![("model", read("model"))],
+        // The model Pi starts with on AstrLink, else the one AstrLink's list
+        // offers.
+        Client::Pi => {
+            let starts_here =
+                config.get("defaultProvider").flatten().as_deref() == Some(PI_PROVIDER);
+            let startup = starts_here.then(|| read("defaultModel")).flatten();
+            let entry = config
+                .get(PI_MODELS_KEY)
+                .flatten()
+                .map(|value| PiModel::parse(&value));
+            let limit = |tokens: Option<u64>| {
+                tokens
+                    .filter(|tokens| (1..=MAX_PI_LIMIT).contains(tokens))
+                    .map(|tokens| tokens.to_string())
+            };
+            vec![
+                ("model", startup.or_else(|| read(PI_MODELS_KEY))),
+                (
+                    "contextWindow",
+                    entry.as_ref().and_then(|entry| limit(entry.context_window)),
+                ),
+                (
+                    "maxTokens",
+                    entry.as_ref().and_then(|entry| limit(entry.max_tokens)),
+                ),
+            ]
+        }
+        _ => CLAUDE_MODEL_KEYS
+            .iter()
+            .map(|(field, path)| (*field, read(path)))
+            .collect(),
+    };
+    models
+        .into_iter()
+        .filter_map(|(field, model)| Some((field, model?)))
+        .collect()
 }
 
 /// Points an untouched config at the gateway's new port, and adds the keys
@@ -1392,28 +1769,39 @@ fn write_files(
     Ok(())
 }
 
-pub fn status(home: &Path, inference_url: Option<&str>) -> Result<Vec<ClientStatus>, String> {
+pub fn status(
+    home: Home,
+    inference_url: Option<&str>,
+    tokens: Option<&Tokens>,
+) -> Result<Vec<ClientStatus>, String> {
     let origin = inference_url.map(local_origin).transpose()?;
     let _lock = host_files::lock();
-    let records = read_records(home)?;
+    let records = read_records(&home)?;
     let mut statuses = Vec::new();
     for client in Client::WRITABLE {
         let paths = client.config_paths(home);
         let existing = read_files(&paths)?;
         let record = records.get(client);
-        let state = records.state(client, &texts(&existing), origin.as_deref());
+        let state = records.state(client, &texts(&existing), origin.as_deref(), tokens);
+        // Only a config AstrLink wrote names its token and models.
+        let token_id = record
+            .filter(|_| !matches!(state, ClientState::NotConfigured | ClientState::CcSwitch))
+            .map(|record| record.token_id.clone());
         statuses.push(ClientStatus {
             client,
+            wsl: home.distribution().map(str::to_string),
             detected: client.detected(home),
             paths: paths
                 .iter()
                 .map(|path| path.display().to_string())
                 .collect(),
             state,
-            // Only a config AstrLink wrote names its token.
-            token_id: record
-                .filter(|_| !matches!(state, ClientState::NotConfigured | ClientState::CcSwitch))
-                .map(|record| record.token_id.clone()),
+            models: if token_id.is_some() {
+                current_models(client, &texts(&existing))
+            } else {
+                BTreeMap::new()
+            },
+            token_id,
         });
     }
     Ok(statuses)
@@ -1421,7 +1809,7 @@ pub fn status(home: &Path, inference_url: Option<&str>) -> Result<Vec<ClientStat
 
 pub async fn apply(
     manager: &CoreManager,
-    home: PathBuf,
+    target: OwnedHome,
     token_id: String,
     client: Client,
     models: &Models,
@@ -1430,14 +1818,33 @@ pub async fn apply(
 ) -> Result<ApplyOutcome, String> {
     let client = client.writable()?;
     let origin = local_origin(&inference_url)?;
+    let (context_window, max_tokens) = models.pi_limits(client)?;
     let models = models.fields(client)?;
-    if !client.detected(&home) {
+    if !client.detected(target.home()) {
         return Err("this client is not installed for the current user".into());
     }
     let token = reveal_access_token(manager, &token_id, &inference_url).await?;
+    let tokens = Tokens::of(manager).await?;
+    // Pi offers thinking levels only for a model its entry says reasons.
+    // Without the levels the model is still written, without thinking.
+    let reasoning = match models.iter().find(|(field, _)| *field == "model") {
+        Some((_, model)) if client == Client::Pi => manager
+            .official_reasoning(model)
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!("reasoning levels for {model} are unavailable: {error}");
+                None
+            }),
+        _ => None,
+    };
+    let pi = PiDetails {
+        reasoning,
+        context_window,
+        max_tokens,
+    };
     tauri::async_runtime::spawn_blocking(move || {
-        write(
-            &home,
+        write_with(
+            target.home(),
             client,
             &Connection {
                 token_id: &token_id,
@@ -1445,6 +1852,8 @@ pub async fn apply(
                 origin: &origin,
                 models: &models,
             },
+            &pi,
+            &tokens,
             replace,
         )
     })
@@ -1452,46 +1861,88 @@ pub async fn apply(
     .map_err(|error| error.to_string())?
 }
 
-pub fn write(
-    home: &Path,
+/// `write_with` for a model the official catalog lists no reasoning for.
+#[cfg(test)]
+fn write(
+    home: Home,
     client: Client,
     connection: &Connection,
+    tokens: &Tokens,
+    replace: bool,
+) -> Result<ApplyOutcome, String> {
+    write_with(
+        home,
+        client,
+        connection,
+        &PiDetails::default(),
+        tokens,
+        replace,
+    )
+}
+
+/// `tokens` are the gateway's, so a config another AstrLink wrote moves here
+/// only once the user confirms. `pi` is what Pi's entry for the model says
+/// besides its id.
+fn write_with(
+    home: Home,
+    client: Client,
+    connection: &Connection,
+    pi: &PiDetails,
+    tokens: &Tokens,
     replace: bool,
 ) -> Result<ApplyOutcome, String> {
     let client = client.writable()?;
     let _lock = host_files::lock();
-    let mut records = read_records(home)?;
+    let mut records = read_records(&home)?;
     let paths = client.config_paths(home);
     let existing = read_files(&paths)?;
-    let plan = plan_write(client, &texts(&existing), connection, records.get(client))
-        .map_err(|error| error.at(&paths))?;
-    if !plan.conflicts.is_empty() && !replace {
+    let plan = plan_write_with(
+        client,
+        &texts(&existing),
+        connection,
+        pi,
+        records.get(client),
+    )
+    .map_err(|error| error.at(&paths))?;
+    let gateway = records
+        .get(client)
+        .filter(|_| {
+            records.state(
+                client,
+                &texts(&existing),
+                Some(connection.origin),
+                Some(tokens),
+            ) == ClientState::Elsewhere
+        })
+        .map(|record| record.base_url.clone());
+    if (!plan.conflicts.is_empty() || gateway.is_some()) && !replace {
         return Ok(ApplyOutcome::NeedsConfirmation {
             keys: plan.conflicts,
+            gateway,
         });
     }
     let previous = records.slot(client).replace(plan.record);
     // Writing takes the client back from CC Switch.
     let handed_over = records.handed_over(client);
     records.set_handed_over(client, false);
-    write_records(home, &mut records)?;
+    write_records(&home, &mut records)?;
     if let Err(error) = write_files(&paths, &existing, &plan.contents) {
         *records.slot(client) = previous;
         records.set_handed_over(client, handed_over);
-        let _ = write_records(home, &mut records);
+        let _ = write_records(&home, &mut records);
         return Err(error);
     }
     Ok(ApplyOutcome::Applied)
 }
 
-pub fn remove(home: &Path, client: Client) -> Result<(), String> {
+pub fn remove(home: Home, client: Client) -> Result<(), String> {
     let client = client.writable()?;
     let _lock = host_files::lock();
-    let mut records = read_records(home)?;
+    let mut records = read_records(&home)?;
     let Some(record) = records.get(client).cloned() else {
         if records.handed_over(client) {
             records.set_handed_over(client, false);
-            write_records(home, &mut records)?;
+            write_records(&home, &mut records)?;
         }
         return Ok(());
     };
@@ -1499,7 +1950,8 @@ pub fn remove(home: &Path, client: Client) -> Result<(), String> {
     let existing = read_files(&paths)?;
     // CC Switch rewrites some keys with the values AstrLink wrote, so the
     // files of a client it holds are left to it.
-    let removals = if records.state(client, &texts(&existing), None) == ClientState::CcSwitch {
+    let removals = if records.state(client, &texts(&existing), None, None) == ClientState::CcSwitch
+    {
         Vec::new()
     } else {
         plan_remove(client, &texts(&existing), &record).map_err(|error| error.at(&paths))?
@@ -1528,33 +1980,38 @@ pub fn remove(home: &Path, client: Client) -> Result<(), String> {
     }
     *records.slot(client) = None;
     records.set_handed_over(client, false);
-    write_records(home, &mut records)
+    write_records(&home, &mut records)
 }
 
 /// Records whether the user moved a client AstrLink writes to CC Switch, and
 /// returns whether the record changed. Other clients have no record.
-pub fn set_cc_switch(home: &Path, client: Client, handed_over: bool) -> Result<bool, String> {
+pub fn set_cc_switch(home: Home, client: Client, handed_over: bool) -> Result<bool, String> {
     if !Client::WRITABLE.contains(&client) {
         return Ok(false);
     }
     let _lock = host_files::lock();
-    let mut records = read_records(home)?;
+    let mut records = read_records(&home)?;
     if records.handed_over(client) == handed_over {
         return Ok(false);
     }
     records.set_handed_over(client, handed_over);
-    write_records(home, &mut records)?;
+    write_records(&home, &mut records)?;
     Ok(true)
 }
 
-/// Moves every untouched config to the gateway's current address.
-pub fn sync(home: &Path, inference_url: &str) -> Result<(), String> {
+/// Moves every untouched config the gateway wrote with one of its `tokens`
+/// to its current address. Another AstrLink's configs stay pointed at it.
+pub fn sync(home: Home, inference_url: &str, tokens: &Tokens) -> Result<(), String> {
     let origin = local_origin(inference_url)?;
     let _lock = host_files::lock();
-    let mut records = read_records(home)?;
+    let mut records = read_records(&home)?;
     let mut errors = Vec::new();
     for client in Client::WRITABLE {
-        let Some(record) = records.get(client).cloned() else {
+        let Some(record) = records
+            .get(client)
+            .filter(|record| tokens.own(record))
+            .cloned()
+        else {
             continue;
         };
         let paths = client.config_paths(home);
@@ -1566,11 +2023,11 @@ pub fn sync(home: &Path, inference_url: &str) -> Result<(), String> {
                 return Ok(());
             };
             *records.slot(client) = Some(next);
-            write_records(home, &mut records)?;
+            write_records(&home, &mut records)?;
             let written = write_files(&paths, &existing, &contents);
             if written.is_err() {
                 *records.slot(client) = Some(record.clone());
-                let _ = write_records(home, &mut records);
+                let _ = write_records(&home, &mut records);
             }
             written
         })();
@@ -1617,6 +2074,11 @@ mod tests {
             origin: ORIGIN,
             models,
         }
+    }
+
+    /// The tokens of the gateway `connection` writes for.
+    fn tokens() -> Tokens {
+        Tokens(BTreeSet::from(["token_01".to_string()]))
     }
 
     fn codex_models() -> Vec<(&'static str, String)> {
@@ -2105,18 +2567,108 @@ mod tests {
     fn only_claude_codex_and_pi_are_written_directly() {
         let home = unique_home("unsupported");
         for client in [Client::Gemini, Client::Opencode, Client::Openclaw] {
-            let error = write(&home, client, &connection(&codex_models()), true).unwrap_err();
+            let error = write(
+                Home::local(&home),
+                client,
+                &connection(&codex_models()),
+                &tokens(),
+                true,
+            )
+            .unwrap_err();
             assert!(!error.contains(TOKEN));
-            assert!(remove(&home, client).is_err());
+            assert!(remove(Home::local(&home), client).is_err());
             assert!(snippet(client, &connection(&codex_models())).is_err());
         }
-        let clients = status(&home, Some("http://127.0.0.1:18317/"))
-            .unwrap()
-            .into_iter()
-            .map(|status| status.client)
-            .collect::<Vec<_>>();
+        let clients = status(
+            Home::local(&home),
+            Some("http://127.0.0.1:18317/"),
+            Some(&tokens()),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|status| status.client)
+        .collect::<Vec<_>>();
         assert_eq!(clients, [Client::Claude, Client::Codex, Client::Pi]);
         fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn moved_dirs_and_wsl_homes_hold_their_own_configs() {
+        use crate::{agent_home::ToolDirs, wsl::WslHome};
+
+        let host = unique_home("moved-host");
+        let claude = host.join("work").join("claude");
+        let pi = host.join("work").join("pi-agent");
+        fs::create_dir_all(&claude).unwrap();
+        fs::create_dir_all(&pi).unwrap();
+        let dirs = ToolDirs {
+            claude: Some(claude.clone()),
+            pi: Some(pi.clone()),
+            ..Default::default()
+        };
+        let local = crate::agent_home::homes(&host, &dirs, &[]).next().unwrap();
+        assert!(Client::Pi.detected(local));
+        write(local, Client::Claude, &connection(&[]), &tokens(), false).unwrap();
+        write(
+            local,
+            Client::Pi,
+            &connection(&pi_models()),
+            &tokens(),
+            false,
+        )
+        .unwrap();
+        assert!(claude.join("settings.json").is_file());
+        assert!(pi.join("models.json").is_file() && pi.join("settings.json").is_file());
+        assert!(!host.join(".claude").join("settings.json").exists());
+        assert!(!host.join(".pi").exists());
+
+        let share = unique_home("moved-share");
+        let wsl = WslHome {
+            distribution: "Ubuntu".to_string(),
+            share: share.clone(),
+            mount_root: "/mnt".to_string(),
+            dirs: ToolDirs::default(),
+        };
+        let statuses = status(
+            Home::in_wsl(&host, &wsl),
+            Some("http://127.0.0.1:8317/"),
+            Some(&tokens()),
+        )
+        .unwrap();
+        assert!(statuses
+            .iter()
+            .all(|status| status.wsl.as_deref() == Some("Ubuntu")
+                && status.state == ClientState::NotConfigured));
+        let claude_status = statuses
+            .iter()
+            .find(|status| status.client == Client::Claude)
+            .unwrap();
+        assert!(claude_status.detected);
+        assert_eq!(
+            claude_status.paths,
+            [share
+                .join(".claude")
+                .join("settings.json")
+                .display()
+                .to_string()]
+        );
+        // Each home keeps its own records.
+        write(
+            Home::in_wsl(&host, &wsl),
+            Client::Claude,
+            &connection(&[]),
+            &tokens(),
+            false,
+        )
+        .unwrap();
+        assert!(records_path(&share).is_file());
+        assert!(share.join(".claude").join("settings.json").is_file());
+        remove(Home::in_wsl(&host, &wsl), Client::Claude).unwrap();
+        assert!(!share.join(".claude").join("settings.json").exists());
+        assert!(read_records(&host).unwrap().claude.is_some());
+        assert!(claude.join("settings.json").is_file());
+        fs::remove_dir_all(host).unwrap();
+        fs::remove_dir_all(share).unwrap();
     }
 
     fn pi_models() -> Vec<(&'static str, String)> {
@@ -2240,6 +2792,230 @@ mod tests {
         );
     }
 
+    fn levels(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn pi_entries_name_the_official_thinking_levels() {
+        let gpt = levels(&["none", "low", "medium", "high", "xhigh", "max"]);
+        let plan = plan_write_with(
+            Client::Pi,
+            &[None, None],
+            &connection(&pi_models()),
+            &PiDetails {
+                reasoning: Some(gpt.clone()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert!(plan.conflicts.is_empty());
+        assert_eq!(
+            json(&plan.contents[0])["providers"]["astrlink"]["models"],
+            serde_json::json!([{"id": "pi-route", "reasoning": true, "thinkingLevelMap": {
+                "off": "none", "minimal": null, "low": "low", "medium": "medium",
+                "high": "high", "xhigh": "xhigh", "max": "max",
+            }}])
+        );
+        // Written in Pi's order, recorded with sorted keys.
+        let text = &plan.contents[0];
+        let at = |needle: &str| text.find(needle).unwrap();
+        assert!(at("\"reasoning\"") < at("\"thinkingLevelMap\"") && at("\"off\"") < at("\"max\""));
+        assert_eq!(
+            plan.record.keys[PI_MODELS_KEY],
+            sha256_hex(
+                r#"{"id":"pi-route","reasoning":true,"thinkingLevelMap":{"high":"high","low":"low","max":"max","medium":"medium","minimal":null,"off":"none","xhigh":"xhigh"}}"#
+            )
+        );
+        let existing = [Some(plan.contents[0].as_str()), Some(&plan.contents[1])];
+        assert_eq!(
+            inspect(Client::Pi, &existing, Some(&plan.record), Some(ORIGIN)),
+            ClientState::Configured
+        );
+        assert_eq!(
+            current_models(Client::Pi, &[existing[0], None]),
+            BTreeMap::from([("model", "pi-route".to_string())])
+        );
+        assert_eq!(
+            plan_remove(Client::Pi, &existing, &plan.record).unwrap()[0],
+            Removal::Delete
+        );
+
+        // A model that cannot answer without reasoning has no off level.
+        let opus = levels(&["low", "medium", "high", "xhigh", "max"]);
+        let plan = plan_write_with(
+            Client::Pi,
+            &[None, None],
+            &connection(&pi_models()),
+            &PiDetails {
+                reasoning: Some(opus.clone()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            json(&plan.contents[0])["providers"]["astrlink"]["models"][0]["thinkingLevelMap"],
+            serde_json::json!({
+                "off": null, "minimal": null, "low": "low", "medium": "medium",
+                "high": "high", "xhigh": "xhigh", "max": "max",
+            })
+        );
+        // One that reasons with no strength to choose keeps Pi's range.
+        let plan = plan_write_with(
+            Client::Pi,
+            &[None, None],
+            &connection(&pi_models()),
+            &PiDetails {
+                reasoning: Some(Vec::new()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            json(&plan.contents[0])["providers"]["astrlink"]["models"],
+            serde_json::json!([{"id": "pi-route", "reasoning": true}])
+        );
+    }
+
+    #[test]
+    fn pi_thinking_levels_reach_released_configs_and_edits_stay_the_users() {
+        let released =
+            plan_write(Client::Pi, &[None, None], &connection(&pi_models()), None).unwrap();
+        let existing = [
+            Some(released.contents[0].as_str()),
+            Some(&released.contents[1]),
+        ];
+        let gpt = levels(&["none", "low", "medium", "high", "xhigh", "max"]);
+        let plan = plan_write_with(
+            Client::Pi,
+            &existing,
+            &connection(&pi_models()),
+            &PiDetails {
+                reasoning: Some(gpt.clone()),
+                ..Default::default()
+            },
+            Some(&released.record),
+        )
+        .unwrap();
+        assert!(plan.conflicts.is_empty());
+        assert!(plan.contents[0].contains("\"thinkingLevelMap\""));
+        // Reformatting the entry keeps it AstrLink's.
+        let compact = json(&plan.contents[0]).to_string();
+        assert_eq!(
+            plan_remove(
+                Client::Pi,
+                &[Some(&compact), Some(&plan.contents[1])],
+                &plan.record
+            )
+            .unwrap()[0],
+            Removal::Delete
+        );
+        // A level the user changed is theirs.
+        let edited = plan.contents[0].replace("\"max\": \"max\"", "\"max\": null");
+        assert_ne!(edited, plan.contents[0]);
+        let existing = [Some(edited.as_str()), Some(&plan.contents[1])];
+        let rewrite = plan_write_with(
+            Client::Pi,
+            &existing,
+            &connection(&pi_models()),
+            &PiDetails {
+                reasoning: Some(gpt.clone()),
+                ..Default::default()
+            },
+            Some(&plan.record),
+        )
+        .unwrap();
+        assert_eq!(rewrite.conflicts, ["providers.astrlink.models"]);
+        assert_eq!(
+            current_models(Client::Pi, &[existing[0], None]),
+            BTreeMap::from([("model", "pi-route".to_string())])
+        );
+        let removals = plan_remove(Client::Pi, &existing, &plan.record).unwrap();
+        let Removal::Write(left) = &removals[0] else {
+            panic!("expected the edited list to stay");
+        };
+        assert_eq!(
+            json(left)["providers"]["astrlink"]["models"][0]["thinkingLevelMap"]["max"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn pi_entries_carry_the_limits_the_user_set() {
+        let pi = PiDetails {
+            reasoning: Some(levels(&["none", "high"])),
+            context_window: Some(400_000),
+            max_tokens: Some(64_000),
+        };
+        let plan = plan_write_with(
+            Client::Pi,
+            &[None, None],
+            &connection(&pi_models()),
+            &pi,
+            None,
+        )
+        .unwrap();
+        let entry = &json(&plan.contents[0])["providers"]["astrlink"]["models"][0];
+        assert_eq!(entry["contextWindow"], 400_000);
+        assert_eq!(entry["maxTokens"], 64_000);
+        let existing = [Some(plan.contents[0].as_str()), Some(&plan.contents[1])];
+        assert_eq!(
+            current_models(Client::Pi, &existing),
+            BTreeMap::from([
+                ("contextWindow", "400000".to_string()),
+                ("maxTokens", "64000".to_string()),
+                ("model", "pi-route".to_string()),
+            ])
+        );
+        // Writing the same entry again changes nothing and asks nothing.
+        let again = plan_write_with(
+            Client::Pi,
+            &existing,
+            &connection(&pi_models()),
+            &pi,
+            Some(&plan.record),
+        )
+        .unwrap();
+        assert!(again.conflicts.is_empty());
+        assert_eq!(again.contents, plan.contents);
+        // Clearing the limits gives Pi its defaults back.
+        let cleared = plan_write_with(
+            Client::Pi,
+            &existing,
+            &connection(&pi_models()),
+            &PiDetails::default(),
+            Some(&plan.record),
+        )
+        .unwrap();
+        assert!(cleared.conflicts.is_empty());
+        assert_eq!(
+            json(&cleared.contents[0])["providers"]["astrlink"]["models"],
+            serde_json::json!([{"id": "pi-route"}])
+        );
+        assert_eq!(
+            plan_remove(Client::Pi, &existing, &plan.record).unwrap()[0],
+            Removal::Delete
+        );
+        let limits = |context_window, max_tokens| Models {
+            model: Some("m".into()),
+            context_window,
+            max_tokens,
+            ..Default::default()
+        };
+        assert_eq!(
+            limits(Some(1), Some(MAX_PI_LIMIT)).pi_limits(Client::Pi),
+            Ok((Some(1), Some(MAX_PI_LIMIT)))
+        );
+        assert!(limits(Some(0), None).pi_limits(Client::Pi).is_err());
+        assert!(limits(None, Some(MAX_PI_LIMIT + 1))
+            .pi_limits(Client::Pi)
+            .is_err());
+        assert!(limits(Some(1), None).pi_limits(Client::Codex).is_err());
+    }
+
     #[test]
     fn pi_files_pi_cannot_read_are_left_alone() {
         for (models, settings, file) in [
@@ -2278,7 +3054,14 @@ mod tests {
         let settings = agent.join("settings.json");
         fs::write(&settings, "{\n  \"theme\": \"dark\"\n}\n").unwrap();
         assert_eq!(
-            write(&home, Client::Pi, &connection(&pi_models()), false).unwrap(),
+            write(
+                Home::local(&home),
+                Client::Pi,
+                &connection(&pi_models()),
+                &tokens(),
+                false
+            )
+            .unwrap(),
             ApplyOutcome::Applied
         );
         let models = agent.join("models.json");
@@ -2286,17 +3069,22 @@ mod tests {
         assert!(fs::read_to_string(&settings)
             .unwrap()
             .contains("\"defaultModel\": \"pi-route\""));
-        let statuses = status(&home, Some("http://127.0.0.1:9000/")).unwrap();
+        let statuses = status(
+            Home::local(&home),
+            Some("http://127.0.0.1:9000/"),
+            Some(&tokens()),
+        )
+        .unwrap();
         assert_eq!(statuses[2].state, ClientState::Outdated);
         assert_eq!(
             statuses[2].paths,
             [models.display().to_string(), settings.display().to_string()]
         );
-        sync(&home, "http://127.0.0.1:9000/").unwrap();
+        sync(Home::local(&home), "http://127.0.0.1:9000/", &tokens()).unwrap();
         assert!(fs::read_to_string(&models)
             .unwrap()
             .contains("http://127.0.0.1:9000/v1"));
-        remove(&home, Client::Pi).unwrap();
+        remove(Home::local(&home), Client::Pi).unwrap();
         assert!(!models.exists());
         assert_eq!(
             json(&fs::read_to_string(&settings).unwrap()),
@@ -2317,7 +3105,14 @@ mod tests {
             home.join(".pi/agent/settings.json"),
         )
         .unwrap();
-        assert!(write(&home, Client::Pi, &connection(&pi_models()), false).is_err());
+        assert!(write(
+            Home::local(&home),
+            Client::Pi,
+            &connection(&pi_models()),
+            &tokens(),
+            false
+        )
+        .is_err());
         assert!(!home.join(".pi/agent/models.json").exists());
         assert!(!records_path(&home).exists());
         fs::remove_dir_all(home).unwrap();
@@ -2329,17 +3124,32 @@ mod tests {
         let settings = home.join(".claude/settings.json");
         let foreign = "{\n  \"env\": {\n    \"ANTHROPIC_API_KEY\": \"sk-secret\"\n  }\n}\n";
         fs::write(&settings, foreign).unwrap();
-        let outcome = write(&home, Client::Claude, &connection(&[]), false).unwrap();
+        let outcome = write(
+            Home::local(&home),
+            Client::Claude,
+            &connection(&[]),
+            &tokens(),
+            false,
+        )
+        .unwrap();
         assert_eq!(
             outcome,
             ApplyOutcome::NeedsConfirmation {
-                keys: vec!["env.ANTHROPIC_API_KEY".into()]
+                keys: vec!["env.ANTHROPIC_API_KEY".into()],
+                gateway: None,
             }
         );
         assert_eq!(fs::read_to_string(&settings).unwrap(), foreign);
         assert!(!records_path(&home).exists());
 
-        let outcome = write(&home, Client::Claude, &connection(&[]), true).unwrap();
+        let outcome = write(
+            Home::local(&home),
+            Client::Claude,
+            &connection(&[]),
+            &tokens(),
+            true,
+        )
+        .unwrap();
         assert_eq!(outcome, ApplyOutcome::Applied);
         let written = fs::read_to_string(&settings).unwrap();
         assert!(!written.contains("sk-secret"));
@@ -2354,14 +3164,94 @@ mod tests {
                 assert_eq!(mode, 0o600);
             }
         }
-        let statuses = status(&home, Some("http://127.0.0.1:18317/")).unwrap();
+        let statuses = status(
+            Home::local(&home),
+            Some("http://127.0.0.1:18317/"),
+            Some(&tokens()),
+        )
+        .unwrap();
         assert_eq!(statuses[0].state, ClientState::Configured);
         assert_eq!(statuses[0].token_id.as_deref(), Some("token_01"));
         assert_eq!(statuses[1].state, ClientState::NotConfigured);
 
-        remove(&home, Client::Claude).unwrap();
+        remove(Home::local(&home), Client::Claude).unwrap();
         assert_eq!(fs::read_to_string(&settings).unwrap(), "{}\n");
         assert!(!records_path(&home).exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn status_names_the_models_written_configs_hold_now() {
+        let home = unique_home("models");
+        fs::create_dir_all(home.join(".pi/agent")).unwrap();
+        let settings = home.join(".claude/settings.json");
+        // A model in a config AstrLink did not write is not its to show.
+        fs::write(&settings, "{\"env\": {\"ANTHROPIC_MODEL\": \"own\"}}\n").unwrap();
+        let models = || {
+            status(Home::local(&home), None, None)
+                .unwrap()
+                .into_iter()
+                .map(|status| status.models)
+                .collect::<Vec<_>>()
+        };
+        assert!(models().iter().all(BTreeMap::is_empty));
+
+        let claude = [
+            ("model", "main-route".to_string()),
+            ("opusModel", "opus-route".to_string()),
+        ];
+        for (client, models) in [
+            (Client::Claude, &claude[..]),
+            (Client::Codex, &codex_models()[..]),
+            (Client::Pi, &pi_models()[..]),
+        ] {
+            write(
+                Home::local(&home),
+                client,
+                &connection(models),
+                &tokens(),
+                true,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            models(),
+            [
+                BTreeMap::from([
+                    ("model", "main-route".into()),
+                    ("opusModel", "opus-route".into())
+                ]),
+                BTreeMap::from([("model", "gpt-route".into())]),
+                BTreeMap::from([("model", "pi-route".into())]),
+            ]
+        );
+
+        // Models the clients picked since are the current ones, and a name
+        // AstrLink could not write back is left out.
+        let edit = |path: PathBuf, from: &str, to: &str| {
+            let text = fs::read_to_string(&path).unwrap();
+            assert!(text.contains(from));
+            fs::write(&path, text.replace(from, to)).unwrap();
+        };
+        edit(settings, "opus-route", &"x".repeat(257));
+        edit(
+            home.join(".codex/config.toml"),
+            "gpt-route",
+            "picked-in-tui",
+        );
+        let pi_settings = home.join(".pi/agent/settings.json");
+        edit(pi_settings.clone(), "\"pi-route\"", "\"pi-mini\"");
+        assert_eq!(
+            models(),
+            [
+                BTreeMap::from([("model", "main-route".into())]),
+                BTreeMap::from([("model", "picked-in-tui".into())]),
+                BTreeMap::from([("model", "pi-mini".into())]),
+            ]
+        );
+        // Pi starting on another provider still lists AstrLink's model.
+        edit(pi_settings, "\"astrlink\"", "\"anthropic\"");
+        assert_eq!(models()[2], BTreeMap::from([("model", "pi-route".into())]));
         fs::remove_dir_all(home).unwrap();
     }
 
@@ -2371,11 +3261,18 @@ mod tests {
         let auth = home.join(".codex/auth.json");
         let login = "{\"auth_mode\": \"chatgpt\", \"tokens\": {}}\n";
         fs::write(&auth, login).unwrap();
-        write(&home, Client::Codex, &connection(&codex_models()), false).unwrap();
-        sync(&home, "http://127.0.0.1:9000/").unwrap();
+        write(
+            Home::local(&home),
+            Client::Codex,
+            &connection(&codex_models()),
+            &tokens(),
+            false,
+        )
+        .unwrap();
+        sync(Home::local(&home), "http://127.0.0.1:9000/", &tokens()).unwrap();
         let config = fs::read_to_string(home.join(".codex/config.toml")).unwrap();
         assert!(config.contains("base_url = \"http://127.0.0.1:9000/v1\""));
-        remove(&home, Client::Codex).unwrap();
+        remove(Home::local(&home), Client::Codex).unwrap();
         assert!(!home.join(".codex/config.toml").exists());
         assert_eq!(fs::read_to_string(&auth).unwrap(), login);
         let entries = fs::read_dir(home.join(".codex"))
@@ -2389,8 +3286,22 @@ mod tests {
     #[test]
     fn sync_leaves_modified_and_unreadable_configs_alone() {
         let home = unique_home("sync");
-        write(&home, Client::Claude, &connection(&[]), false).unwrap();
-        write(&home, Client::Codex, &connection(&codex_models()), false).unwrap();
+        write(
+            Home::local(&home),
+            Client::Claude,
+            &connection(&[]),
+            &tokens(),
+            false,
+        )
+        .unwrap();
+        write(
+            Home::local(&home),
+            Client::Codex,
+            &connection(&codex_models()),
+            &tokens(),
+            false,
+        )
+        .unwrap();
         let settings = home.join(".claude/settings.json");
         let edited = fs::read_to_string(&settings)
             .unwrap()
@@ -2398,18 +3309,82 @@ mod tests {
         fs::write(&settings, &edited).unwrap();
         let broken = "token = \"astr_x\n";
         fs::write(home.join(".codex/config.toml"), broken).unwrap();
-        sync(&home, "http://127.0.0.1:9000/").unwrap();
+        sync(Home::local(&home), "http://127.0.0.1:9000/", &tokens()).unwrap();
         assert_eq!(fs::read_to_string(&settings).unwrap(), edited);
         assert_eq!(
             fs::read_to_string(home.join(".codex/config.toml")).unwrap(),
             broken
         );
-        let statuses = status(&home, Some("http://127.0.0.1:9000/")).unwrap();
+        let statuses = status(
+            Home::local(&home),
+            Some("http://127.0.0.1:9000/"),
+            Some(&tokens()),
+        )
+        .unwrap();
         assert_eq!(statuses[0].state, ClientState::Modified);
         assert_eq!(statuses[1].state, ClientState::Invalid);
-        let error = remove(&home, Client::Codex).unwrap_err();
+        let error = remove(Home::local(&home), Client::Codex).unwrap_err();
         assert!(error.contains("config.toml") && error.contains("TOML"));
         assert!(!error.contains("astr_x"));
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn another_astrlinks_config_moves_here_only_once_confirmed() {
+        let home = unique_home("elsewhere");
+        let config = home.join(".codex/config.toml");
+        let models = codex_models();
+        let other = Tokens(BTreeSet::from(["token_02".to_string()]));
+        let theirs = Connection {
+            token_id: "token_02",
+            token: OTHER_TOKEN,
+            origin: "http://127.0.0.1:8317",
+            models: &models,
+        };
+        write(Home::local(&home), Client::Codex, &theirs, &other, false).unwrap();
+        let written = fs::read_to_string(&config).unwrap();
+        let codex = |tokens: Option<&Tokens>| {
+            status(Home::local(&home), Some("http://127.0.0.1:18317/"), tokens)
+                .unwrap()
+                .remove(1)
+        };
+        let elsewhere = codex(Some(&tokens()));
+        assert_eq!(elsewhere.state, ClientState::Elsewhere);
+        assert_eq!(elsewhere.token_id.as_deref(), Some("token_02"));
+        assert_eq!(codex(None).state, ClientState::Outdated);
+        sync(Home::local(&home), "http://127.0.0.1:18317/", &tokens()).unwrap();
+        assert_eq!(fs::read_to_string(&config).unwrap(), written);
+
+        assert_eq!(
+            write(
+                Home::local(&home),
+                Client::Codex,
+                &connection(&models),
+                &tokens(),
+                false
+            )
+            .unwrap(),
+            ApplyOutcome::NeedsConfirmation {
+                keys: Vec::new(),
+                gateway: Some("http://127.0.0.1:8317/v1".into()),
+            }
+        );
+        assert_eq!(fs::read_to_string(&config).unwrap(), written);
+        write(
+            Home::local(&home),
+            Client::Codex,
+            &connection(&models),
+            &tokens(),
+            true,
+        )
+        .unwrap();
+        let switched = fs::read_to_string(&config).unwrap();
+        assert!(switched.contains(&format!("base_url = \"{ORIGIN}/v1\"")));
+        assert!(switched.contains(TOKEN));
+        assert_eq!(codex(Some(&tokens())).state, ClientState::Configured);
+        // The other AstrLink leaves it here in turn.
+        sync(Home::local(&home), "http://127.0.0.1:8317/", &other).unwrap();
+        assert_eq!(fs::read_to_string(&config).unwrap(), switched);
         fs::remove_dir_all(home).unwrap();
     }
 
@@ -2417,7 +3392,14 @@ mod tests {
     fn a_client_moved_to_cc_switch_is_left_to_it_once_cc_switch_switches() {
         let home = unique_home("cc-switch");
         let config = home.join(".codex/config.toml");
-        write(&home, Client::Codex, &connection(&codex_models()), false).unwrap();
+        write(
+            Home::local(&home),
+            Client::Codex,
+            &connection(&codex_models()),
+            &tokens(),
+            false,
+        )
+        .unwrap();
         let written = fs::read_to_string(&config).unwrap();
         // CC Switch's switch takes over the route and model keys and adds its
         // own provider table; AstrLink's table stays behind.
@@ -2431,33 +3413,52 @@ mod tests {
                 "\n[model_providers.custom]\nname = \"AstrLink · VS Code\"\nbase_url = \"{ORIGIN}/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"{TOKEN}\"\n"
             );
         let codex = |home: &Path| {
-            status(home, Some("http://127.0.0.1:18317/"))
-                .unwrap()
-                .remove(1)
+            status(
+                Home::local(home),
+                Some("http://127.0.0.1:18317/"),
+                Some(&tokens()),
+            )
+            .unwrap()
+            .remove(1)
         };
         fs::write(&config, &switched).unwrap();
         assert_eq!(codex(&home).state, ClientState::Modified);
 
         // The move counts once CC Switch replaces AstrLink's connection.
         fs::write(&config, &written).unwrap();
-        assert!(set_cc_switch(&home, Client::Codex, true).unwrap());
-        assert!(!set_cc_switch(&home, Client::Codex, true).unwrap());
+        assert!(set_cc_switch(Home::local(&home), Client::Codex, true).unwrap());
+        assert!(!set_cc_switch(Home::local(&home), Client::Codex, true).unwrap());
         assert_eq!(codex(&home).state, ClientState::Configured);
         fs::write(&config, &switched).unwrap();
         let moved = codex(&home);
         assert_eq!(moved.state, ClientState::CcSwitch);
         assert_eq!(moved.token_id, None);
-        sync(&home, "http://127.0.0.1:9000/").unwrap();
+        sync(Home::local(&home), "http://127.0.0.1:9000/", &tokens()).unwrap();
         assert_eq!(fs::read_to_string(&config).unwrap(), switched);
 
         // Writing takes it back, asking only about the route CC Switch chose.
         assert_eq!(
-            write(&home, Client::Codex, &connection(&codex_models()), false).unwrap(),
+            write(
+                Home::local(&home),
+                Client::Codex,
+                &connection(&codex_models()),
+                &tokens(),
+                false
+            )
+            .unwrap(),
             ApplyOutcome::NeedsConfirmation {
-                keys: vec!["model_provider".into()]
+                keys: vec!["model_provider".into()],
+                gateway: None,
             }
         );
-        write(&home, Client::Codex, &connection(&codex_models()), true).unwrap();
+        write(
+            Home::local(&home),
+            Client::Codex,
+            &connection(&codex_models()),
+            &tokens(),
+            true,
+        )
+        .unwrap();
         let rewritten = fs::read_to_string(&config).unwrap();
         assert!(rewritten.contains("model_provider = \"astrlink\""));
         assert!(rewritten.contains("model_reasoning_effort = \"high\""));
@@ -2474,20 +3475,30 @@ mod tests {
         let home = unique_home("cc-switch-remove");
         let settings = home.join(".claude/settings.json");
         let models = vec![("model", "main-route".to_string())];
-        write(&home, Client::Claude, &connection(&models), false).unwrap();
-        set_cc_switch(&home, Client::Claude, true).unwrap();
+        write(
+            Home::local(&home),
+            Client::Claude,
+            &connection(&models),
+            &tokens(),
+            false,
+        )
+        .unwrap();
+        set_cc_switch(Home::local(&home), Client::Claude, true).unwrap();
         // A CC Switch provider with another token keeps the address and model
         // AstrLink wrote, which removal would otherwise take for its own.
         let switched = fs::read_to_string(&settings)
             .unwrap()
             .replace(TOKEN, OTHER_TOKEN);
         fs::write(&settings, &switched).unwrap();
-        assert_eq!(status(&home, None).unwrap()[0].state, ClientState::CcSwitch);
-        remove(&home, Client::Claude).unwrap();
+        assert_eq!(
+            status(Home::local(&home), None, None).unwrap()[0].state,
+            ClientState::CcSwitch
+        );
+        remove(Home::local(&home), Client::Claude).unwrap();
         assert_eq!(fs::read_to_string(&settings).unwrap(), switched);
         assert!(!records_path(&home).exists());
         assert_eq!(
-            status(&home, None).unwrap()[0].state,
+            status(Home::local(&home), None, None).unwrap()[0].state,
             ClientState::NotConfigured
         );
         fs::remove_dir_all(home).unwrap();
@@ -2496,14 +3507,14 @@ mod tests {
     #[test]
     fn moves_are_noted_only_for_clients_astrlink_writes() {
         let home = unique_home("cc-switch-only");
-        assert!(!set_cc_switch(&home, Client::Gemini, true).unwrap());
+        assert!(!set_cc_switch(Home::local(&home), Client::Gemini, true).unwrap());
         assert!(!records_path(&home).exists());
-        assert!(set_cc_switch(&home, Client::Codex, true).unwrap());
-        let statuses = status(&home, None).unwrap();
+        assert!(set_cc_switch(Home::local(&home), Client::Codex, true).unwrap());
+        let statuses = status(Home::local(&home), None, None).unwrap();
         assert_eq!(statuses[0].state, ClientState::NotConfigured);
         assert_eq!(statuses[1].state, ClientState::CcSwitch);
         assert_eq!(statuses[1].token_id, None);
-        remove(&home, Client::Codex).unwrap();
+        remove(Home::local(&home), Client::Codex).unwrap();
         assert!(!records_path(&home).exists());
         fs::remove_dir_all(home).unwrap();
     }
@@ -2521,7 +3532,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            status(&home, Some("http://127.0.0.1:18317/")).unwrap()[1].state,
+            status(
+                Home::local(&home),
+                Some("http://127.0.0.1:18317/"),
+                Some(&tokens())
+            )
+            .unwrap()[1]
+                .state,
             ClientState::Configured
         );
         fs::remove_dir_all(home).unwrap();
@@ -2555,7 +3572,14 @@ mod tests {
         let target = home.join("dotfiles-settings.json");
         fs::write(&target, "{}\n").unwrap();
         std::os::unix::fs::symlink(&target, home.join(".claude/settings.json")).unwrap();
-        write(&home, Client::Claude, &connection(&[]), false).unwrap();
+        write(
+            Home::local(&home),
+            Client::Claude,
+            &connection(&[]),
+            &tokens(),
+            false,
+        )
+        .unwrap();
         assert!(fs::symlink_metadata(home.join(".claude/settings.json"))
             .unwrap()
             .file_type()

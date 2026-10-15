@@ -20,14 +20,16 @@ import {
   GeminiColor,
   OpenCodeMono,
   OpenClawColor,
-  PiMono,
+  PiColor,
 } from "@/components/brand-icons";
 import { CCSwitchIcon } from "@/components/CCSwitchIcon";
 import { ArrowUpRight, Key, Server, Settings } from "@/components/icons";
 import { RadioGroup } from "@/components/ui/radio-group";
+import { SegmentedControl } from "@/components/SegmentedControl";
 import { ModelSelect } from "@/components/ModelSelect";
 import { FormMessage } from "@/components/FormMessage";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import {
   Dialog,
@@ -57,11 +59,14 @@ import {
   isDirectClient,
   type ClientConfigClient,
   type ClientConfigModels,
+  type ClientConfigOverview,
   type ClientConfigState,
   type ClientConfigStatus,
   type ClientProxyCheck,
   type DirectClient,
+  maxPiLimit,
 } from "./client-config-model";
+import { getOfficialModelLimits } from "./pricing-bridge";
 import {
   astrlinkAutoModelId,
   type ModelRedirect,
@@ -78,7 +83,7 @@ export const clientSetupClients = [
   { id: "gemini", label: "Gemini CLI", Icon: GeminiColor },
   { id: "opencode", label: "OpenCode", Icon: OpenCodeMono },
   { id: "openclaw", label: "OpenClaw", Icon: OpenClawColor },
-  { id: "pi", label: "Pi", Icon: PiMono },
+  { id: "pi", label: "Pi", Icon: PiColor },
 ] as const satisfies readonly {
   id: ClientConfigClient;
   label: string;
@@ -87,6 +92,29 @@ export const clientSetupClients = [
 
 export function clientLabel(client: ClientConfigClient): string {
   return clientSetupClients.find(({ id }) => id === client)?.label ?? client;
+}
+
+/** The client's name, followed by its WSL distribution when it runs in one. */
+function placeLabel(client: ClientConfigClient, wsl: string | null): string {
+  const name = clientLabel(client);
+  return wsl === null
+    ? name
+    : i18n.t("clientSetup.placeClient", {
+        client: name,
+        place: placeName(wsl),
+      });
+}
+
+/** This computer, or a WSL distribution, as the location control names it. */
+function placeName(wsl: string | null): string {
+  return wsl === null
+    ? i18n.t("clientSetup.placeLocal")
+    : i18n.t("agentDebug.wslPlace", { name: wsl });
+}
+
+/** Windows matches WSL distribution names in any case. */
+function samePlace(a: string | null, b: string | null): boolean {
+  return a?.toLowerCase() === b?.toLowerCase();
 }
 
 const protocols: Record<ClientConfigClient, string> = {
@@ -105,18 +133,85 @@ const claudeTiers = [
   "fableModel",
 ] as const;
 
+const piLimits = ["contextWindow", "maxTokens"] as const;
+
+/** What Pi assumes for a model whose entry names no limit. */
+const piDefaults: Record<(typeof piLimits)[number], number> = {
+  contextWindow: 128000,
+  maxTokens: 16384,
+};
+
+/**
+ * The model fields as the form holds them; only Claude Code shows the tiers,
+ * and only Pi the limits.
+ */
+type ModelFields = Record<
+  "model" | (typeof claudeTiers)[number] | (typeof piLimits)[number],
+  string
+>;
+
+const noModels: ModelFields = {
+  model: "",
+  haikuModel: "",
+  sonnetModel: "",
+  opusModel: "",
+  fableModel: "",
+  contextWindow: "",
+  maxTokens: "",
+};
+
+/** A typed limit in tokens: undefined when blank, null when invalid. */
+function piLimit(text: string): number | null | undefined {
+  const value = text.trim();
+  if (!value) return undefined;
+  const tokens = /^[0-9]{1,9}$/.test(value) ? Number(value) : 0;
+  return tokens >= 1 && tokens <= maxPiLimit ? tokens : null;
+}
+
 const stateTones: Record<
-  Exclude<ClientConfigState, "not_configured" | "cc_switch">,
+  Exclude<ClientConfigState, "not_configured">,
   StatusTone
 > = {
   configured: "positive",
   outdated: "pending",
+  elsewhere: "neutral",
   modified: "pending",
+  cc_switch: "neutral",
   invalid: "negative",
 };
 
+/** A config's state, once AstrLink or CC Switch wrote it. */
+function stateBadge(status: ClientConfigStatus) {
+  return status.state === "not_configured" ? null : (
+    <StatusBadge tone={stateTones[status.state]}>
+      {i18n.t(`clientSetup.state.${status.state}`)}
+    </StatusBadge>
+  );
+}
+
 /** How a client card can be used right now. */
 type Availability = "loading" | "direct" | "cc-switch" | "missing";
+
+/** A config write, on this computer (`wsl: null`) or in a WSL distribution. */
+type WriteTarget = ClientConfigTarget & { wsl: string | null };
+
+/** The value the location control uses for this computer. */
+const localPlace = "local";
+
+/**
+ * Where a client can be configured: this computer when it is installed or
+ * configured there, and each WSL distribution where it is.
+ */
+function placesOf(
+  overview: ClientConfigOverview | null,
+  client: ClientConfigClient,
+): ClientConfigStatus[] {
+  return (overview?.clients ?? []).filter(
+    (status) =>
+      status.client === client &&
+      (status.detected || status.state !== "not_configured"),
+  );
+}
 
 interface Failure {
   message: string;
@@ -192,27 +287,31 @@ function DesktopClientSetupDialog({
   onChanged?: () => void;
 }) {
   const t = i18n.t.bind(i18n);
-  const [statuses, setStatuses] = useState<ClientConfigStatus[] | null>(null);
+  const [overview, setOverview] = useState<ClientConfigOverview | null>(null);
   const [statusFailed, setStatusFailed] = useState(false);
   const [ccSwitch, setCCSwitch] = useState(false);
   const [choice, setChoice] = useState<ClientConfigClient | null>(null);
-  const [model, setModel] = useState("");
-  const [claudeModels, setClaudeModels] = useState({
-    model: "",
-    haikuModel: "",
-    sonnetModel: "",
-    opusModel: "",
-    fableModel: "",
-  });
+  // `undefined` follows the first place the client is installed.
+  const [placeChoice, setPlaceChoice] = useState<string | null | undefined>(
+    undefined,
+  );
+  // What the user typed, by client and place. A config left alone shows the
+  // models it holds now.
+  const [drafts, setDrafts] = useState<Record<string, ModelFields>>({});
   const [busy, setBusy] = useState<"write" | "remove" | "cc-switch" | null>(
     null,
   );
   const [error, setError] = useState<Failure | null>(null);
   const [conflict, setConflict] = useState<{
-    target: ClientConfigTarget;
+    target: WriteTarget;
     keys: string[];
+    /** The base URL of the other AstrLink the config connects to now. */
+    gateway: string | null;
   } | null>(null);
-  const [removal, setRemoval] = useState<DirectClient | null>(null);
+  const [removal, setRemoval] = useState<{
+    client: DirectClient;
+    wsl: string | null;
+  } | null>(null);
   const [catalog, setCatalog] = useState<{
     services: Service[];
     redirects: ModelRedirect[];
@@ -238,11 +337,19 @@ function DesktopClientSetupDialog({
     try {
       const next = await getClientConfigStatus(inferenceURL || null);
       if (!active.current) return;
-      setStatuses(next);
+      setOverview(next);
       setStatusFailed(false);
     } catch {
       if (!active.current) return;
-      setStatuses((current) => current ?? []);
+      setOverview(
+        (current) =>
+          current ?? {
+            clients: [],
+            wsl_unchecked: [],
+            wsl_localhost: false,
+            cc_switch_wsl: { claude: null, codex: null },
+          },
+      );
       setStatusFailed(true);
     }
   }, [inferenceURL]);
@@ -278,31 +385,121 @@ function DesktopClientSetupDialog({
     };
   }, []);
 
-  const statusOf = (id: ClientConfigClient) =>
-    statuses?.find((status) => status.client === id);
+  // The place a card stands for: the chosen one, else where it is installed.
+  const statusOf = (id: ClientConfigClient, place?: string | null) => {
+    const places = placesOf(overview, id);
+    return (
+      (place !== undefined
+        ? places.find((status) => status.wsl === place)
+        : undefined) ??
+      places.find((status) => status.detected) ??
+      overview?.clients.find(
+        (status) => status.client === id && status.wsl === null,
+      )
+    );
+  };
   const availability = (id: ClientConfigClient): Availability => {
     if (!isDirectClient(id)) return ccSwitch ? "cc-switch" : "missing";
-    const card = statusOf(id);
     // A failed status read says nothing about whether the client exists.
-    if (!card) return "loading";
-    return card.detected ? "direct" : "missing";
+    if (!overview?.clients.some((status) => status.client === id))
+      return "loading";
+    return placesOf(overview, id).some((status) => status.detected)
+      ? "direct"
+      : "missing";
   };
   const usable = (id: ClientConfigClient) =>
     ["direct", "cc-switch"].includes(availability(id));
   // Wait for the status before picking a card, so the choice does not jump.
   const client =
     (choice && usable(choice) ? choice : null) ??
-    (statuses === null
+    (overview === null
       ? null
       : (clientSetupClients.find(({ id }) => usable(id))?.id ?? null));
   const mode = client ? availability(client) : null;
-  const status = client ? statusOf(client) : undefined;
+  const places = client ? placesOf(overview, client) : [];
+  const status = client ? statusOf(client, placeChoice) : undefined;
+  const place = status?.wsl ?? null;
+  const inWSL = place !== null;
   const label = client ? clientLabel(client) : "";
   const isClaude = client === "claude";
-  const modelRequired = !isClaude && !model.trim();
+  const draftKey = `${client}:${place ?? ""}`;
+  const currentModels: ModelFields = {
+    ...noModels,
+    ...Object.fromEntries(
+      Object.entries(status?.models ?? {}).map(([key, value]) => [
+        key,
+        String(value),
+      ]),
+    ),
+  };
+  const modelFields = drafts[draftKey] ?? currentModels;
+  const editModel = (field: keyof ModelFields, value: string) =>
+    setDrafts((current) => {
+      const fields = current[draftKey] ?? currentModels;
+      // Limits describe a model; another model starts from its own.
+      const limits =
+        client === "pi" && field === "model" && value !== fields.model
+          ? { contextWindow: "", maxTokens: "" }
+          : {};
+      return {
+        ...current,
+        [draftKey]: { ...fields, ...limits, [field]: value },
+      };
+    });
+  const modelRequired = !isClaude && !modelFields.model.trim();
+  const limitsInvalid =
+    client === "pi" &&
+    piLimits.some((key) => piLimit(modelFields[key]) === null);
+  const cannotWrite = modelRequired || limitsInvalid;
+  // Pi's limits start from the official model's; the user can change them or
+  // clear them for Pi's defaults. Each model is looked up once per place.
+  const prefilled = useRef(new Set<string>());
+  const piModel = client === "pi" ? modelFields.model.trim() : "";
+  const limitsBlank = !modelFields.contextWindow && !modelFields.maxTokens;
+  useEffect(() => {
+    const key = `${draftKey}\n${piModel}`;
+    if (!piModel || !limitsBlank || prefilled.current.has(key)) return;
+    prefilled.current.add(key);
+    void getOfficialModelLimits(piModel).then(
+      (limits) => {
+        if (!active.current || !limits) return;
+        const tokens = (count: number) => (count > 0 ? String(count) : "");
+        setDrafts((current) => {
+          const fields = current[draftKey] ?? currentModels;
+          if (
+            fields.model.trim() !== piModel ||
+            fields.contextWindow ||
+            fields.maxTokens
+          ) {
+            return current;
+          }
+          return {
+            ...current,
+            [draftKey]: {
+              ...fields,
+              contextWindow: tokens(limits.contextTokens),
+              maxTokens: tokens(limits.outputTokens),
+            },
+          };
+        });
+      },
+      () => undefined,
+    );
+    // currentModels is rebuilt each render; the place and model decide.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draftKey, piModel, limitsBlank]);
   const configured = status?.token_id != null;
-  const offersCCSwitch = ccSwitch && client !== null && ccSwitchImports(client);
-  const checksProxy = client === "codex" && inferenceURL !== "";
+  // CC Switch writes a client where its directory settings point, which for
+  // Claude Code and Codex can be one WSL distribution. Only that place
+  // offers its import.
+  const ccSwitchPlace =
+    client === "claude" || client === "codex"
+      ? (overview?.cc_switch_wsl[client] ?? null)
+      : null;
+  const ccSwitchable = ccSwitch && client !== null && ccSwitchImports(client);
+  const offersCCSwitch = ccSwitchable && samePlace(ccSwitchPlace, place);
+  // The system proxy applies to this computer's Codex, not to one in WSL.
+  const checksProxy = client === "codex" && !inWSL && inferenceURL !== "";
 
   useEffect(() => {
     if (!checksProxy) return;
@@ -322,8 +519,8 @@ function DesktopClientSetupDialog({
 
   // Removing needs a readable file; an unreadable one is left for the user.
   const removable =
-    mode === "direct" && configured && status?.state !== "invalid"
-      ? (status?.client ?? null)
+    mode === "direct" && configured && status && status.state !== "invalid"
+      ? { client: status.client, wsl: status.wsl }
       : null;
   const otherToken =
     status?.token_id != null && status.token_id !== token.id
@@ -406,14 +603,23 @@ function DesktopClientSetupDialog({
     ) : null;
   };
 
-  const models = (): ClientConfigModels =>
-    isClaude
-      ? Object.fromEntries(
-          Object.entries(claudeModels)
-            .map(([key, value]) => [key, value.trim()])
-            .filter(([, value]) => value),
-        )
-      : { model: model.trim() };
+  const models = (): ClientConfigModels => {
+    if (isClaude) {
+      return Object.fromEntries(
+        (["model", ...claudeTiers] as const)
+          .map((key) => [key, modelFields[key].trim()])
+          .filter(([, value]) => value),
+      );
+    }
+    const fields: ClientConfigModels = { model: modelFields.model.trim() };
+    if (client === "pi") {
+      for (const key of piLimits) {
+        const tokens = piLimit(modelFields[key]);
+        if (tokens) fields[key] = tokens;
+      }
+    }
+    return fields;
+  };
 
   const begin = (next: NonNullable<typeof busy>) => {
     if (pending.current) return false;
@@ -435,7 +641,8 @@ function DesktopClientSetupDialog({
     const protocol = protocols[target.client];
     const entries = new Map(
       Object.values(target.models).flatMap((modelID) => {
-        const entry = requiredEntry(modelID ?? "", protocol);
+        if (typeof modelID !== "string") return [];
+        const entry = requiredEntry(modelID, protocol);
         return entry ? [[entry.service.id, entry.service] as const] : [];
       }),
     );
@@ -494,18 +701,20 @@ function DesktopClientSetupDialog({
     return active.current;
   };
 
-  const write = async (target: ClientConfigTarget, replace: boolean) => {
+  const write = async (target: WriteTarget, replace: boolean) => {
     if (!begin("write")) return;
     try {
       if (!(await enableEntries(target))) return;
       const outcome = await applyClientConfig({ ...target, replace });
       if (!active.current) return;
       if (outcome.status === "needs_confirmation") {
-        setConflict({ target, keys: outcome.keys });
+        setConflict({ target, keys: outcome.keys, gateway: outcome.gateway });
         return;
       }
       notify.success(
-        t("clientSetup.written", { client: clientLabel(target.client) }),
+        t("clientSetup.written", {
+          client: placeLabel(target.client, target.wsl),
+        }),
       );
       onChanged?.();
       await refresh();
@@ -517,12 +726,19 @@ function DesktopClientSetupDialog({
     }
   };
 
-  const remove = async (target: DirectClient) => {
+  const remove = async (target: {
+    client: DirectClient;
+    wsl: string | null;
+  }) => {
     if (!begin("remove")) return;
     try {
-      await removeClientConfig(target);
+      await removeClientConfig(target.client, target.wsl);
       if (!active.current) return;
-      notify.success(t("clientSetup.removed", { client: clientLabel(target) }));
+      notify.success(
+        t("clientSetup.removed", {
+          client: placeLabel(target.client, target.wsl),
+        }),
+      );
       onChanged?.();
       await refresh();
     } catch (cause) {
@@ -534,7 +750,7 @@ function DesktopClientSetupDialog({
   };
 
   const importWithCCSwitch = async () => {
-    if (!client || modelRequired || !begin("cc-switch")) return;
+    if (!client || cannotWrite || !begin("cc-switch")) return;
     try {
       const target = {
         tokenId: token.id,
@@ -545,7 +761,7 @@ function DesktopClientSetupDialog({
       if (!(await enableEntries(target))) return;
       await openCCSwitchImport(target);
       if (!active.current) return;
-      notify.success(t("clientSetup.ccSwitchOpened"));
+      notify.successWithSteps(t("clientSetup.ccSwitchOpened"));
       onClose();
     } catch {
       if (active.current)
@@ -557,7 +773,7 @@ function DesktopClientSetupDialog({
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    if (!client || modelRequired) return;
+    if (!client || cannotWrite) return;
     if (!isDirectClient(client)) {
       void importWithCCSwitch();
       return;
@@ -569,13 +785,15 @@ function DesktopClientSetupDialog({
         client,
         models: models(),
         inferenceUrl: inferenceURL,
+        wsl: place,
       },
       false,
     );
   };
 
   const cardNote = (id: ClientConfigClient) => {
-    const card = statusOf(id);
+    // The chosen card follows the chosen place.
+    const card = id === client ? status : statusOf(id);
     switch (availability(id)) {
       case "loading":
         return null;
@@ -591,11 +809,7 @@ function DesktopClientSetupDialog({
         if (!card || card.state === "not_configured") return null;
         // Reads like the clients only CC Switch configures.
         if (card.state === "cc_switch") return t("clientSetup.state.cc_switch");
-        return (
-          <StatusBadge tone={stateTones[card.state]}>
-            {t(`clientSetup.state.${card.state}`)}
-          </StatusBadge>
-        );
+        return stateBadge(card);
     }
   };
 
@@ -632,6 +846,7 @@ function DesktopClientSetupDialog({
               value={client ?? ""}
               onValueChange={(value) => {
                 setChoice(value as ClientConfigClient);
+                setPlaceChoice(undefined);
                 setError(null);
               }}
               disabled={working}
@@ -661,9 +876,42 @@ function DesktopClientSetupDialog({
                 {t("clientSetup.unsupportedHint")}
               </p>
             ) : null}
+            {overview?.wsl_unchecked.length ? (
+              <p className="text-xs text-muted-foreground">
+                {t("clientSetup.wslUnchecked", {
+                  names: overview.wsl_unchecked.join(
+                    t("agentDebug.partsSeparator"),
+                  ),
+                })}
+              </p>
+            ) : null}
           </fieldset>
           {client ? (
             <>
+              {mode === "direct" && places.some((item) => item.wsl !== null) ? (
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-xs font-medium text-text-secondary">
+                    {t("clientSetup.place")}
+                  </span>
+                  <SegmentedControl
+                    label={t("clientSetup.place")}
+                    disabled={working}
+                    options={places.map((item) => ({
+                      value: item.wsl ?? localPlace,
+                      label:
+                        item.wsl === null
+                          ? t("clientSetup.placeLocal")
+                          : t("agentDebug.wslPlace", { name: item.wsl }),
+                      badge: stateBadge(item),
+                    }))}
+                    value={place ?? localPlace}
+                    onValueChange={(value) => {
+                      setPlaceChoice(value === localPlace ? null : value);
+                      setError(null);
+                    }}
+                  />
+                </div>
+              ) : null}
               <div className="grid gap-x-3 gap-y-2 rounded-md border bg-muted/40 px-3 py-2.5 text-xs min-[540px]:grid-cols-2">
                 <div className="flex min-w-0 items-start gap-2">
                   <Server
@@ -725,6 +973,10 @@ function DesktopClientSetupDialog({
                 <FormMessage tone="notice">
                   {t("clientSetup.ccSwitchManagedHint", { client: label })}
                 </FormMessage>
+              ) : status?.state === "elsewhere" ? (
+                <FormMessage tone="notice">
+                  {t("clientSetup.elsewhereHint", { client: label })}
+                </FormMessage>
               ) : status?.token_id != null && status.token_id !== token.id ? (
                 <FormMessage tone="notice">
                   {otherToken
@@ -741,6 +993,11 @@ function DesktopClientSetupDialog({
               ) : null}
               {proxy ? (
                 <FormMessage tone={proxy.tone}>{proxy.message}</FormMessage>
+              ) : null}
+              {mode === "direct" && inWSL && !overview?.wsl_localhost ? (
+                <FormMessage tone="warning">
+                  {t("clientSetup.wslNetwork", { url: baseURL })}
+                </FormMessage>
               ) : null}
               <Field
                 htmlFor="client-setup-model"
@@ -764,21 +1021,52 @@ function DesktopClientSetupDialog({
                   )}
                   options={modelOptions}
                   optionAdornment={optionAdornment}
-                  value={isClaude ? claudeModels.model : model}
+                  value={modelFields.model}
                   placeholder={t("clientSetup.modelPlaceholder")}
-                  onValueChange={(value) =>
-                    isClaude
-                      ? setClaudeModels((current) => ({
-                          ...current,
-                          model: value,
-                        }))
-                      : setModel(value)
-                  }
+                  onValueChange={(value) => editModel("model", value)}
                   maxLength={256}
                   disabled={working}
                 />
               </Field>
-              {entryNote(isClaude ? claudeModels.model : model)}
+              {entryNote(modelFields.model)}
+              {client === "pi" && (
+                <div className="grid gap-1.5">
+                  <div className="grid gap-3 min-[540px]:grid-cols-2">
+                    {piLimits.map((key) => (
+                      <Field
+                        key={key}
+                        htmlFor={`client-setup-${key}`}
+                        label={t(`clientSetup.${key}`)}
+                      >
+                        <Input
+                          id={`client-setup-${key}`}
+                          inputMode="numeric"
+                          autoComplete="off"
+                          value={modelFields[key]}
+                          placeholder={t("clientSetup.piDefault", {
+                            tokens: piDefaults[key],
+                          })}
+                          aria-invalid={piLimit(modelFields[key]) === null}
+                          onChange={(event) =>
+                            editModel(key, event.target.value)
+                          }
+                          maxLength={9}
+                          disabled={working}
+                        />
+                      </Field>
+                    ))}
+                  </div>
+                  {limitsInvalid ? (
+                    <FormMessage tone="error">
+                      {t("clientSetup.limitInvalid")}
+                    </FormMessage>
+                  ) : (
+                    <span className="text-xs text-muted-foreground">
+                      {t("clientSetup.limitsHint")}
+                    </span>
+                  )}
+                </div>
+              )}
               {isClaude && (
                 <div className="grid gap-3 min-[540px]:grid-cols-2">
                   {claudeTiers.map((key) => (
@@ -787,7 +1075,7 @@ function DesktopClientSetupDialog({
                       htmlFor={`client-setup-${key}`}
                       label={t(`clientSetup.${key}`)}
                       hint={
-                        key === "fableModel" && ccSwitch
+                        key === "fableModel" && offersCCSwitch
                           ? t("clientSetup.fableNotImported")
                           : undefined
                       }
@@ -797,18 +1085,13 @@ function DesktopClientSetupDialog({
                         aria-label={t(`clientSetup.${key}`)}
                         options={modelOptions}
                         optionAdornment={optionAdornment}
-                        value={claudeModels[key]}
-                        onValueChange={(value) =>
-                          setClaudeModels((current) => ({
-                            ...current,
-                            [key]: value,
-                          }))
-                        }
+                        value={modelFields[key]}
+                        onValueChange={(value) => editModel(key, value)}
                         placeholder={t("clientSetup.modelPlaceholder")}
                         maxLength={256}
                         disabled={working}
                       />
-                      {entryNote(claudeModels[key])}
+                      {entryNote(modelFields[key])}
                     </Field>
                   ))}
                 </div>
@@ -824,6 +1107,17 @@ function DesktopClientSetupDialog({
                   ) : null}
                   {offersCCSwitch && client === "codex" ? (
                     <p>{t("clientSetup.codexToolsCCSwitch")}</p>
+                  ) : null}
+                  {ccSwitchable && !offersCCSwitch && status ? (
+                    <p>
+                      {t("clientSetup.ccSwitchElsewhere", {
+                        client: label,
+                        target: placeName(ccSwitchPlace),
+                        place: placeName(place),
+                        // The folder holding the config file.
+                        dir: status.paths[0].replace(/[\\/][^\\/]*$/, ""),
+                      })}
+                    </p>
                   ) : null}
                 </HelpDisclosure>
               ) : null}
@@ -865,7 +1159,7 @@ function DesktopClientSetupDialog({
               <Button
                 type="button"
                 variant="outline"
-                disabled={working || modelRequired}
+                disabled={working || cannotWrite}
                 onClick={() => void importWithCCSwitch()}
               >
                 <CCSwitchIcon size={16} />
@@ -878,7 +1172,7 @@ function DesktopClientSetupDialog({
               </Button>
             ) : null}
             {mode === "cc-switch" ? (
-              <Button type="submit" disabled={working || modelRequired}>
+              <Button type="submit" disabled={working || cannotWrite}>
                 <CCSwitchIcon size={16} />
                 {t(
                   busy === "cc-switch"
@@ -893,7 +1187,7 @@ function DesktopClientSetupDialog({
                 disabled={
                   working ||
                   mode !== "direct" ||
-                  modelRequired ||
+                  cannotWrite ||
                   status?.state === "invalid"
                 }
               >
@@ -911,26 +1205,46 @@ function DesktopClientSetupDialog({
       </DialogContent>
       <ConfirmDialog
         open={conflict !== null}
-        title={t("clientSetup.replaceTitle")}
+        title={t(
+          conflict?.gateway
+            ? "clientSetup.switchTitle"
+            : "clientSetup.replaceTitle",
+        )}
         description={
           conflict ? (
             <>
-              <p>
-                {t("clientSetup.replaceBody", {
-                  client: clientLabel(conflict.target.client),
-                })}
-              </p>
-              <ul className="grid gap-1">
-                {conflict.keys.map((key) => (
-                  <li key={key}>
-                    <code className="break-all text-xs">{key}</code>
-                  </li>
-                ))}
-              </ul>
+              {conflict.gateway ? (
+                <p>
+                  {t("clientSetup.switchBody", {
+                    client: clientLabel(conflict.target.client),
+                    url: conflict.gateway,
+                  })}
+                </p>
+              ) : null}
+              {conflict.keys.length > 0 ? (
+                <>
+                  <p>
+                    {t("clientSetup.replaceBody", {
+                      client: clientLabel(conflict.target.client),
+                    })}
+                  </p>
+                  <ul className="grid gap-1">
+                    {conflict.keys.map((key) => (
+                      <li key={key}>
+                        <code className="break-all text-xs">{key}</code>
+                      </li>
+                    ))}
+                  </ul>
+                </>
+              ) : null}
             </>
           ) : null
         }
-        confirmLabel={t("clientSetup.replaceConfirm")}
+        confirmLabel={t(
+          conflict?.gateway
+            ? "clientSetup.switchConfirm"
+            : "clientSetup.replaceConfirm",
+        )}
         onCancel={() => setConflict(null)}
         onConfirm={() => {
           if (!conflict) return;
@@ -942,12 +1256,12 @@ function DesktopClientSetupDialog({
         open={removal !== null}
         destructive
         title={t("clientSetup.removeTitle", {
-          client: removal ? clientLabel(removal) : "",
+          client: removal ? placeLabel(removal.client, removal.wsl) : "",
         })}
         description={
           <p>
             {t("clientSetup.removeBody", {
-              client: removal ? clientLabel(removal) : "",
+              client: removal ? clientLabel(removal.client) : "",
             })}
           </p>
         }

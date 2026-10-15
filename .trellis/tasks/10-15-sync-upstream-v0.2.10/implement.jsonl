@@ -1,0 +1,8 @@
+{"file":"AGENTS.md","reason":"Quality gates, upstream forwarding identity, migration rules, desktop UI rules"}
+{"file":".trellis/spec/guides/upstream-sync-thinking-guide.md","reason":"Preserve upstream logic, fork indirection bypass checks, migration collision reconciliation, environment blockers"}
+{"file":".trellis/spec/guides/version-naming-guide.md","reason":"Preview default channel and release versioning constraints for updater changes"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Rust/TS updater snapshot field, control API and ingress data flow"}
+{"file":".trellis/tasks/10-15-sync-upstream-v0.2.10/research/release-updater-conflicts.md","reason":"Workflow, release-updates.mjs hunk resolutions and hidden repository ReferenceError"}
+{"file":".trellis/tasks/10-15-sync-upstream-v0.2.10/research/core-conflicts-identity.md","reason":"Go conflict resolutions and Droid X-AstrLink header leak"}
+{"file":".trellis/tasks/10-15-sync-upstream-v0.2.10/research/migrations-config-sync.md","reason":"v50 collision reconciliation design, test fixtures, dangling profile reference"}
+{"file":".trellis/tasks/10-15-sync-upstream-v0.2.10/research/desktop-ui-conflicts.md","reason":"Desktop conflict resolutions and ja locale missing keys"}

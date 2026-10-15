@@ -19,8 +19,9 @@ import (
 // codexToolProvider returns the provider that served the Codex turn ref
 // names, while it can still be scheduled and offers the tool itself. A Codex
 // subscription serves both tools, as it does for the official client signed
-// in with ChatGPT. A provider's own image API serves images only: other
-// providers have no /alpha/search, and a failed search ends the whole turn.
+// in with ChatGPT. New API also answers /alpha/search, and a provider's own
+// image API serves images. Other providers have no /alpha/search, and a
+// failed search ends the whole turn.
 func (handler *Handler) codexToolProvider(ctx context.Context, ref codexTurnRef, kind string) (endpoint.Resolved, codexTurnBinding, bool) {
 	principal, _ := AccessTokenIDFromContext(ctx)
 	binding, found := handler.codexTurns.lookup(string(principal), ref, time.Now())
@@ -35,6 +36,7 @@ func (handler *Handler) codexToolProvider(ctx context.Context, ref codexTurnRef,
 	switch service := candidate.CanonicalService(); {
 	case service.Kind == contract.ServiceKindCodexSubscription:
 	case kind == "image_generation" && contract.BuiltinImagesServiceKind(service.Kind):
+	case kind == "web_search" && contract.BuiltinSearchServiceKind(service.Kind):
 	default:
 		return endpoint.Resolved{}, codexTurnBinding{}, false
 	}
@@ -60,10 +62,11 @@ var (
 	errCodexToolUnreachable = errors.New("the provider could not be reached")
 )
 
-// forwardCodexTool sends one of Codex's own image or search requests to the
-// Codex subscription that served the turn, at the path the official client
-// uses. It carries the identity the turn was forwarded with, and it is sent
-// once: never retried, never to another account. handle reads the response.
+// forwardCodexTool sends one of Codex's own image or search requests to a
+// provider that answers it, at the path the official client uses: the Codex
+// subscription that served the turn, or a provider's own search API. It
+// carries the identity the turn was forwarded with, and it is sent once:
+// never retried, never to another account. handle reads the response.
 func (handler *Handler) forwardCodexTool(
 	writer http.ResponseWriter,
 	request *http.Request,
@@ -92,9 +95,11 @@ func (handler *Handler) forwardCodexTool(
 	outbound := request.Clone(ctx)
 	replaceRecoveryRequestBody(outbound, body)
 	outbound.Header.Del("Content-Encoding")
-	// The subscription's API root already ends where /v1 would.
+	// A subscription's API root already ends where /v1 would.
 	path := *outbound.URL
-	path.Path = strings.TrimPrefix(path.Path, "/v1")
+	if candidate.CanonicalService().Kind == contract.ServiceKindCodexSubscription {
+		path.Path = strings.TrimPrefix(path.Path, "/v1")
+	}
 	path.RawPath = ""
 	outbound.URL = &path
 	headers, err := handler.authorizer.Headers(ctx, authorization, outbound.Header)

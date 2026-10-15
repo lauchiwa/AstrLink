@@ -41,7 +41,8 @@ type ClientIdentities struct {
 }
 
 // ClientIdentityStatus pairs the version learned from official client
-// requests with the built-in version used until one is learned.
+// requests with the built-in version used until one is learned; Claude Code
+// keeps the built-in version until a release at least as new is learned.
 type ClientIdentityStatus struct {
 	// LearnedVersion is empty until an official client request is learned. It
 	// is reported even while learning is off.

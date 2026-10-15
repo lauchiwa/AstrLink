@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	_ "golang.org/x/image/webp"
+	"golang.org/x/image/webp"
 
 	"github.com/QuantumNous/astrlink/core/contract"
 	"github.com/QuantumNous/astrlink/core/internal/builtintools"
@@ -76,15 +76,16 @@ func (handler *Handler) serveImages(writer http.ResponseWriter, request *http.Re
 	if settings.BuiltinTools != nil {
 		config = settings.BuiltinTools.ImageGeneration
 	}
+	var service contract.Service
 	if !config.Enabled || config.Validate("image_generation") != nil {
 		ref := codexTurnRef{turnID: codexTurnID(request.Header.Get(codexImageTurnHeader))}
 		candidate, binding, ok := handler.codexToolProvider(request.Context(), ref, "image_generation")
 		if !ok {
 			session.captureUnreadRequestBody(request)
-			fail(http.StatusUnprocessableEntity, "image_generation_disabled", "image generation is turned off, and this conversation's provider has no Images API; it can be turned on under Routing → Models & tools → Built-in tools")
+			fail(http.StatusUnprocessableEntity, "image_generation_disabled", "image generation is turned off, and this conversation's provider has no Images API; it can be turned on under Routing → Redirects → Responses tool mapping")
 			return
 		}
-		service := candidate.CanonicalService()
+		service = candidate.CanonicalService()
 		model := codexToolModel(settings, service, classified.Model)
 		if service.Kind == contract.ServiceKindCodexSubscription {
 			handler.forwardCodexImages(writer, request, classified, settings, candidate, binding, model)
@@ -104,8 +105,10 @@ func (handler *Handler) serveImages(writer http.ResponseWriter, request *http.Re
 			fail(http.StatusBadRequest, "invalid_request", "image model is required")
 			return
 		}
+	} else {
+		service = handler.builtinToolService(request.Context(), config)
 	}
-	finishPrivacy, _, err := handler.applyPrivacy(writer, request, classified, config.ServiceID)
+	finishPrivacy, _, err := handler.applyPrivacy(writer, request, classified, service)
 	defer finishPrivacy()
 	if err != nil {
 		handler.writePrivacyError(writer, request, err)
@@ -187,7 +190,7 @@ func (handler *Handler) forwardCodexImages(
 		writeInferenceError(writer, status, code, message, false, nil)
 		session.noteFailed(errorSummaryFromInference(code, message, false))
 	}
-	finishPrivacy, _, err := handler.applyPrivacy(writer, request, classified, service.ID)
+	finishPrivacy, _, err := handler.applyPrivacy(writer, request, classified, service)
 	defer finishPrivacy()
 	if err != nil {
 		handler.writePrivacyError(writer, request, err)
@@ -318,14 +321,27 @@ func pngImage(dataURL string) (string, error) {
 	if bytes.HasPrefix(data, pngSignature) {
 		return encoded, nil
 	}
-	config, _, err := image.DecodeConfig(bytes.NewReader(data))
+	decodeConfig := func(reader io.Reader) (image.Config, error) {
+		config, _, err := image.DecodeConfig(reader)
+		return config, err
+	}
+	decode := func(reader io.Reader) (image.Image, error) {
+		decoded, _, err := image.Decode(reader)
+		return decoded, err
+	}
+	if len(data) >= 12 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WEBP" {
+		// The request image encoder registers a second WebP decoder, which
+		// image.Decode would pick over x/image's.
+		decodeConfig, decode = webp.DecodeConfig, webp.Decode
+	}
+	config, err := decodeConfig(bytes.NewReader(data))
 	if err != nil {
 		return "", errors.New("image backend returned an unsupported image format")
 	}
 	if config.Width <= 0 || config.Height <= 0 || config.Width*config.Height > maxConvertedImagePixels {
 		return "", errors.New("generated image is too large to convert to PNG")
 	}
-	decoded, _, err := image.Decode(bytes.NewReader(data))
+	decoded, err := decode(bytes.NewReader(data))
 	if err != nil {
 		return "", errors.New("image backend returned an image that could not be decoded")
 	}

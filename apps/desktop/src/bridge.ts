@@ -33,6 +33,10 @@ import {
   type ProviderImportNotice,
 } from "./provider-import-model";
 import { parseUsageSummary } from "./usage-summary-model";
+import {
+  parsePrivacySummary,
+  type PrivacySummary,
+} from "./privacy-summary-model";
 import type { UsageSummary, UsageWindow } from "./usage-range";
 
 import {
@@ -161,12 +165,12 @@ import {
   parseClientConfigApplyOutcome,
   parseClientConfigCopied,
   parseClientConfigSnippet,
-  parseClientConfigStatuses,
+  parseClientConfigOverview,
   parseClientProxyCheck,
   type ClientConfigApplyOutcome,
   type ClientConfigClient,
   type ClientConfigModels,
-  type ClientConfigStatus,
+  type ClientConfigOverview,
   type ClientProxyCheck,
   type DirectClient,
 } from "./client-config-model";
@@ -176,8 +180,16 @@ import {
   type AgentInstallReceipt,
   type AgentInstallStatus,
   type AgentSkillId,
-  type AgentToolId,
+  type AgentToolTarget,
 } from "./agent-install-model";
+import {
+  parseSyncConfig,
+  parseSyncPassphraseResult,
+  parseSyncStatus,
+  syncConfigPayload,
+  type SyncConfig,
+  type SyncStatus,
+} from "./sync-model";
 
 function hasNativeBridge(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -283,14 +295,32 @@ export async function trayAction(action: TrayAction): Promise<void> {
   await invoke<void>("tray_action", { action });
 }
 
-export async function trayPopoverResize(height: number): Promise<void> {
+export async function trayPopoverResize(
+  height: number,
+  devicePixelRatio: number,
+): Promise<void> {
   requireNativeBridge();
-  await invoke<void>("tray_popover_resize", { height });
+  await invoke<void>("tray_popover_resize", { height, devicePixelRatio });
 }
 
 export async function trayPopoverHide(): Promise<void> {
   requireNativeBridge();
   await invoke<void>("tray_popover_hide");
+}
+
+/** The page the tray left for the main window, handed over once. */
+export async function takeTrayNavigation(): Promise<string | null> {
+  if (!hasNativeBridge()) return null;
+  return invoke<string | null>("take_tray_navigation");
+}
+
+/**
+ * Unsaved edits keep the hidden main window alive; otherwise the host
+ * releases it after a while in the tray and builds a fresh one on return.
+ */
+export async function setMainWindowUnsaved(unsaved: boolean): Promise<void> {
+  if (!hasNativeBridge()) return;
+  await invoke<void>("set_main_window_unsaved", { unsaved });
 }
 
 function requireNativeBridge(): void {
@@ -776,7 +806,10 @@ export async function deleteRequestRecord(requestId: string): Promise<void> {
 }
 
 export async function purgeRequestRecords(
-  input: { scope: "all" } | { scope: "before"; before: string },
+  input:
+    | { scope: "all" }
+    | { scope: "before"; before: string }
+    | { scope: "sessions"; session_ids: string[] },
 ): Promise<{ deleted_records: number; deleted_audit_blobs: number }> {
   requireNativeBridge();
   return parsePurgeResult(
@@ -947,6 +980,22 @@ export async function getUsageSummary(
   );
 }
 
+/** What the privacy policy did over the window, in the usage summary's buckets. */
+export async function getPrivacySummary(
+  window: UsageWindow,
+): Promise<PrivacySummary> {
+  requireNativeBridge();
+  return parsePrivacySummary(
+    await invoke<unknown>("get_privacy_summary", {
+      from: window.from,
+      to: window.to,
+      timeZone: window.time_zone || "UTC",
+      bucket: window.preset === "1d" ? "hour" : "day",
+    }),
+    window,
+  );
+}
+
 export async function createAccessToken(
   name: string,
 ): Promise<AccessTokenCreateResult> {
@@ -980,14 +1029,20 @@ export interface ClientConfigTarget {
 }
 
 /**
- * What AstrLink wrote to Claude Code, Codex, and Pi. Outside the desktop there
- * are no local clients to configure.
+ * What AstrLink wrote to Claude Code, Codex, and Pi, on this computer and in
+ * running WSL distributions. Outside the desktop there are no local clients.
  */
 export async function getClientConfigStatus(
   inferenceUrl: string | null,
-): Promise<ClientConfigStatus[]> {
-  if (!hasNativeBridge()) return [];
-  return parseClientConfigStatuses(
+): Promise<ClientConfigOverview> {
+  if (!hasNativeBridge())
+    return {
+      clients: [],
+      wsl_unchecked: [],
+      wsl_localhost: false,
+      cc_switch_wsl: { claude: null, codex: null },
+    };
+  return parseClientConfigOverview(
     await invoke<unknown>("client_config_status", { inferenceUrl }),
   );
 }
@@ -1005,9 +1060,12 @@ export async function checkClientProxy(
   );
 }
 
-/** Writes the connection, or names the keys that need `replace` first. */
+/**
+ * Writes the connection, or names the keys that need `replace` first. `wsl`
+ * names the WSL distribution to write in; `null` is this computer.
+ */
 export async function applyClientConfig(
-  input: ClientConfigTarget & { replace: boolean },
+  input: ClientConfigTarget & { replace: boolean; wsl: string | null },
 ): Promise<ClientConfigApplyOutcome> {
   requireNativeBridge();
   return parseClientConfigApplyOutcome(
@@ -1015,9 +1073,12 @@ export async function applyClientConfig(
   );
 }
 
-export async function removeClientConfig(client: DirectClient): Promise<void> {
+export async function removeClientConfig(
+  client: DirectClient,
+  wsl: string | null,
+): Promise<void> {
   requireNativeBridge();
-  await invoke("remove_client_config", { client });
+  await invoke("remove_client_config", { client, wsl });
 }
 
 /** The config for a fresh setup, with the token shown as its hint. */
@@ -1251,11 +1312,11 @@ export async function getAgentDebugStatus(): Promise<AgentInstallStatus> {
 
 export async function installAgentDebug(
   skillIds: AgentSkillId[],
-  toolIds: AgentToolId[],
+  tools: AgentToolTarget[],
 ): Promise<AgentInstallReceipt> {
   requireNativeBridge();
   return parseAgentInstallReceipt(
-    await invoke<unknown>("install_agent_debug", { skillIds, toolIds }),
+    await invoke<unknown>("install_agent_debug", { skillIds, tools }),
   );
 }
 
@@ -1306,4 +1367,55 @@ export async function builtinToolAction(
     action,
     input,
   });
+}
+
+/** The configuration-sync surface, over the host's `sync_config` command. */
+export async function getSyncStatus(): Promise<SyncStatus> {
+  requireNativeBridge();
+  return parseSyncStatus(
+    await invoke<unknown>("sync_config", { operation: "status" }),
+  );
+}
+
+export async function getSyncConfig(): Promise<SyncConfig> {
+  requireNativeBridge();
+  return parseSyncConfig(
+    await invoke<unknown>("sync_config", { operation: "config" }),
+  );
+}
+
+export async function configureSync(input: SyncConfig): Promise<SyncConfig> {
+  requireNativeBridge();
+  return parseSyncConfig(
+    await invoke<unknown>("sync_config", {
+      operation: "configure",
+      input: syncConfigPayload(input),
+    }),
+  );
+}
+
+export async function setSyncPassphrase(passphrase: string): Promise<boolean> {
+  requireNativeBridge();
+  const result = parseSyncPassphraseResult(
+    await invoke<unknown>("sync_config", {
+      operation: "passphrase",
+      input: { passphrase },
+    }),
+  );
+  return result.passphrase_set;
+}
+
+/** Forgets the passphrase locally; the remote package is left alone. */
+export async function forgetSyncPassphrase(): Promise<void> {
+  requireNativeBridge();
+  await invoke("sync_config", { operation: "forget" });
+}
+
+export async function runSync(): Promise<SyncStatus> {
+  requireNativeBridge();
+  // A run does several remote round trips and may retry the merge, so the host
+  // gives it minutes rather than the usual control-request timeout.
+  return parseSyncStatus(
+    await invoke<unknown>("sync_config", { operation: "run" }),
+  );
 }

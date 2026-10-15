@@ -553,6 +553,8 @@ func (store *Store) UpdateEndpoint(ctx context.Context, endpoint contract.Endpoi
 	service := contract.ServiceFromEndpoint(endpoint)
 	service.Proxy = current.Service.Proxy
 	service.ResponsesWebSocketEnabled = current.Service.ResponsesWebSocketEnabled
+	service.PrivacyTrusted = current.Service.PrivacyTrusted
+	service.ModelProtocols = current.Service.ModelProtocols
 	service.FailurePolicy = current.Service.FailurePolicy
 	service.CreatedAt = current.Service.CreatedAt
 	// The legacy endpoint view cannot express request rules, so an update made

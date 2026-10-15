@@ -1,0 +1,6 @@
+{"file":"AGENTS.md","reason":"Full-scope format/lint/test commands and forwarding identity verification on final outgoing requests"}
+{"file":".trellis/spec/guides/upstream-sync-thinking-guide.md","reason":"Line-by-line explainable diff against upstream, indirection grep, migration lookup by name"}
+{"file":".trellis/spec/guides/version-naming-guide.md","reason":"Verify preview default and stable filter unchanged"}
+{"file":".trellis/tasks/10-15-sync-upstream-v0.2.10/research/release-updater-conflicts.md","reason":"Check release pipeline adaptations and workflow gates"}
+{"file":".trellis/tasks/10-15-sync-upstream-v0.2.10/research/core-conflicts-identity.md","reason":"Check identity-related resolutions and new outbound paths"}
+{"file":".trellis/tasks/10-15-sync-upstream-v0.2.10/research/migrations-config-sync.md","reason":"Check migration matrix and config sync interaction"}

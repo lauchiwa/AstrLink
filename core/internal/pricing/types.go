@@ -11,9 +11,8 @@ import (
 	"time"
 
 	"github.com/QuantumNous/astrlink/core/contract"
+	"github.com/QuantumNous/astrlink/core/internal/modelmeta"
 )
-
-const SourceURL = "https://basellm.github.io/llm-metadata/api"
 
 // Plan/region catalogs are deliberately not fallback price sources. A service
 // selects one canonical first-party supplier; explicit model bindings can name
@@ -38,7 +37,10 @@ type Catalog struct {
 	ActivatedAt time.Time `json:"activated_at"`
 	ETag        string    `json:"etag"`
 	Prices      []Price   `json:"prices"`
-	Warnings    []string  `json:"warnings"`
+	// Models is what LLM Metadata says about each canonical supplier's
+	// models; nil in a catalog saved before they were kept.
+	Models   []modelmeta.Model `json:"models"`
+	Warnings []string          `json:"warnings"`
 }
 type Status struct {
 	Source    string     `json:"source"`
@@ -131,6 +133,21 @@ func (c Config) Resolve(model string, prices []Price) (Price, bool) {
 	for _, p := range prices {
 		if p.Model == b.Model && (b.Provider == p.Provider || b.Provider == "") {
 			match = p
+			count++
+		}
+	}
+	return match, count == 1
+}
+
+// ResolveModel finds the metadata of a model's official counterpart,
+// matched as Resolve matches its price.
+func (c Config) ResolveModel(model string, models []modelmeta.Model) (modelmeta.Model, bool) {
+	b := c.ResolveBinding(model)
+	var match modelmeta.Model
+	count := 0
+	for _, r := range models {
+		if r.Model == b.Model && (b.Provider == r.Provider || b.Provider == "") {
+			match = r
 			count++
 		}
 	}

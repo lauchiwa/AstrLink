@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -128,14 +130,14 @@ func (handler *Handler) builtinExecutor(request *http.Request, classified Reques
 	return builtintools.Executor{Secrets: handler.proxyCredentials, Native: func(ctx context.Context, config contract.BuiltinTool, body builtintools.Object) (builtintools.Object, error) {
 		shared, _ := ctx.Value(builtinTestSessionKey{}).(*recordSession)
 		return handler.builtinModel(ctx, request, body, &builtinInternal{Target: config.ServiceID, Native: true, SharedSession: shared})
-	}, Images: handler.builtinServiceImages, Inspect: func(ctx context.Context, args builtintools.Object) (builtintools.Object, error) {
+	}, Images: handler.builtinServiceImages, Search: handler.builtinServiceSearch, Inspect: func(ctx context.Context, args builtintools.Object) (builtintools.Object, error) {
 		body := builtintools.Text(builtintools.Object{"input": builtintools.Text(args), "model": classified.Model})
 		inspect := request.Clone(ctx)
 		inspect.Body = io.NopCloser(strings.NewReader(body))
 		inspect.GetBody = nil
 		inspect.ContentLength = int64(len(body))
 		capture := &builtinCapture{header: make(http.Header)}
-		finish, _, err := handler.applyPrivacy(capture, inspect, classified, "")
+		finish, _, err := handler.applyPrivacy(capture, inspect, classified, contract.Service{})
 		defer finish()
 		if err != nil {
 			return nil, fmt.Errorf("tool arguments blocked by privacy policy")
@@ -177,6 +179,9 @@ func (handler *Handler) builtinModel(ctx context.Context, original *http.Request
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Del("Content-Length")
 	request.Header.Del("Content-Encoding")
+	// The capture parses raw bytes and cannot decode the compressed answer
+	// the client's Accept-Encoding would invite.
+	request.Header.Del("Accept-Encoding")
 	capture := &builtinCapture{header: make(http.Header), onEvent: mode.OnEvent}
 	handler.ServeHTTP(capture, request)
 	if ctx.Err() != nil {
@@ -188,7 +193,7 @@ func (handler *Handler) builtinModel(ctx context.Context, original *http.Request
 	if capture.status >= 400 {
 		return nil, fmt.Errorf("model request failed with HTTP %d", capture.status)
 	}
-	if strings.Contains(capture.header.Get("Content-Type"), "text/event-stream") {
+	if capture.events {
 		if capture.response == nil {
 			return nil, fmt.Errorf("model stream ended without a terminal response")
 		}
@@ -278,13 +283,93 @@ func (handler *Handler) builtinServiceImages(ctx context.Context, config contrac
 	return response, nil
 }
 
+// builtinToolService is the provider a configured built-in tool backend sends
+// to, whose privacy trust then applies. An external backend is no provider,
+// and a provider that cannot be resolved is not trusted.
+func (handler *Handler) builtinToolService(ctx context.Context, config contract.BuiltinTool) contract.Service {
+	service := contract.Service{ID: config.ServiceID}
+	if config.ServiceID == "" || config.Backend == "external" {
+		return service
+	}
+	resolver, ok := handler.resolver.(endpoint.ServiceResolver)
+	if !ok {
+		return service
+	}
+	candidate, err := resolver.ResolveService(ctx, config.ServiceID)
+	if err != nil {
+		return service
+	}
+	return candidate.CanonicalService()
+}
+
+// searchService resolves a provider configured to answer web searches with
+// its own search API.
+func (handler *Handler) searchService(ctx context.Context, id contract.ServiceID) (endpoint.Resolved, error) {
+	resolver, ok := handler.resolver.(endpoint.ServiceResolver)
+	if !ok {
+		return endpoint.Resolved{}, fmt.Errorf("provider lookup is unavailable")
+	}
+	candidate, err := resolver.ResolveService(ctx, id)
+	if err != nil {
+		return endpoint.Resolved{}, fmt.Errorf("search provider is unavailable or disabled")
+	}
+	if !contract.BuiltinSearchServiceKind(candidate.CanonicalService().Kind) {
+		return endpoint.Resolved{}, fmt.Errorf("search provider does not offer a search API")
+	}
+	return candidate, nil
+}
+
+// builtinServiceSearch posts a search to a configured provider's own search
+// API the way Codex's own search reaches it, with the provider's shared client
+// identity.
+func (handler *Handler) builtinServiceSearch(ctx context.Context, config contract.BuiltinTool, body builtintools.Object) (builtintools.Object, error) {
+	candidate, err := handler.searchService(ctx, config.ServiceID)
+	if err != nil {
+		return nil, err
+	}
+	data := []byte(builtintools.Text(body))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://localhost/v1/alpha/search", bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	// An empty value suppresses Go's default client identity.
+	request.Header.Set("User-Agent", "")
+	var answer builtintools.Object
+	err = handler.forwardCodexTool(&builtinCapture{header: make(http.Header)}, request, candidate, codexTurnBinding{}, handler.requestRoutingSettings(ctx), data, func(response *http.Response) error {
+		defer response.Body.Close()
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			return fmt.Errorf("search provider returned HTTP %d", response.StatusCode)
+		}
+		data, err := readCodexToolResponse(response, maxCodexSearchResponseBytes)
+		if err != nil {
+			return err
+		}
+		if json.Unmarshal(data, &answer) != nil || answer == nil {
+			return fmt.Errorf("invalid search provider response")
+		}
+		return nil
+	})
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if err != nil {
+		return nil, err
+	}
+	return answer, nil
+}
+
 // builtinCapture parses bounded individual SSE frames. Large image payloads
 // never pass through the ordinary eight-MiB text inspection buffer here.
+// The body, not its Content-Type, tells an event stream from a JSON answer:
+// some upstreams send a valid event stream under a missing or other MIME type.
 type builtinCapture struct {
 	onEvent  func(builtintools.Object) error
 	header   http.Header
 	status   int
 	buffer   []byte
+	events   bool
+	items    map[int]any
 	response builtintools.Object
 	err      error
 }
@@ -308,8 +393,13 @@ func (c *builtinCapture) Write(data []byte) (int, error) {
 		c.err = fmt.Errorf("model response exceeds tool buffer limit")
 		return 0, c.err
 	}
-	if !strings.Contains(c.header.Get("Content-Type"), "text/event-stream") {
-		return len(data), nil
+	if !c.events {
+		// A JSON answer is one object, read whole once it ends.
+		start := firstNonSpace(c.buffer)
+		if start < 0 || c.buffer[start] == '{' {
+			return len(data), nil
+		}
+		c.events = true
 	}
 	c.buffer = bytes.ReplaceAll(c.buffer, []byte("\r\n"), []byte("\n"))
 	for {
@@ -334,8 +424,24 @@ func (c *builtinCapture) Write(data []byte) (int, error) {
 			}
 		}
 		switch builtintools.String(event["type"]) {
+		case "response.output_item.done":
+			if index, ok := event["output_index"].(float64); ok && builtintools.Map(event["item"]) != nil {
+				if c.items == nil {
+					c.items = map[int]any{}
+				}
+				c.items[int(index)] = event["item"]
+			}
 		case "response.completed", "response.incomplete":
 			c.response = builtintools.Map(event["response"])
+			// The Codex backend completes with an empty output after sending
+			// its items one by one.
+			if c.response != nil && len(builtintools.Array(c.response["output"])) == 0 && len(c.items) > 0 {
+				output := make([]any, 0, len(c.items))
+				for _, index := range slices.Sorted(maps.Keys(c.items)) {
+					output = append(output, c.items[index])
+				}
+				c.response["output"] = output
+			}
 		case "response.failed", "error":
 			c.err = builtinStreamError(event)
 			return 0, c.err
@@ -408,6 +514,11 @@ func (handler *Handler) TestBuiltinTool(ctx context.Context, kind string, config
 	classified := Request{Protocol: contract.ProtocolOpenAIResponses, Model: config.Model, InputPreview: "Builtin tool test · " + kind}
 	session := handler.startRecordSession(request, classified)
 	session.addEvent(contract.RequestEventAccepted, contract.RequestStatusPending, "builtin tool test · "+kind)
+	if config.Backend == "service_images" || config.Backend == "service_search" {
+		// The provider's own API is called directly, never through
+		// routing, so the record names the tested provider here.
+		session.noteAttemptedService(config.ServiceID)
+	}
 	session.persistPending(ctx, handler.requestRecords, handler.recordLogger)
 	defer func() {
 		session.finish(context.Background(), handler.requestRecords, handler.auditBlobs, handler.recordLogger)

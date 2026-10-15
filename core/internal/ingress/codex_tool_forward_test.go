@@ -18,6 +18,7 @@ import (
 	"github.com/QuantumNous/astrlink/core/internal/accountauth"
 	"github.com/QuantumNous/astrlink/core/internal/builtintools"
 	"github.com/QuantumNous/astrlink/core/internal/endpoint"
+	"github.com/QuantumNous/astrlink/core/internal/transport"
 )
 
 const (
@@ -423,4 +424,267 @@ func TestCodexImageFindsATurnServedThroughToolMapping(t *testing.T) {
 		t.Fatalf("image = %d %s", response.Code, response.Body.String())
 	}
 	upstream.last(t, "/images/generations")
+}
+
+// codexToolNewAPI is a New API provider, which answers /alpha/search itself.
+func codexToolNewAPI(baseURL string) endpoint.Resolved {
+	candidate := wsCandidate(baseURL)
+	candidate.Service.ID = "service_newapi"
+	candidate.Service.Kind = contract.ServiceKindNewAPI
+	candidate.Service.ResponsesWebSocketEnabled = nil
+	candidate.Service.Models = []string{"gpt-5.6-sol", "gpt-5.5-search"}
+	candidate.Service.HTTP.Auth = contract.ServiceAuth{Scheme: contract.AuthSchemeBearer}
+	candidate.Service.HTTP.CredentialRef = "local://service/service_newapi"
+	return candidate
+}
+
+func codexSearch(t *testing.T, handler http.Handler, official bool) *httptest.ResponseRecorder {
+	t.Helper()
+	search := codexClientRequest("/v1/alpha/search", `{"id":"`+codexTestSession+`","model":"gpt-5.6-sol","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"find a fox"}]}],"commands":{"search_query":[{"q":"fox"}]}}`, official)
+	search.Header.Set("X-Codex-Turn-Metadata", `{"session_id":"`+codexTestSession+`","turn_id":"`+codexTestTurn+`"}`)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, search)
+	return response
+}
+
+func assertNoGatewayHeaders(t *testing.T, header http.Header) {
+	t.Helper()
+	for name := range header {
+		if strings.EqualFold(name, transport.OpenAIActorAuthorizationHeader) || strings.Contains(strings.ToLower(name), "astrlink") {
+			t.Fatalf("search request carried %s", name)
+		}
+	}
+}
+
+func TestCodexSearchReachesTheTurnsNewAPI(t *testing.T) {
+	upstream := &codexToolUpstream{t: t}
+	server := httptest.NewServer(upstream)
+	defer server.Close()
+	store := newRedirectSettingsStore()
+	store.settings.BuiltinTools = &contract.BuiltinTools{}
+	handler := NewWithDependencies(Dependencies{
+		Resolver:       codexToolResolver{candidateResolver{candidates: []endpoint.Resolved{codexToolNewAPI(server.URL)}}},
+		Authorizer:     endpoint.NewServiceAuthorizer(codingPlanCredentials{}, codingPlanCredentials{}),
+		RequestRecords: store,
+	})
+	codexTurn(t, handler, true)
+	if response := codexSearch(t, handler, true); response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "native search result") {
+		t.Fatalf("search = %d %s", response.Code, response.Body.String())
+	}
+	call := upstream.last(t, "/alpha/search")
+	// Only a subscription's turns scope the session ID to the account.
+	if call.path != "/v1/alpha/search" || call.body["model"] != "gpt-5.6-sol" || call.body["id"] != codexTestSession || call.header.Get("Authorization") != "Bearer plan-key" {
+		t.Fatalf("search upstream = %s %v %v", call.path, call.body, call.header)
+	}
+	assertNoGatewayHeaders(t, call.header)
+	for _, record := range store.snapshot() {
+		if record.InputProtocol == contract.ProtocolOpenAISearch && (record.Status != contract.RequestStatusSucceeded || record.ServiceID == nil || *record.ServiceID != "service_newapi") {
+			t.Fatalf("search record = %s %v", record.Status, record.ServiceID)
+		}
+	}
+}
+
+func TestCodexSearchUsesTheConfiguredSearchAPI(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		turnBy   string
+		searchBy contract.ServiceID
+		official bool
+		path     string
+		// identity reports whether the search keeps the official client's
+		// own identity.
+		identity bool
+	}{
+		{name: "New API while a subscription served the turn", turnBy: "codex", searchBy: "service_newapi", official: true, path: "/v1/alpha/search"},
+		{name: "the subscription that served an official turn", turnBy: "codex", searchBy: "service_codex", official: true, path: "/backend-api/codex/alpha/search", identity: true},
+		{name: "the subscription that served a third-party turn", turnBy: "codex", searchBy: "service_codex", path: "/backend-api/codex/alpha/search"},
+		{name: "a subscription that did not serve the turn", turnBy: "newapi", searchBy: "service_codex", official: true, path: "/backend-api/codex/alpha/search"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			upstream := &codexToolUpstream{t: t}
+			server := httptest.NewServer(upstream)
+			defer server.Close()
+			candidates := []endpoint.Resolved{codexToolSubscription(server.URL), codexToolNewAPI(server.URL)}
+			if test.turnBy == "newapi" {
+				candidates[0], candidates[1] = candidates[1], candidates[0]
+			}
+			store := newRedirectSettingsStore()
+			store.settings.BuiltinTools = &contract.BuiltinTools{WebSearch: contract.BuiltinTool{Enabled: true, Backend: "service_search", ServiceID: test.searchBy, Model: "gpt-5.5-search"}}
+			handler := NewWithDependencies(Dependencies{
+				Resolver:       codexToolResolver{candidateResolver{candidates: candidates}},
+				Authorizer:     endpoint.NewServiceAuthorizer(codingPlanCredentials{}, codingPlanCredentials{}, accountauth.CodexIdentityPolicy{}),
+				RequestRecords: store,
+			})
+			codexTurn(t, handler, test.official)
+			if response := codexSearch(t, handler, test.official); response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "native search result") {
+				t.Fatalf("search = %d %s", response.Code, response.Body.String())
+			}
+			call := upstream.last(t, "/alpha/search")
+			// The provider gets Codex's search as it is, with the
+			// configured model.
+			if call.path != test.path || call.body["model"] != "gpt-5.5-search" || builtintools.Text(call.body["commands"]) != `{"search_query":[{"q":"fox"}]}` || !strings.Contains(builtintools.Text(call.body["input"]), "find a fox") {
+				t.Fatalf("search upstream = %s %v", call.path, call.body)
+			}
+			assertNoGatewayHeaders(t, call.header)
+			if test.searchBy == "service_newapi" {
+				if call.header.Get("Authorization") != "Bearer plan-key" {
+					t.Fatalf("search Authorization = %q", call.header.Get("Authorization"))
+				}
+			} else {
+				turn := upstream.last(t, "/responses")
+				if call.header.Get("Authorization") != "Bearer subscription-token" || call.header.Get("User-Agent") == "" || call.header.Get("originator") == "" {
+					t.Fatalf("search headers = %v", call.header)
+				}
+				if official := call.header.Get("User-Agent") == codexTestUA; official != test.identity {
+					t.Fatalf("search User-Agent = %q", call.header.Get("User-Agent"))
+				}
+				if test.turnBy == "codex" && (call.header.Get("User-Agent") != turn.header.Get("User-Agent") || call.header.Get("originator") != turn.header.Get("originator")) {
+					t.Fatalf("search identity %v differs from its turn's %v", call.header, turn.header)
+				}
+			}
+			for _, record := range store.snapshot() {
+				if record.InputProtocol == contract.ProtocolOpenAISearch && (record.Status != contract.RequestStatusSucceeded || record.ServiceID == nil || *record.ServiceID != test.searchBy) {
+					t.Fatalf("search record = %s %v", record.Status, record.ServiceID)
+				}
+			}
+		})
+	}
+}
+
+func TestConfiguredSearchAPIFailuresKeepTheCodexTurn(t *testing.T) {
+	upstream := &codexToolUpstream{t: t, searchBody: `<html>maintenance</html>`}
+	server := httptest.NewServer(upstream)
+	defer server.Close()
+	plain := codexToolNewAPI(server.URL)
+	plain.Service.ID = "service_plain"
+	plain.Service.Kind = contract.ServiceKindOpenAI
+	for _, test := range []struct {
+		service contract.ServiceID
+		want    string
+	}{
+		{"service_newapi", "invalid search answer"},
+		{"service_plain", "does not offer a search API"},
+		{"service_missing", "unavailable or disabled"},
+	} {
+		store := newRedirectSettingsStore()
+		store.settings.BuiltinTools = &contract.BuiltinTools{WebSearch: contract.BuiltinTool{Enabled: true, Backend: "service_search", ServiceID: test.service, Model: "gpt-5.5-search"}}
+		handler := NewWithDependencies(Dependencies{
+			Resolver:       codexToolResolver{candidateResolver{candidates: []endpoint.Resolved{codexToolNewAPI(server.URL), plain}}},
+			Authorizer:     endpoint.NewServiceAuthorizer(codingPlanCredentials{}, codingPlanCredentials{}),
+			RequestRecords: store,
+		})
+		// A failed search ends the whole Codex turn, so it answers 200.
+		if output := searchOutput(t, codexSearch(t, handler, true)); !strings.Contains(output, test.want) {
+			t.Fatalf("%s search output = %q", test.service, output)
+		}
+		for _, record := range store.snapshot() {
+			if record.InputProtocol == contract.ProtocolOpenAISearch && record.Status != contract.RequestStatusFailed {
+				t.Fatalf("%s search record = %s", test.service, record.Status)
+			}
+		}
+	}
+}
+
+func TestBuiltinToolTestThroughAProviderSearchAPI(t *testing.T) {
+	upstream := &codexToolUpstream{t: t}
+	server := httptest.NewServer(upstream)
+	defer server.Close()
+	store := newRedirectSettingsStore()
+	handler := NewWithDependencies(Dependencies{
+		Resolver:       codexToolResolver{candidateResolver{candidates: []endpoint.Resolved{codexToolSubscription(server.URL), codexToolNewAPI(server.URL)}}},
+		Authorizer:     endpoint.NewServiceAuthorizer(codingPlanCredentials{}, codingPlanCredentials{}, accountauth.CodexIdentityPolicy{}),
+		RequestRecords: store,
+	})
+	for _, test := range []struct {
+		service             contract.ServiceID
+		path, authorization string
+	}{
+		{"service_newapi", "/v1/alpha/search", "Bearer plan-key"},
+		{"service_codex", "/backend-api/codex/alpha/search", "Bearer subscription-token"},
+	} {
+		config := contract.BuiltinTool{Enabled: true, Backend: "service_search", ServiceID: test.service, Model: "gpt-5.5-search"}
+		if result, err := handler.TestBuiltinTool(context.Background(), "web_search", config); err != nil || result["ok"] != true {
+			t.Fatalf("%s test = %v %v", test.service, result, err)
+		}
+		upstream.mu.Lock()
+		call := upstream.calls[len(upstream.calls)-1]
+		upstream.mu.Unlock()
+		if call.path != test.path || call.body["model"] != "gpt-5.5-search" || builtintools.Text(call.body["commands"]) != `{"search_query":[{"q":"OpenAI official website"}]}` || call.header.Get("Authorization") != test.authorization {
+			t.Fatalf("%s search upstream = %s %v %v", test.service, call.path, call.body, call.header)
+		}
+		// A request the gateway writes itself carries no Go client identity.
+		if strings.HasPrefix(call.header.Get("User-Agent"), "Go-http-client") {
+			t.Fatalf("%s search User-Agent = %q", test.service, call.header.Get("User-Agent"))
+		}
+		assertNoGatewayHeaders(t, call.header)
+	}
+	for _, record := range store.snapshot() {
+		if record.Status != contract.RequestStatusSucceeded || record.ServiceID == nil {
+			t.Fatalf("test record = %s %v", record.Status, record.ServiceID)
+		}
+	}
+}
+
+// A client's hosted web_search, mapped to a provider's search API, runs as
+// Codex's own search command against that API.
+func TestHostedWebSearchThroughAProviderSearchAPI(t *testing.T) {
+	var mu sync.Mutex
+	var searches []builtintools.Object
+	var toolOutput string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body builtintools.Object
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.URL.Path {
+		case "/v1/alpha/search":
+			if r.Header.Get("Authorization") != "Bearer plan-key" {
+				t.Errorf("search Authorization = %q", r.Header.Get("Authorization"))
+			}
+			searches = append(searches, body)
+			_, _ = io.WriteString(w, `{"output":"[turn0search0] Example: the fact is 42.","results":[{"type":"text_result","ref_id":"turn0search0","url":"https://example.com/fact","title":"Example"}]}`)
+		case "/v1/responses":
+			var output []any
+			if input := builtintools.Text(body["input"]); strings.Contains(input, "function_call_output") {
+				toolOutput = input
+				output = []any{builtinMessage("[Example](https://example.com/fact) says 42.")}
+			} else {
+				tool := builtintools.Map(builtintools.Array(body["tools"])[0])
+				output = []any{builtintools.Object{"type": "function_call", "id": "fc_main", "name": tool["name"], "call_id": "call_main", "arguments": `{"action":"search","query":"fact"}`, "status": "completed"}}
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			response := builtintools.Object{"id": builtintools.ID("resp_"), "object": "response", "model": body["model"], "status": "completed", "output": output, "usage": builtintools.Object{"input_tokens": 2, "output_tokens": 1, "total_tokens": 3}}
+			_, _ = fmt.Fprintf(w, "event: response.completed\ndata: %s\n\n", builtintools.Text(builtintools.Object{"type": "response.completed", "response": response}))
+		default:
+			t.Errorf("unexpected upstream path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	main := wsCandidate(server.URL)
+	main.Service.ID = "service_main"
+	main.Service.Models = []string{"main"}
+	main.Service.ResponsesWebSocketEnabled = nil
+	store := newRedirectSettingsStore()
+	store.settings.BuiltinTools = &contract.BuiltinTools{WebSearch: contract.BuiltinTool{Enabled: true, Backend: "service_search", ServiceID: "service_newapi", Model: "gpt-5.5-search"}}
+	handler := NewWithDependencies(Dependencies{
+		Resolver:       codexToolResolver{candidateResolver{candidates: []endpoint.Resolved{main, codexToolNewAPI(server.URL)}}},
+		Authorizer:     endpoint.NewServiceAuthorizer(codingPlanCredentials{}, codingPlanCredentials{}),
+		RequestRecords: store,
+	})
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"main","input":"Find a fact","tools":[{"type":"web_search","search_context_size":"low"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"type":"web_search_call"`) || !strings.Contains(response.Body.String(), "https://example.com/fact") {
+		t.Fatalf("response = %d %s", response.Code, response.Body.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(searches) != 1 || searches[0]["model"] != "gpt-5.5-search" || builtintools.Text(searches[0]["commands"]) != `{"search_query":[{"q":"fact"}]}` || builtintools.Text(searches[0]["settings"]) != `{"search_context_size":"low"}` {
+		t.Fatalf("searches = %v", searches)
+	}
+	// The main model reads the provider's output and each result's URL.
+	if !strings.Contains(toolOutput, "the fact is 42") || !strings.Contains(toolOutput, "https://example.com/fact") {
+		t.Fatalf("tool output = %s", toolOutput)
+	}
 }

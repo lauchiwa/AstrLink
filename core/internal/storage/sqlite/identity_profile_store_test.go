@@ -26,6 +26,19 @@ func newStoredIdentityCandidate(t *testing.T, id contract.IdentityProfileID, ser
 	return contract.IdentityProfile{ID: id, ServiceID: serviceID, Client: contract.IdentityClientCodexCLI, Source: contract.IdentityProfileBuiltin, Fingerprint: fingerprint}
 }
 
+// migrationsBeforeNamed returns every migration before the named one, so the
+// fixture is the schema an older Core left behind before that step existed.
+func migrationsBeforeNamed(t *testing.T, migrations []migrate.Migration, name string) []migrate.Migration {
+	t.Helper()
+	for index, migration := range migrations {
+		if migration.Name == name {
+			return migrations[:index]
+		}
+	}
+	t.Fatalf("migration %q is missing", name)
+	return nil
+}
+
 func TestIdentityProfileUpgradeRestartAndServiceCascade(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "profiles.db")
@@ -33,8 +46,9 @@ func TestIdentityProfileUpgradeRestartAndServiceCascade(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	all := migrate.DefaultMigrations()
-	previous := all[:len(all)-1]
+	// Slice by name, not position: upstream has renumbered the profile step
+	// three times, and a positional slice silently seeds the wrong history.
+	previous := migrationsBeforeNamed(t, migrate.DefaultMigrations(), "service_identity_profiles")
 	old, err := migrate.New(migrate.SQLDatabase{DB: db}, previous)
 	if err != nil {
 		t.Fatal(err)

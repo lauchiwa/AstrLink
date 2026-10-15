@@ -523,6 +523,60 @@ func TestServiceResponsesWebSocketDefaultsAndPersistence(t *testing.T) {
 	}
 }
 
+func TestServicePrivacyTrustPersistsAcrossUpdates(t *testing.T) {
+	ctx := context.Background()
+	store, handler := newServiceHandler(t, "service_trusted_api", "service_trusted_codex", "service_trusted_null", "service_trusted_text")
+	api := createServiceForTest(t, handler, `{"name":"API","kind":"openai","privacy_trusted":true,"http":{"base_url":"https://api.example/v1","auth":{"scheme":"none"}},"capabilities":[{"protocol":"openai.chat","mode":"native","streaming":true}]}`)
+	if !api.PrivacyTrusted {
+		t.Fatal("created trust lost")
+	}
+	codex := createServiceForTest(t, handler, `{"name":"Codex","kind":"codex_subscription"}`)
+	if codex.PrivacyTrusted {
+		t.Fatal("a provider must not be trusted by default")
+	}
+	for _, body := range []string{
+		`{"name":"Bad","kind":"codex_subscription","privacy_trusted":null}`,
+		`{"name":"Bad","kind":"codex_subscription","privacy_trusted":"yes"}`,
+	} {
+		if response := serviceRequestForTest(t, handler, http.MethodPost, ServicesPath, "application/json", body, ""); response.Code != 422 {
+			t.Fatalf("accepted %s: %d %s", body, response.Code, response.Body.String())
+		}
+	}
+
+	record, err := store.GetService(ctx, codex.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := serviceRequestForTest(t, handler, http.MethodPatch, ServicesPath+"/"+string(codex.ID), "application/merge-patch+json", `{"privacy_trusted":true}`, record.ETag)
+	if response.Code != 200 {
+		t.Fatalf("patch %d %s", response.Code, response.Body.String())
+	}
+	saved, err := store.GetService(ctx, codex.ID)
+	if err != nil || !saved.Service.PrivacyTrusted {
+		t.Fatalf("persisted trust %v %v", saved, err)
+	}
+	// A token refresh rewrites the subscription document from its account.
+	account, err := saved.Service.SubscriptionAccountView()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutSubscriptionAccount(ctx, account); err != nil {
+		t.Fatal(err)
+	}
+	refreshed, err := store.GetService(ctx, codex.ID)
+	if err != nil || !refreshed.Service.PrivacyTrusted {
+		t.Fatalf("trust after account update %v %v", refreshed, err)
+	}
+	response = serviceRequestForTest(t, handler, http.MethodPatch, ServicesPath+"/"+string(codex.ID), "application/merge-patch+json", `{"privacy_trusted":null}`, refreshed.ETag)
+	if response.Code != 422 {
+		t.Fatalf("accepted null: %d", response.Code)
+	}
+	response = serviceRequestForTest(t, handler, http.MethodPatch, ServicesPath+"/"+string(codex.ID), "application/merge-patch+json", `{"privacy_trusted":false}`, refreshed.ETag)
+	if response.Code != 200 || strings.Contains(response.Body.String(), "privacy_trusted") {
+		t.Fatalf("revoke %d %s", response.Code, response.Body.String())
+	}
+}
+
 func TestServiceModelRedirectsPersist(t *testing.T) {
 	store, handler := newServiceHandler(t, "service_copilot_default", "service_redirect_api", "service_redirect_bad")
 	copilot := createServiceForTest(t, handler, `{"name":"Copilot","kind":"copilot_subscription"}`)
@@ -556,6 +610,58 @@ func TestServiceModelRedirectsPersist(t *testing.T) {
 	}
 	if cleared, err := store.GetService(context.Background(), copilot.ID); err != nil || cleared.Service.ModelRedirects != nil {
 		t.Fatalf("cleared = %#v, %v", cleared.Service.ModelRedirects, err)
+	}
+}
+
+func TestServiceModelProtocolsPersist(t *testing.T) {
+	store, handler := newServiceHandler(t, "service_format_api", "service_format_bad_one", "service_format_bad_two",
+		"service_format_bad_three", "service_format_copilot")
+	api := createServiceForTest(t, handler, `{"name":"API","kind":"newapi","http":{"base_url":"https://newapi.example","auth":{"scheme":"bearer"},"credential":{"secret":"key"}},"capabilities":[{"protocol":"openai.responses","mode":"native","streaming":true}],"models":["gpt-x","gemini-x"],"model_protocols":[{"model":"gpt-x","protocol":"openai.chat"},{"model":"gemini-x","protocol":"google.generate_content"}]}`)
+	if len(api.ModelProtocols) != 2 || api.ModelProtocols[0].Model != "gemini-x" || api.ModelProtocols[1].Protocol != contract.ProtocolOpenAIChat {
+		t.Fatalf("created formats = %#v", api.ModelProtocols)
+	}
+	for _, formats := range []string{
+		`[{"model":"gpt-x","protocol":"openai.embeddings"}]`,
+		`[{"model":"gpt-x","protocol":"openai.chat"},{"model":"gpt-x","protocol":"openai.responses"}]`,
+		`[{"model":"gpt-x","protocol":"openai.chat","enabled":true}]`,
+	} {
+		if response := serviceRequestForTest(t, handler, http.MethodPost, ServicesPath, "application/json",
+			`{"name":"Bad","kind":"newapi","http":{"base_url":"https://newapi.example","auth":{"scheme":"none"}},"capabilities":[{"protocol":"openai.chat","mode":"native","streaming":true}],"model_protocols":`+formats+`}`, ""); response.Code != 422 {
+			t.Fatalf("accepted %s: %d %s", formats, response.Code, response.Body.String())
+		}
+	}
+	copilot := createServiceForTest(t, handler, `{"name":"Copilot","kind":"copilot_subscription"}`)
+	record, err := store.GetService(context.Background(), copilot.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := ServicesPath + "/" + string(copilot.ID)
+	if response := serviceRequestForTest(t, handler, http.MethodPatch, path, "application/merge-patch+json",
+		`{"model_protocols":[{"model":"gemini-3.1-pro","protocol":"google.generate_content"}]}`, record.ETag); response.Code != 422 {
+		t.Fatalf("accepted a format Copilot is not called in: %d %s", response.Code, response.Body.String())
+	}
+	if response := serviceRequestForTest(t, handler, http.MethodPatch, path, "application/merge-patch+json",
+		`{"model_protocols":[{"model":"gpt-5.4","protocol":"openai.chat"}]}`, record.ETag); response.Code != 200 {
+		t.Fatalf("patch %d %s", response.Code, response.Body.String())
+	}
+	saved, err := store.GetService(context.Background(), copilot.ID)
+	if err != nil || len(saved.Service.ModelProtocols) != 1 {
+		t.Fatalf("persisted = %#v, %v", saved.Service, err)
+	}
+	account, err := saved.Service.SubscriptionAccountView()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutSubscriptionAccount(context.Background(), account); err != nil {
+		t.Fatal(err)
+	}
+	refreshed, err := store.GetService(context.Background(), copilot.ID)
+	if err != nil || len(refreshed.Service.ModelProtocols) != 1 {
+		t.Fatalf("formats after account update = %#v, %v", refreshed.Service.ModelProtocols, err)
+	}
+	if response := serviceRequestForTest(t, handler, http.MethodPatch, path, "application/merge-patch+json", `{"model_protocols":[]}`, refreshed.ETag); response.Code != 200 ||
+		strings.Contains(response.Body.String(), "model_protocols") {
+		t.Fatalf("clear %d %s", response.Code, response.Body.String())
 	}
 }
 

@@ -49,6 +49,14 @@ function readSource(relativePath: string): string {
   return readFileSync(`${srcDirectory}/${relativePath}`, "utf8");
 }
 
+/**
+ * Two effects need a gradient without painting a surface: the running shimmer
+ * sweeps a fading band through text, and the scroll edge fade is an alpha
+ * mask. Each stays inside its own utility.
+ */
+const gradientEffects =
+  /^@utility (?:shimmer|scroll-fade-[xy]) \{$[\s\S]*?^\}$/gm;
+
 function productionSources(): Array<[string, string]> {
   return readdirSync(srcDirectory)
     .filter(
@@ -141,7 +149,7 @@ describe("paper/hairline design system", () => {
     expect(globals).toContain("--color-tide: var(--tide);");
 
     for (const [name, source] of [
-      ["styles/globals.css", globals] as const,
+      ["styles/globals.css", globals.replace(gradientEffects, "")] as const,
       ...migratedSources.map(
         (path) => [path, readSource(path)] as [string, string],
       ),

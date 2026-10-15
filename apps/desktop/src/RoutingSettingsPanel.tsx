@@ -2,6 +2,7 @@ import { BuiltinToolsEditor } from "./components/BuiltinToolsEditor";
 import { useWorkspaceSnapshot } from "./workspace-snapshots";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { getRoutingSettings, updateRoutingSettings } from "./bridge";
+import { controlErrorMessage } from "./control-error";
 import { ChannelStickinessEditor } from "./components/ChannelStickinessEditor";
 import { FailurePolicyEditor } from "./components/FailurePolicyEditor";
 import {
@@ -9,23 +10,34 @@ import {
   RecoveryOrderControls,
 } from "./components/FailoverEditor";
 import { FormMessage } from "./components/FormMessage";
+import { ImageCompressionEditor } from "./components/ImageCompressionEditor";
 import { ModelRedirectEditor } from "./components/ModelRedirectEditor";
 import { Panel, PanelHeader } from "./components/Panel";
 import { Button } from "./components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./components/ui/tabs";
 import {
+  Boxes,
+  Fingerprint,
+  SquarePen,
+  type AnimatedIcon,
+} from "./components/icons";
+import { defaultBuiltinTools } from "./builtin-tools-model";
+import {
+  defaultImageCompression,
   identityLearningKeys,
   identitySettingKeys,
   identityVersionKeys,
-  modelRedirectIssues,
   parseRoutingSettings,
   subscriptionProtectionKeys,
+  thinkingPromptKeys,
   type RoutingSettings,
 } from "./failure-policy-model";
-import { useT } from "./i18n";
+import { currentLocale, useT } from "./i18n";
 import { PageHeader } from "./PageHeader";
 import type { RoutableService } from "./service-model";
+import { ThinkingPromptSettings } from "./ThinkingPromptSettings";
 import { UpstreamIdentitySettings } from "./UpstreamIdentitySettings";
+import { useGatewayResponseTimeout } from "./use-gateway-response-timeout";
 
 export const routingAutosaveDelay = 500;
 
@@ -37,19 +49,114 @@ const routingSettingKeys = [
   "channel_stickiness",
   "model_redirects",
   "builtin_tools",
+  "image_compression",
   ...identitySettingKeys,
   ...subscriptionProtectionKeys,
   ...identityLearningKeys,
   ...identityVersionKeys,
+  ...thinkingPromptKeys,
 ] as const;
+type RoutingSettingKey = (typeof routingSettingKeys)[number];
 
-const routingTabs = [
-  "modelsAndTools",
-  "recovery",
-  "rules",
-  "session",
-  "identity",
+const routingTabs: ReadonlyArray<{
+  value: string;
+  icon?: AnimatedIcon;
+  keys: readonly RoutingSettingKey[];
+}> = [
+  {
+    value: "rewrite",
+    icon: SquarePen,
+    keys: ["image_compression", ...thinkingPromptKeys],
+  },
+  {
+    value: "redirects",
+    icon: Boxes,
+    keys: ["model_redirects", "builtin_tools"],
+  },
+  {
+    value: "recovery",
+    keys: [
+      "default_failure_policy",
+      "allow_unmatched_failover",
+      "strategy",
+      "max_attempts",
+    ],
+  },
+  { value: "rules", keys: ["default_failure_policy"] },
+  { value: "session", keys: ["channel_stickiness"] },
+  {
+    value: "identity",
+    icon: Fingerprint,
+    keys: [
+      ...identitySettingKeys,
+      ...subscriptionProtectionKeys,
+      ...identityLearningKeys,
+      ...identityVersionKeys,
+    ],
+  },
 ];
+
+const same = (left: unknown, right: unknown) =>
+  JSON.stringify(left) === JSON.stringify(right);
+
+/**
+ * What an autosave sends: each changed setting, and each built-in tool on its
+ * own, that is valid on top of the saved document. An incomplete one stays
+ * pending in the draft without holding back the rest.
+ */
+function planAutosave(original: RoutingSettings, draft: RoutingSettings) {
+  type Unit = (document: RoutingSettings) => RoutingSettings;
+  let units: { key: RoutingSettingKey; apply: Unit }[] = [];
+  for (const key of routingSettingKeys) {
+    if (same(draft[key], original[key])) continue;
+    const tools = draft.builtin_tools;
+    const kinds =
+      key === "builtin_tools" && tools
+        ? (["web_search", "image_generation"] as const).filter(
+            (kind) => !same(tools[kind], original.builtin_tools?.[kind]),
+          )
+        : [];
+    if (tools && kinds.length)
+      for (const kind of kinds)
+        units.push({
+          key,
+          apply: (document) => ({
+            ...document,
+            builtin_tools: {
+              ...(document.builtin_tools ?? defaultBuiltinTools()),
+              [kind]: tools[kind],
+            },
+          }),
+        });
+    else
+      units.push({
+        key,
+        apply: (document) => ({ ...document, [key]: draft[key] }),
+      });
+  }
+  let sent = original;
+  // Settings validated together, such as the adaptive range, may only fit
+  // once another has gone in, so passes repeat while one is accepted.
+  for (let accepted = true; accepted; ) {
+    accepted = false;
+    units = units.filter(({ apply }) => {
+      const candidate = apply(sent);
+      try {
+        parseRoutingSettings(candidate);
+      } catch {
+        return true;
+      }
+      sent = candidate;
+      accepted = true;
+      return false;
+    });
+  }
+  const patch: Partial<RoutingSettings> = {};
+  for (const key of routingSettingKeys)
+    if (!same(sent[key], original[key]))
+      Object.assign(patch, { [key]: sent[key] });
+  return { patch, sent, pending: units.map(({ key }) => key) };
+}
 
 // A document without the key has no redirects; compare and edit it as [].
 function withRedirects(settings: RoutingSettings): RoutingSettings {
@@ -68,7 +175,8 @@ export function RoutingSettingsPanel({
   onDirtyChange: (dirty: boolean) => void;
 }) {
   const t = useT();
-  const [tab, setTab] = useState("modelsAndTools");
+  const gatewayTimeout = useGatewayResponseTimeout();
+  const [tab, setTab] = useState("rewrite");
   const [settings, setSettings] = useWorkspaceSnapshot<RoutingSettings | null>(
     "routing-settings",
     null,
@@ -83,16 +191,24 @@ export function RoutingSettingsPanel({
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [savedOnce, setSavedOnce] = useState(false);
-  const [validationError, setValidationError] = useState(false);
   const [editingRedirect, setEditingRedirect] = useState(false);
   const draftRef = useRef(draft);
   draftRef.current = draft;
   const [reload, setReload] = useState(0);
   const [showRedirectIssues, setShowRedirectIssues] = useState(false);
   const dirty = draft !== null && JSON.stringify(draft) !== baseline;
-  const redirectsInvalid =
-    draft !== null &&
-    modelRedirectIssues(draft.model_redirects ?? []).some(Boolean);
+  const plan = useMemo(
+    () =>
+      draft && dirty
+        ? planAutosave(JSON.parse(baseline) as RoutingSettings, draft)
+        : undefined,
+    [draft, dirty, baseline],
+  );
+  const pending = plan?.pending ?? [];
+  const incompleteTabs = routingTabs.filter(
+    ({ value, keys }) =>
+      value !== tab && keys.some((key) => pending.includes(key)),
+  );
   const modelOptions = useMemo(
     () =>
       [
@@ -139,29 +255,17 @@ export function RoutingSettingsPanel({
 
   const changeDraft = (next: RoutingSettings) => {
     setError(null);
-    setValidationError(false);
     setShowRedirectIssues(false);
     setDraft(next);
   };
 
   useEffect(() => {
-    if (!draft || !dirty || !ready || saving || error || editingRedirect)
-      return;
+    if (!draft || !plan || !ready || saving || error || editingRedirect) return;
     const submitted = draft;
+    const { patch, sent } = plan;
     const timer = setTimeout(() => {
-      try {
-        parseRoutingSettings(submitted);
-      } catch {
-        setValidationError(true);
-        setShowRedirectIssues(true);
-        return;
-      }
-      const original = JSON.parse(baseline) as RoutingSettings;
-      const patch: Partial<RoutingSettings> = {};
-      for (const key of routingSettingKeys) {
-        if (JSON.stringify(submitted[key]) !== JSON.stringify(original[key]))
-          Object.assign(patch, { [key]: submitted[key] });
-      }
+      if (plan.pending.includes("model_redirects")) setShowRedirectIssues(true);
+      if (Object.keys(patch).length === 0) return;
       mutationVersion.current += 1;
       setSaving(true);
       void updateRoutingSettings(patch)
@@ -169,15 +273,14 @@ export function RoutingSettingsPanel({
           const saved = withRedirects(result);
           setSettings(saved);
           setBaseline(JSON.stringify(saved));
-          // A response acknowledges only its submitted version. Keep edits made
-          // while it was in flight, including a change back to the old value.
+          // A response acknowledges only what it sent. Keep the rest of the
+          // draft: pending settings and edits made while it was in flight,
+          // including a change back to the old value.
           setDraft((current) => {
-            if (!current || current === submitted) return saved;
+            if (!current) return saved;
             const merged = { ...saved };
             for (const key of routingSettingKeys) {
-              if (
-                JSON.stringify(current[key]) !== JSON.stringify(submitted[key])
-              )
+              if (!same(current[key], sent[key]))
                 Object.assign(merged, { [key]: current[key] });
             }
             return merged;
@@ -188,24 +291,12 @@ export function RoutingSettingsPanel({
           // Newer edits get their own attempt; an unchanged failed draft pauses
           // until the user edits it or retries, rather than looping requests.
           if (draftRef.current === submitted)
-            setError(
-              error instanceof Error ? error.message : t("routing.saveFailed"),
-            );
+            setError(controlErrorMessage(error, t("routing.saveFailed")));
         })
         .finally(() => setSaving(false));
     }, routingAutosaveDelay);
     return () => clearTimeout(timer);
-  }, [
-    draft,
-    dirty,
-    ready,
-    saving,
-    error,
-    editingRedirect,
-    baseline,
-    setSettings,
-    t,
-  ]);
+  }, [draft, plan, ready, saving, error, editingRedirect, setSettings, t]);
 
   return (
     <div
@@ -223,17 +314,21 @@ export function RoutingSettingsPanel({
             className="shrink-0 text-xs text-muted-foreground"
             aria-live="polite"
           >
-            {error || validationError
+            {error
               ? t("routing.notSaved")
               : !ready && dirty
                 ? t("routing.waitingConnection")
                 : editingRedirect && dirty
                   ? t("routing.editing")
-                  : saving || dirty
+                  : saving
                     ? t("common.saving")
-                    : savedOnce
-                      ? t("routing.autoSaved")
-                      : t("routing.autosave")}
+                    : pending.length
+                      ? t("routing.incomplete")
+                      : dirty
+                        ? t("common.saving")
+                        : savedOnce
+                          ? t("routing.autoSaved")
+                          : t("routing.autosave")}
           </span>
         }
       />
@@ -263,8 +358,16 @@ export function RoutingSettingsPanel({
           </Button>
         </FormMessage>
       ) : null}
-      {validationError && !redirectsInvalid ? (
-        <FormMessage tone="error">{t("routing.autosaveInvalid")}</FormMessage>
+      {incompleteTabs.length ? (
+        <FormMessage tone="warning">
+          {t("routing.autosaveInvalid", {
+            tabs: new Intl.ListFormat(currentLocale()).format(
+              incompleteTabs.map(({ value }) =>
+                t("routing.tabMention", { tab: t(`routing.tabs.${value}`) }),
+              ),
+            ),
+          })}
+        </FormMessage>
       ) : null}
       <Tabs
         value={tab}
@@ -276,12 +379,13 @@ export function RoutingSettingsPanel({
           aria-label={t("nav.routing")}
           className="min-w-0 shrink-0"
         >
-          {routingTabs.map((value) => (
+          {routingTabs.map(({ value, icon: Icon }) => (
             <TabsTrigger
               key={value}
               value={value}
               onClick={() => setTab(value)}
             >
+              {Icon ? <Icon aria-hidden="true" /> : null}
               {t(`routing.tabs.${value}`)}
             </TabsTrigger>
           ))}
@@ -289,7 +393,23 @@ export function RoutingSettingsPanel({
         {draft ? (
           <>
             <TabsContent
-              value="modelsAndTools"
+              value="rewrite"
+              className="gutter-scroller min-h-0 flex-1 overflow-y-auto pb-1"
+              data-tab-scroller
+            >
+              <fieldset disabled={!ready} className="grid min-w-0 gap-3">
+                <ImageCompressionEditor
+                  value={draft.image_compression ?? defaultImageCompression()}
+                  disabled={!ready}
+                  onChange={(image_compression) =>
+                    changeDraft({ ...draft, image_compression })
+                  }
+                />
+                <ThinkingPromptSettings value={draft} onChange={changeDraft} />
+              </fieldset>
+            </TabsContent>
+            <TabsContent
+              value="redirects"
               className="gutter-scroller flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto pb-1"
               data-tab-scroller
             >
@@ -365,6 +485,7 @@ export function RoutingSettingsPanel({
                     }
                     headingLevel={2}
                     value={draft.default_failure_policy}
+                    gatewayTimeoutSeconds={gatewayTimeout}
                     onChange={(default_failure_policy) =>
                       changeDraft({ ...draft, default_failure_policy })
                     }
@@ -387,6 +508,7 @@ export function RoutingSettingsPanel({
                   hint={t("routing.rulesHint")}
                   headingLevel={2}
                   value={draft.default_failure_policy}
+                  gatewayTimeoutSeconds={gatewayTimeout}
                   onChange={(default_failure_policy) =>
                     changeDraft({ ...draft, default_failure_policy })
                   }

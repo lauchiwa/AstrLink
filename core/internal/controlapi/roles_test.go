@@ -97,6 +97,7 @@ func TestControlRoleMatrix(t *testing.T) {
 		{http.MethodGet, RequestsPath + "/req_missing/children", "", RoleObserver},
 		{http.MethodGet, RequestSessionsPath, "", RoleObserver},
 		{http.MethodGet, UsageSummaryPath, "", RoleObserver},
+		{http.MethodGet, PrivacySummaryPath, "", RoleObserver},
 		{http.MethodGet, AccessTokenUsagePath, "", RoleObserver},
 		{http.MethodGet, AuditSettingsPath, "", RoleObserver},
 		// Observers get the reduced raw_available view.
@@ -110,6 +111,7 @@ func TestControlRoleMatrix(t *testing.T) {
 		{http.MethodGet, ServiceOrderPath, "", RoleObserver},
 		{http.MethodGet, LocalDataPath, "", RoleObserver},
 		{http.MethodGet, ClientIdentitiesPath, "", RoleObserver},
+		{http.MethodGet, ModelMetadataPath + "?model=gpt-5.6", "", RoleObserver},
 
 		{http.MethodGet, AccessTokensPath + "/tok_missing/secret", "", RoleOperator},
 		// The full view needs the operator role or an approved raw grant.

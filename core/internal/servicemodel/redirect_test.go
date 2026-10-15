@@ -176,7 +176,7 @@ func TestModelDiscoveryFollowsSameOriginRedirect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a same-origin redirect was refused: %v", err)
 	}
-	if got := strings.Join(models, ","); got != "first,second" {
+	if got := strings.Join(models.Models, ","); got != "first,second" {
 		t.Fatalf("models = %q", got)
 	}
 	if pages != 2 {

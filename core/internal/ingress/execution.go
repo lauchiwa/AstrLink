@@ -152,7 +152,11 @@ func (handler *Handler) executeCandidatesWithTest(
 	}
 	var rateLimited []endpoint.RateLimitedCandidate
 	schedule := newRecoverySchedule(candidates, body.Replayable())
-	protection := handler.subscriptionProtection(request.Context())
+	routingSettings := handler.requestRoutingSettings(request.Context())
+	protection := subscriptionProtectionFrom(routingSettings)
+	rewrite := gatewayRewriteFrom(routingSettings)
+	compression := imageCompressionFrom(routingSettings)
+	haiku := claudeCodeHaikuRequest(detectClientType(request.Header), classified.Model)
 	// Each official client identity is learned at most once per request.
 	learnedClaude, learnedCodex, learnedGrok := false, false, false
 	// One logical request publishes at most one identity candidate, so retries
@@ -193,10 +197,11 @@ func (handler *Handler) executeCandidatesWithTest(
 		if upstreamModel == "" {
 			upstreamModel = classified.routingModel()
 		}
-		if native := candidate.Service.Kind.ModelNativeProtocol(upstreamModel); native != "" {
+		if format := candidate.Service.ModelProtocol(upstreamModel); format != "" && classified.Protocol.IsModelFormat() {
+			// The model's format replaces the entry row's own conversion.
 			convertTo = ""
-			if native != classified.Protocol {
-				convertTo = native
+			if format != classified.Protocol {
+				convertTo = format
 			}
 		}
 		if test != nil {
@@ -215,7 +220,7 @@ func (handler *Handler) executeCandidatesWithTest(
 			}
 			plan, planErr = planner.BuildRelayKit(planner.RelayKitInput{
 				Service: candidate.Service, InputProtocol: classified.Protocol,
-				UpstreamProtocol: upstreamProtocol, Streaming: classified.Streaming,
+				UpstreamProtocol: upstreamProtocol, UpstreamModel: upstreamModel, Streaming: classified.Streaming,
 				Edges: handler.conversionEngine.Edges(),
 			})
 		} else {
@@ -302,7 +307,7 @@ func (handler *Handler) executeCandidatesWithTest(
 			downstream,
 			attemptRequest,
 			classified,
-			candidate.Service.ID,
+			candidate.Service,
 		)
 		redactions := privacyResult.redactions
 		if request.Context().Err() != nil {
@@ -343,6 +348,32 @@ func (handler *Handler) executeCandidatesWithTest(
 			}
 		}
 
+		// The global system prompt, reasoning settings and image compression
+		// edit the body in the upstream protocol, before the subscription
+		// identity steps below, so an official identity they add or check stays
+		// first. Connection tests send their own fixed request.
+		var reasoning gatewayReasoning
+		var images imageCompressionResult
+		if test == nil {
+			var rewriteErr error
+			reasoning, rewriteErr = handler.applyGatewayRewrite(attemptRequest, plan.UpstreamProtocol, rewrite, haiku)
+			if rewriteErr == nil {
+				images, rewriteErr = handler.applyImageCompression(attemptRequest, plan.UpstreamProtocol, compression)
+			}
+			if rewriteErr != nil {
+				finishPrivacy()
+				if request.Context().Err() != nil {
+					return
+				}
+				last = executionFailure{kind: executionFailureConfiguration, err: rewriteErr, endpointID: candidate.Service.ID}
+				records.noteCandidateRejected(last.endpointID, last.code())
+				if !body.Replayable() {
+					break
+				}
+				continue
+			}
+		}
+
 		clientClass := accountauth.ClientClassUnknown
 		codexForcedStream := false
 		if candidate.Service.Kind == contract.ServiceKindCodexSubscription &&
@@ -356,7 +387,8 @@ func (handler *Handler) executeCandidatesWithTest(
 				handler.learnClientIdentity(request.Context(), contract.SubscriptionProviderOpenAICodex, attemptRequest.Header)
 			}
 			if recognized && protection.officialPassthrough {
-				// A genuine Codex CLI request is forwarded untouched.
+				// A genuine Codex CLI request is forwarded untouched, apart
+				// from the web_search declaration below.
 				clientClass = accountauth.ClientClassOfficial
 			} else {
 				clientClass = accountauth.ClientClassThirdParty
@@ -382,6 +414,17 @@ func (handler *Handler) executeCandidatesWithTest(
 					continue
 				}
 				codexForcedStream = forced
+			}
+			// The backend rejects a replayed hosted web search without a declared
+			// web_search tool, whichever client sent it; compaction has its own
+			// wire shape.
+			if protection.codexRequests && plan.UpstreamProtocol == contract.ProtocolOpenAIResponses {
+				if err := declareCodexWebSearchHistory(attemptRequest); err != nil {
+					finishPrivacy()
+					last = executionFailure{kind: executionFailureConfiguration, err: err, endpointID: candidate.Service.ID}
+					records.noteCandidateRejected(last.endpointID, last.code())
+					continue
+				}
 			}
 		}
 
@@ -634,10 +677,12 @@ func (handler *Handler) executeCandidatesWithTest(
 					request.Context(),
 					candidate,
 					plan,
+					images,
 					handler.requestRecords,
 					handler.recordLogger,
 				)
 				recordSession.noteConversionDiagnostics(contract.ConversionDiagnosticPhaseRequest, conversion.Diagnostics)
+				recordSession.noteGatewayReasoning(reasoning)
 				recordSession.observeOutboundCapture(outbound)
 			}
 			// Capture reads the ORIGINAL inbound request, not this outbound one:
@@ -703,6 +748,12 @@ func (handler *Handler) executeCandidatesWithTest(
 					// without retrying any of its routes.
 					action = contract.FailureFailover
 					schedule.excludeService(candidate.CanonicalService().ID)
+				}
+				if response.StatusCode == http.StatusBadRequest && candidate.Service.Kind == contract.ServiceKindClaudeSubscription &&
+					claudeExtraUsageRejection(response, inspect) {
+					// Another Claude subscription would refuse it as well, or bill
+					// it to extra usage.
+					schedule.excludeKind(contract.ServiceKindClaudeSubscription)
 				}
 				var repaired []byte
 				if response.StatusCode == http.StatusBadRequest && !downstream.Committed() && !accountBlocked &&
@@ -1143,7 +1194,10 @@ func requiresInspectedJSON(protocol contract.ProtocolID) bool {
 		contract.ProtocolOpenAIResponsesCompact,
 		contract.ProtocolAnthropicMessages,
 		contract.ProtocolOpenAIChat,
-		contract.ProtocolOpenAICompletions:
+		contract.ProtocolOpenAICompletions,
+		contract.ProtocolOpenAIEmbeddings,
+		contract.ProtocolRerank,
+		contract.ProtocolGoogleEmbeddings:
 		return true
 	default:
 		return false

@@ -19,12 +19,20 @@ const bridgeMocks = vi.hoisted(() => ({
 
 vi.mock("./bridge", () => bridgeMocks);
 
+const pricingMocks = vi.hoisted(() => ({
+  getOfficialModelLimits: vi.fn(),
+}));
+
+vi.mock("./pricing-bridge", () => pricingMocks);
+
 import type { ConversionEngineCapability } from "./core-model";
 import type { Service } from "./service-model";
 import { ClientSetupDialog } from "./ClientSetupDialog";
+import { notify } from "./notify";
 import type { AccessTokenSummary } from "./access-token-model";
 import type {
   ClientConfigState,
+  ClientConfigOverview,
   ClientConfigStatus,
 } from "./client-config-model";
 
@@ -48,26 +56,31 @@ function statuses(
   claude: Partial<ClientConfigStatus> = {},
   codex: Partial<ClientConfigStatus> = {},
   pi: Partial<ClientConfigStatus> = {},
-): ClientConfigStatus[] {
-  return [
+): ClientConfigOverview {
+  return overview([
     {
       client: "claude",
+      wsl: null,
       detected: true,
       paths: ["/Users/me/.claude/settings.json"],
       state: "not_configured",
       token_id: null,
+      models: {},
       ...claude,
     },
     {
       client: "codex",
+      wsl: null,
       detected: true,
       paths: ["/Users/me/.codex/config.toml"],
       state: "not_configured",
       token_id: null,
+      models: {},
       ...codex,
     },
     {
       client: "pi",
+      wsl: null,
       detected: true,
       paths: [
         "/Users/me/.pi/agent/models.json",
@@ -75,9 +88,23 @@ function statuses(
       ],
       state: "not_configured",
       token_id: null,
+      models: {},
       ...pi,
     },
-  ];
+  ]);
+}
+
+function overview(
+  clients: ClientConfigStatus[],
+  extra: Partial<ClientConfigOverview> = {},
+): ClientConfigOverview {
+  return {
+    clients,
+    wsl_unchecked: [],
+    wsl_localhost: false,
+    cc_switch_wsl: { claude: null, codex: null },
+    ...extra,
+  };
 }
 
 function configured(
@@ -85,6 +112,25 @@ function configured(
   tokenId = token.id,
 ): Partial<ClientConfigStatus> {
   return { state, token_id: tokenId };
+}
+
+/** Every client on this Windows computer and in WSL Ubuntu-24.04. */
+function windowsPlaces(
+  ccSwitchWSL: ClientConfigOverview["cc_switch_wsl"],
+): ClientConfigOverview {
+  const home = (wsl: string | null, root: string) =>
+    statuses(
+      { paths: [`${root}\\.claude\\settings.json`] },
+      { paths: [`${root}\\.codex\\config.toml`] },
+      { paths: [`${root}\\.pi\\agent\\models.json`] },
+    ).clients.map((status) => ({ ...status, wsl }));
+  return overview(
+    [
+      ...home(null, "C:\\Users\\codbitz"),
+      ...home("Ubuntu-24.04", "\\\\wsl$\\Ubuntu-24.04\\home\\codbitz"),
+    ],
+    { wsl_localhost: true, cc_switch_wsl: ccSwitchWSL },
+  );
 }
 
 function dialog(): HTMLElement {
@@ -119,6 +165,16 @@ function card(label: string): HTMLButtonElement {
 
 function cardText(label: string): string {
   return card(label).closest("label")?.textContent ?? "";
+}
+
+function placeOption(label: string): HTMLButtonElement {
+  const match = [
+    ...dialog().querySelectorAll<HTMLButtonElement>(
+      '[data-slot="segmented-control-item"]',
+    ),
+  ].find((item) => item.textContent?.startsWith(label));
+  if (!match) throw new Error(`Missing place: ${label}`);
+  return match;
 }
 
 async function setInput(selector: string, value: string): Promise<void> {
@@ -167,6 +223,7 @@ describe("ClientSetupDialog", () => {
     bridgeMocks.isCCSwitchInstalled.mockResolvedValue(false);
     bridgeMocks.listServices.mockResolvedValue({ items: [] });
     bridgeMocks.getRoutingSettings.mockResolvedValue({ model_redirects: [] });
+    pricingMocks.getOfficialModelLimits.mockResolvedValue(null);
     bridgeMocks.checkClientProxy.mockResolvedValue({
       client: { route: "direct" },
       numeric: null,
@@ -527,6 +584,7 @@ describe("ClientSetupDialog", () => {
       client: "claude",
       models: { sonnetModel: "sonnet-route", fableModel: "fable-route" },
       inferenceUrl: "http://127.0.0.1:8317",
+      wsl: null,
     };
     expect(bridgeMocks.applyClientConfig).toHaveBeenLastCalledWith({
       ...target,
@@ -548,6 +606,50 @@ describe("ClientSetupDialog", () => {
     expect(onClose).not.toHaveBeenCalled();
     expect(cardText("Claude Code")).toContain("已配置");
     expect(button("更新配置")).toBeTruthy();
+  });
+
+  it("starts from the models each config holds and keeps what the user types", async () => {
+    bridgeMocks.getClientConfigStatus.mockResolvedValue(
+      statuses(
+        {
+          ...configured("configured"),
+          models: { model: "claude-main", opusModel: "claude-opus" },
+        },
+        { ...configured("configured"), models: { model: "gpt-5.4" } },
+      ),
+    );
+    bridgeMocks.applyClientConfig.mockResolvedValue({ status: "applied" });
+    await renderDialog();
+    const value = (field: string) =>
+      document.querySelector<HTMLInputElement>(`#client-setup-${field}`)?.value;
+
+    expect(value("model")).toBe("claude-main");
+    expect(value("opusModel")).toBe("claude-opus");
+    expect(value("haikuModel")).toBe("");
+    // An update keeps the models instead of dropping them.
+    await act(async () => button("更新配置").click());
+    expect(bridgeMocks.applyClientConfig).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        client: "claude",
+        models: { model: "claude-main", opusModel: "claude-opus" },
+      }),
+    );
+
+    await act(async () => card("Codex").click());
+    expect(value("model")).toBe("gpt-5.4");
+    expect(button("更新配置").disabled).toBe(false);
+    await setInput("#client-setup-model", "gpt-5.5");
+    await act(async () => card("Pi").click());
+    expect(value("model")).toBe("");
+    await act(async () => card("Codex").click());
+    expect(value("model")).toBe("gpt-5.5");
+    await act(async () => button("更新配置").click());
+    expect(bridgeMocks.applyClientConfig).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        client: "codex",
+        models: { model: "gpt-5.5" },
+      }),
+    );
   });
 
   it("writes nothing when the replacement is cancelled", async () => {
@@ -574,6 +676,51 @@ describe("ClientSetupDialog", () => {
       }),
     );
     expect(onChanged).not.toHaveBeenCalled();
+  });
+
+  it("asks before taking over a client another AstrLink set up", async () => {
+    bridgeMocks.getClientConfigStatus.mockResolvedValue(
+      statuses(
+        {},
+        { ...configured("elsewhere", "token_09"), models: { model: "gpt-5" } },
+      ),
+    );
+    bridgeMocks.applyClientConfig
+      .mockResolvedValueOnce({
+        status: "needs_confirmation",
+        keys: [],
+        gateway: "http://localhost:18318/v1",
+      })
+      .mockResolvedValueOnce({ status: "applied" });
+    await renderDialog();
+
+    expect(cardText("Codex")).toContain("连接其他实例");
+    await act(async () => card("Codex").click());
+    expect(dialog().textContent).toContain(
+      "Codex 现在连接的是这台电脑上的另一个 AstrLink。更新配置后改为连接这里。",
+    );
+    expect(dialog().textContent).not.toContain("当前使用其他令牌");
+    await act(async () => button("更新配置").click());
+    expect(bridgeMocks.applyClientConfig).toHaveBeenLastCalledWith(
+      expect.objectContaining({ client: "codex", replace: false }),
+    );
+    const text = confirmation().textContent;
+    expect(text).toContain("改为连接这个 AstrLink？");
+    expect(text).toContain(
+      "Codex 现在连接的是另一个 AstrLink（http://localhost:18318/v1）。",
+    );
+    expect(text).not.toContain("不是 AstrLink 写入的");
+    expect(onChanged).not.toHaveBeenCalled();
+
+    await act(async () => button("改连并写入", confirmation()).click());
+    expect(bridgeMocks.applyClientConfig).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        client: "codex",
+        models: { model: "gpt-5" },
+        replace: true,
+      }),
+    );
+    expect(onChanged).toHaveBeenCalledOnce();
   });
 
   it("shows why a write failed without closing", async () => {
@@ -603,6 +750,7 @@ describe("ClientSetupDialog", () => {
     await act(async () => button("移除配置", confirmation()).click());
     expect(bridgeMocks.removeClientConfig).toHaveBeenCalledExactlyOnceWith(
       "claude",
+      null,
     );
     expect(onChanged).toHaveBeenCalledOnce();
     expect(button("写入配置")).toBeTruthy();
@@ -645,6 +793,194 @@ describe("ClientSetupDialog", () => {
     expect(bridgeMocks.applyClientConfig).not.toHaveBeenCalled();
   });
 
+  it("writes a client in WSL and explains the WSL network setting", async () => {
+    const inUbuntu = (
+      status: ClientConfigStatus,
+      extra: Partial<ClientConfigStatus> = {},
+    ): ClientConfigStatus => ({
+      ...status,
+      wsl: "Ubuntu",
+      paths: status.paths.map((path) => `\\\\wsl$\\Ubuntu${path}`),
+      detected: false,
+      ...extra,
+    });
+    const local = statuses({ detected: false }).clients;
+    bridgeMocks.getClientConfigStatus.mockResolvedValue(
+      overview(
+        [
+          ...local,
+          inUbuntu(local[0]!, { detected: true }),
+          inUbuntu(local[1]!),
+          inUbuntu(local[2]!),
+        ],
+        { wsl_unchecked: ["Debian"] },
+      ),
+    );
+    bridgeMocks.applyClientConfig.mockResolvedValue({ status: "applied" });
+    await renderDialog();
+
+    // Only Ubuntu has Claude Code, so it is the one place offered.
+    const places = [
+      ...dialog().querySelectorAll('[data-slot="segmented-control-item"]'),
+    ].map((item) => item.textContent);
+    expect(places).toEqual(["WSL · Ubuntu"]);
+    expect(dialog().textContent).toContain(
+      "\\\\wsl$\\Ubuntu/Users/me/.claude/settings.json",
+    );
+    expect(dialog().textContent).toContain(
+      "WSL 里的客户端默认连不上这台电脑的 http://127.0.0.1:8317",
+    );
+    expect(dialog().textContent).toContain("Debian 未运行");
+    await act(async () => button("写入配置").click());
+    expect(bridgeMocks.applyClientConfig).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        client: "claude",
+        wsl: "Ubuntu",
+        replace: false,
+      }),
+    );
+  });
+
+  it("switches between this computer and WSL", async () => {
+    const local = statuses({
+      ...configured("configured"),
+      models: { model: "local-route" },
+    }).clients;
+    bridgeMocks.getClientConfigStatus.mockResolvedValue(
+      overview(
+        [
+          ...local,
+          ...local.map((status) => ({
+            ...status,
+            wsl: "Ubuntu",
+            paths: ["/wsl" + status.paths[0]],
+            state: "not_configured" as const,
+            token_id: null,
+            models: {},
+          })),
+        ],
+        { wsl_localhost: true },
+      ),
+    );
+    await renderDialog();
+    const places = () => [
+      ...dialog().querySelectorAll<HTMLButtonElement>(
+        '[data-slot="segmented-control-item"]',
+      ),
+    ];
+    const place = (label: string) => {
+      const match = places().find((item) =>
+        item.textContent?.startsWith(label),
+      );
+      if (!match) throw new Error(`Missing place: ${label}`);
+      return match;
+    };
+    expect(place("本机").getAttribute("data-state")).toBe("on");
+    // Each place names its own state, so the configured one stands out.
+    expect(places().map((item) => item.textContent)).toEqual([
+      "本机已配置",
+      "WSL · Ubuntu",
+    ]);
+    expect(cardText("Claude Code")).toContain("已配置");
+    expect(dialog().textContent).toContain("/Users/me/.claude/settings.json");
+    expect(button("更新配置")).toBeTruthy();
+    const model = () =>
+      document.querySelector<HTMLInputElement>("#client-setup-model")?.value;
+    expect(model()).toBe("local-route");
+    await act(async () => place("WSL · Ubuntu").click());
+    expect(dialog().textContent).toContain(
+      "/wsl/Users/me/.claude/settings.json",
+    );
+    expect(button("写入配置")).toBeTruthy();
+    // The chosen card and the models follow the chosen place.
+    expect(cardText("Claude Code")).not.toContain("已配置");
+    expect(model()).toBe("");
+    expect(dialog().textContent).not.toContain("移除配置");
+    // Mirrored networking shares localhost, so no network hint.
+    expect(dialog().textContent).not.toContain("networkingMode");
+    await act(async () => card("Codex").click());
+    expect(place("本机").getAttribute("data-state")).toBe("on");
+  });
+
+  it("offers CC Switch's import only in the place it writes", async () => {
+    bridgeMocks.isCCSwitchInstalled.mockResolvedValue(true);
+    bridgeMocks.getClientConfigStatus.mockResolvedValue(
+      windowsPlaces({ claude: null, codex: null }),
+    );
+    await renderDialog();
+    await act(async () => card("Codex").click());
+
+    // By default CC Switch writes the Codex on this computer.
+    expect(placeOption("本机").getAttribute("data-state")).toBe("on");
+    expect(button("改用 CC Switch 导入")).toBeTruthy();
+    expect(dialog().textContent).toContain(
+      "在 CC Switch 中切换供应商会覆盖这里写入的配置。",
+    );
+    expect(dialog().textContent).not.toContain("配置目录覆盖");
+
+    await act(async () => placeOption("WSL · Ubuntu-24.04").click());
+    const text = dialog().textContent;
+    expect(text).not.toContain("改用 CC Switch 导入");
+    expect(text).not.toContain("在 CC Switch 中切换供应商");
+    expect(text).not.toContain("用 CC Switch 导入的配置里没有这项设置");
+    expect(text).toContain(
+      "用 CC Switch 导入时，配置会写入 Codex（本机）。要写入 Codex（WSL · Ubuntu-24.04），在 CC Switch「设置」的「配置目录覆盖（高级）」中，把「Codex 配置目录」设为 \\\\wsl$\\Ubuntu-24.04\\home\\codbitz\\.codex，然后重新打开此窗口。",
+    );
+  });
+
+  it("follows CC Switch's directory settings into WSL, in any case", async () => {
+    bridgeMocks.isCCSwitchInstalled.mockResolvedValue(true);
+    bridgeMocks.openCCSwitchImport.mockResolvedValue(undefined);
+    bridgeMocks.getClientConfigStatus.mockResolvedValue(
+      windowsPlaces({ claude: "ubuntu-24.04", codex: "ubuntu-24.04" }),
+    );
+    const notice = vi.spyOn(notify, "successWithSteps");
+    await renderDialog();
+
+    let text = dialog().textContent;
+    expect(placeOption("本机").getAttribute("data-state")).toBe("on");
+    expect(text).not.toContain("改用 CC Switch 导入");
+    expect(text).not.toContain("通过 CC Switch 导入时不包含 Fable。");
+    expect(text).toContain(
+      "用 CC Switch 导入时，配置会写入 Claude Code（WSL · ubuntu-24.04）。要写入 Claude Code（本机），在 CC Switch「设置」的「配置目录覆盖（高级）」中，把「Claude Code 配置目录」设为 C:\\Users\\codbitz\\.claude，然后重新打开此窗口。",
+    );
+    await act(async () => placeOption("WSL · Ubuntu-24.04").click());
+    text = dialog().textContent;
+    expect(text).toContain("通过 CC Switch 导入时不包含 Fable。");
+    expect(text).not.toContain("配置目录覆盖");
+
+    await act(async () => card("Codex").click());
+    await act(async () => placeOption("WSL · Ubuntu-24.04").click());
+    await setInput("#client-setup-model", "gpt-5");
+    await act(async () => button("改用 CC Switch 导入").click());
+    expect(bridgeMocks.openCCSwitchImport).toHaveBeenCalledExactlyOnceWith({
+      tokenId: token.id,
+      client: "codex",
+      models: { model: "gpt-5" },
+      inferenceUrl: "http://127.0.0.1:8317",
+    });
+    // CC Switch may drop a link that starts it, and AstrLink cannot tell.
+    expect(notice).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining("这时让它保持打开，再导入一次。"),
+    );
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it("shows nothing of CC Switch in any place while it is not installed", async () => {
+    bridgeMocks.getClientConfigStatus.mockResolvedValue(
+      windowsPlaces({ claude: null, codex: "Ubuntu-24.04" }),
+    );
+    await renderDialog();
+    await act(async () => card("Codex").click());
+
+    for (const label of ["本机", "WSL · Ubuntu-24.04"]) {
+      await act(async () => placeOption(label).click());
+      expect(placeOption(label).getAttribute("data-state")).toBe("on");
+      expect(dialog().textContent).not.toContain("改用 CC Switch 导入");
+      expect(dialog().textContent).not.toContain("配置目录覆盖");
+    }
+  });
+
   it("writes Pi itself, even while CC Switch is installed", async () => {
     bridgeMocks.isCCSwitchInstalled.mockResolvedValue(true);
     bridgeMocks.applyClientConfig.mockResolvedValue({ status: "applied" });
@@ -676,6 +1012,7 @@ describe("ClientSetupDialog", () => {
       models: { model: "gpt-5" },
       inferenceUrl: "http://127.0.0.1:8317",
       replace: false,
+      wsl: null,
     });
     expect(bridgeMocks.openCCSwitchImport).not.toHaveBeenCalled();
     expect(onChanged).toHaveBeenCalledOnce();
@@ -688,6 +1025,45 @@ describe("ClientSetupDialog", () => {
     await renderDialog();
     expect(card("Pi").disabled).toBe(true);
     expect(cardText("Pi")).toContain("未安装");
+  });
+
+  it("fills Pi's limits from the official model and writes what the user keeps", async () => {
+    bridgeMocks.applyClientConfig.mockResolvedValue({ status: "applied" });
+    pricingMocks.getOfficialModelLimits.mockImplementation(async (model) =>
+      model === "gpt-5.6"
+        ? { contextTokens: 1050000, outputTokens: 128000 }
+        : null,
+    );
+    await renderDialog();
+    await act(async () => card("Pi").click());
+    const field = (key: string) =>
+      document.querySelector<HTMLInputElement>(`#client-setup-${key}`)!;
+    expect(field("contextWindow").placeholder).toContain("128000");
+
+    await setInput("#client-setup-model", "gpt-5.6");
+    expect(field("contextWindow").value).toBe("1050000");
+    expect(field("maxTokens").value).toBe("128000");
+
+    // The subscription allows less; the user's numbers are written.
+    await setInput("#client-setup-contextWindow", "400000");
+    await setInput("#client-setup-maxTokens", "");
+    await act(async () => button("写入配置").click());
+    expect(bridgeMocks.applyClientConfig).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        models: { model: "gpt-5.6", contextWindow: 400000 },
+      }),
+    );
+
+    // A number Pi cannot take blocks the write.
+    await setInput("#client-setup-maxTokens", "12k");
+    expect(dialog().textContent).toContain("1 到 100000000");
+    expect(button("写入配置").disabled).toBe(true);
+
+    // Another model starts from its own limits; an unknown one from Pi's.
+    await setInput("#client-setup-model", "house-model");
+    expect(field("contextWindow").value).toBe("");
+    expect(field("maxTokens").value).toBe("");
+    expect(button("写入配置").disabled).toBe(false);
   });
 
   it("suggests only compatible enabled models for each client", async () => {

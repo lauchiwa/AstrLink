@@ -20,6 +20,11 @@ fn main() {
     println!(
         "cargo:rustc-env=ASTRLINK_RELEASE_API=https://api.github.com/repos/{repository}/releases"
     );
+    // Fork: upstream's download mirror serves only upstream's releases.
+    println!(
+        "cargo:rustc-env=ASTRLINK_OFFICIAL_MIRROR={}",
+        u8::from(release_repository::official_mirror(&repository))
+    );
     println!("cargo:rerun-if-env-changed=TAURI_UPDATER_PUBLIC_KEY");
     let update_key = std::env::var("TAURI_UPDATER_PUBLIC_KEY").unwrap_or_default();
     assert!(

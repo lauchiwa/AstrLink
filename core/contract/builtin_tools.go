@@ -68,11 +68,14 @@ func (config BuiltinTool) Validate(kind string) error {
 	if !BuiltinToolKind(kind) {
 		return fmt.Errorf("unknown builtin tool")
 	}
-	if config.Backend != "" && config.Backend != "upstream" && config.Backend != "external" && config.Backend != "service_images" {
+	if config.Backend != "" && config.Backend != "upstream" && config.Backend != "external" && config.Backend != "service_images" && config.Backend != "service_search" {
 		return fmt.Errorf("invalid backend")
 	}
 	if config.Backend == "service_images" && kind != "image_generation" {
 		return fmt.Errorf("provider Images API is only available for image generation")
+	}
+	if config.Backend == "service_search" && kind != "web_search" {
+		return fmt.Errorf("provider search API is only available for web search")
 	}
 	if config.Enabled && config.Backend == "" {
 		return fmt.Errorf("backend is required")
@@ -94,7 +97,7 @@ func (config BuiltinTool) Validate(kind string) error {
 		}
 	}
 	if config.Enabled {
-		if config.Backend == "upstream" && (config.ServiceID == "" || config.Model == "") {
+		if (config.Backend == "upstream" || config.Backend == "service_search") && (config.ServiceID == "" || config.Model == "") {
 			return fmt.Errorf("provider and model are required")
 		}
 		if config.Backend == "external" && (config.BaseURL == "" || (kind == "image_generation" && config.Model == "")) {
@@ -115,6 +118,13 @@ func BuiltinToolKind(kind string) bool { return kind == "web_search" || kind == 
 func BuiltinImagesServiceKind(kind ServiceKind) bool {
 	return kind == ServiceKindNewAPI || kind == ServiceKindOpenAI || kind == ServiceKindOpenAICompatible ||
 		kind == ServiceKindMiniMax || kind == ServiceKindMiniMaxCoding
+}
+
+// BuiltinSearchServiceKind reports provider kinds that answer Codex's
+// standalone web search, /alpha/search, with the provider's ordinary
+// credential.
+func BuiltinSearchServiceKind(kind ServiceKind) bool {
+	return kind == ServiceKindCodexSubscription || kind == ServiceKindNewAPI
 }
 
 func (settings BuiltinTools) For(kind string) BuiltinTool {

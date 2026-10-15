@@ -1,5 +1,4 @@
 import { i18n } from "./i18n";
-import { webText } from "./web-copy";
 
 export const CONSOLE_SIGNED_OUT = "astrlink:console-signed-out";
 export const RAW_CHANGED = "astrlink:web-raw-changed";
@@ -14,7 +13,7 @@ export class ConsoleError extends Error {
   ) {
     super(
       code === "oauth_loopback_callback_unavailable"
-        ? webText("loopback")
+        ? i18n.t("webConsole.loopback")
         : code,
     );
   }
@@ -180,6 +179,7 @@ const commands: Record<string, Command> = {
       last_error: null,
       inference_port_fallback: null,
       inference_listen_active: null,
+      restart_pending: false,
       recovery_attempt: 0,
       recovery_scheduled_in_ms: null,
     };
@@ -353,7 +353,7 @@ const commands: Record<string, Command> = {
     return result;
   },
   set_raw_password: (a) => {
-    if (a.action !== "change") throw new Error(webText("forgot"));
+    if (a.action !== "change") throw new Error(i18n.t("webConsole.forgot"));
     return raw("raw-password", {
       action: a.action,
       password: a.password,
@@ -371,6 +371,10 @@ const commands: Record<string, Command> = {
   get_usage_summary: route(
     (a) =>
       `/usage-summary${query({ from: a.from, to: a.to, time_zone: a.timeZone, bucket: a.bucket })}`,
+  ),
+  get_privacy_summary: route(
+    (a) =>
+      `/privacy-summary${query({ from: a.from, to: a.to, time_zone: a.timeZone, bucket: a.bucket })}`,
   ),
   create_access_token: route("/access-tokens", "POST", (a) => ({
     name: a.name,
@@ -455,6 +459,25 @@ const commands: Record<string, Command> = {
       method,
       input,
     )(a);
+  },
+  sync_config: (a) => {
+    const base = "/sync";
+    switch (a.operation) {
+      case "status":
+        return route(`${base}/status`)(a);
+      case "config":
+        return route(`${base}/config`)(a);
+      case "configure":
+        return route(`${base}/config`, "PUT", input)(a);
+      case "passphrase":
+        return route(`${base}/passphrase`, "PUT", input)(a);
+      case "forget":
+        return route(`${base}/passphrase`, "DELETE")(a);
+      case "run":
+        return route(`${base}/run`, "POST")(a);
+      default:
+        throw new Error("Unsupported sync operation");
+    }
   },
 };
 export async function webInvoke<T>(

@@ -19,7 +19,7 @@ describe("HTTP service product presets", () => {
     expect(preset.kind).toBe("newapi");
     expect(preset.authScheme).toBe("bearer");
     expect(preset.baseURL).toBe("");
-    expect(preset.capabilities).toHaveLength(8);
+    expect(preset.capabilities).toHaveLength(11);
     expect(new Set(preset.capabilities.map(({ mode }) => mode))).toEqual(
       new Set(["native"]),
     );
@@ -32,6 +32,9 @@ describe("HTTP service product presets", () => {
       "openai.completions",
       "openai.models",
       "google.models",
+      "openai.embeddings",
+      "google.embeddings",
+      "rerank",
     ]);
   });
 
@@ -100,6 +103,7 @@ describe("HTTP service product presets", () => {
           streaming: true,
         },
         { protocol: "openai.models", mode: "native", streaming: false },
+        { protocol: "openai.embeddings", mode: "native", streaming: false },
       ],
     });
   });
@@ -122,6 +126,7 @@ describe("HTTP service product presets", () => {
           streaming: true,
         },
         { protocol: "openai.models", mode: "native", streaming: false },
+        { protocol: "openai.embeddings", mode: "native", streaming: false },
       ],
     });
     expect(httpServicePreset("anthropic")).toMatchObject({
@@ -146,6 +151,7 @@ describe("HTTP service product presets", () => {
           streaming: true,
         },
         { protocol: "google.models", mode: "native", streaming: false },
+        { protocol: "google.embeddings", mode: "native", streaming: false },
         {
           protocol: "openai.chat",
           mode: "native",
@@ -258,6 +264,33 @@ describe("HTTP service product presets", () => {
             mode === "native" && convert_to === undefined,
         ),
       ).toBe(true);
+    }
+  });
+
+  it("sends OpenCode requests under /inference and takes Gemini clients natively", () => {
+    for (const [kind, baseURL] of [
+      ["opencode_go", "https://opencode.ai/inference/go/v1"],
+      ["opencode_zen", "https://opencode.ai/inference/v1"],
+    ] as const) {
+      const preset = httpServicePreset(kind);
+      expect(preset).toMatchObject({
+        baseURL,
+        baseURLPlaceholder: baseURL,
+        authScheme: "bearer",
+        sites: [{ id: "official", baseURL }],
+      });
+      expect(preset.capabilities).toContainEqual({
+        protocol: "google.generate_content",
+        mode: "native",
+        streaming: true,
+      });
+      expect(
+        preset.capabilities.every(({ convert_to }) => convert_to === undefined),
+      ).toBe(true);
+      // An address saved under the old /zen path still reads as OpenCode's site.
+      expect(serviceSiteForBaseURL(preset, "https://opencode.ai/zen/v1")).toBe(
+        "official",
+      );
     }
   });
 
@@ -421,6 +454,7 @@ describe("default protocol conversions", () => {
         "gemini": [
           "google.generate_content:native:true",
           "google.models:native:false",
+          "google.embeddings:native:false",
           "openai.chat:native:true → google.generate_content",
           "openai.responses:native:true → google.generate_content",
         ],
@@ -481,6 +515,9 @@ describe("default protocol conversions", () => {
           "openai.completions:native:true",
           "openai.models:native:false",
           "google.models:native:false",
+          "openai.embeddings:native:false",
+          "google.embeddings:native:false",
+          "rerank:native:false",
         ],
         "openai": [
           "openai.responses:native:true",
@@ -488,6 +525,7 @@ describe("default protocol conversions", () => {
           "openai.chat:native:true",
           "openai.completions:native:true",
           "openai.models:native:false",
+          "openai.embeddings:native:false",
           "anthropic.messages:native:true → openai.responses",
           "google.generate_content:native:true → openai.responses",
         ],
@@ -495,6 +533,7 @@ describe("default protocol conversions", () => {
           "openai.chat:native:true",
           "openai.completions:native:true",
           "openai.models:native:false",
+          "openai.embeddings:native:false",
           "openai.responses:native:true → openai.chat",
           "anthropic.messages:native:true → openai.chat",
           "google.generate_content:native:true → openai.chat",
@@ -503,12 +542,14 @@ describe("default protocol conversions", () => {
           "openai.responses:native:true",
           "openai.chat:native:true",
           "anthropic.messages:native:true",
+          "google.generate_content:native:true",
           "openai.models:native:false",
         ],
         "opencode_zen": [
           "openai.responses:native:true",
           "openai.chat:native:true",
           "anthropic.messages:native:true",
+          "google.generate_content:native:true",
           "openai.models:native:false",
         ],
         "qwen": [

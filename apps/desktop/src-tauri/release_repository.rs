@@ -34,9 +34,33 @@ pub fn release_repository(
     Ok(slug.to_owned())
 }
 
+/// Upstream's own repository. Only its builds may use upstream's download
+/// mirror (download.astrlink.com, astrlink.com/api/releases): that mirror
+/// serves upstream's releases, so a fork build must update only from its own
+/// GitHub repository.
+const UPSTREAM_REPOSITORY: &str = "Calcium-Ion/AstrLink";
+
+/// Whether a build released from `repository` may offer upstream's mirror.
+pub fn official_mirror(repository: &str) -> bool {
+    repository == UPSTREAM_REPOSITORY
+}
+
 #[cfg(test)]
 mod tests {
-    use super::release_repository;
+    use super::{official_mirror, release_repository};
+
+    #[test]
+    fn only_upstream_builds_offer_the_official_mirror() {
+        assert!(official_mirror("Calcium-Ion/AstrLink"));
+        for repository in [
+            "lauchiwa/AstrLink",
+            "fork/desktop",
+            "Calcium-Ion/AstrLink-fork",
+            "calcium-ion/astrlink",
+        ] {
+            assert!(!official_mirror(repository), "{repository}");
+        }
+    }
 
     #[test]
     fn repository_precedence_is_explicit_then_actions_then_local_config() {

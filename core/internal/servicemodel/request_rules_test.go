@@ -30,7 +30,7 @@ func TestDiscoveryUsesDefaultsInsteadOfModelRulesOnEveryPage(t *testing.T) {
 			ExtraHeaders: map[string]string{"X-Relay-Client": "fake-default-value", "User-Agent": "FakeDiscoveryClient/1.0"},
 			ModelRules:   []contract.ModelRule{{Match: "*", Headers: map[string]string{"X-Relay-Client": "fake-rule-value"}, IdentityProfile: "identity_unused"}},
 		}, []byte("fake-probe-secret"), contract.ProtocolOpenAIModels)
-	if err != nil || len(models) != 2 || calls != 2 {
+	if err != nil || len(models.Models) != 2 || calls != 2 {
 		t.Fatalf("models = %v, calls = %d, error = %v", models, calls, err)
 	}
 }

@@ -97,6 +97,12 @@ var exactProtocolRoutes = map[string]protocolRoute{
 	"/v1/models": {
 		method: http.MethodGet, protocol: contract.ProtocolOpenAIModels,
 	},
+	"/v1/embeddings": {
+		method: http.MethodPost, protocol: contract.ProtocolOpenAIEmbeddings, inspectMetadata: true,
+	},
+	"/v1/rerank": {
+		method: http.MethodPost, protocol: contract.ProtocolRerank, inspectMetadata: true,
+	},
 	// Codex calls these itself for its image and web search tools. The
 	// built-in tools answer them, or the provider that served the turn.
 	"/v1/images/generations": {
@@ -157,7 +163,10 @@ func classify(request *http.Request, maxBodyBytes int64) (Request, error) {
 	if err != nil {
 		return Request{}, err
 	}
-	if result.Protocol != contract.ProtocolOpenAIResponsesCompact {
+	switch result.Protocol {
+	case contract.ProtocolOpenAIResponsesCompact, contract.ProtocolOpenAIEmbeddings,
+		contract.ProtocolGoogleEmbeddings, contract.ProtocolRerank:
+	default:
 		result.Streaming = metadata.Stream
 	}
 	if result.Model == "" {
@@ -224,6 +233,10 @@ func matchProtocolRoute(path string) (protocolRoute, string, bool) {
 	case "streamGenerateContent":
 		return protocolRoute{
 			method: http.MethodPost, protocol: contract.ProtocolGoogleGenerateContent, streaming: true,
+		}, model, true
+	case "embedContent", "batchEmbedContents":
+		return protocolRoute{
+			method: http.MethodPost, protocol: contract.ProtocolGoogleEmbeddings, inspectMetadata: true,
 		}, model, true
 	default:
 		return protocolRoute{}, "", false

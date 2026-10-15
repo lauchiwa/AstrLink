@@ -29,6 +29,7 @@ import (
 	"github.com/QuantumNous/astrlink/core/internal/builtintools"
 	"github.com/QuantumNous/astrlink/core/internal/endpoint"
 	"github.com/QuantumNous/astrlink/core/internal/identitycapture"
+	"github.com/QuantumNous/astrlink/core/internal/imagecompress"
 	"github.com/QuantumNous/astrlink/core/internal/planner"
 	"github.com/QuantumNous/astrlink/core/internal/privacy"
 	"github.com/QuantumNous/astrlink/core/internal/relaykitbridge"
@@ -106,24 +107,24 @@ func (function ClassifierFunc) Classify(ctx context.Context, text string) autocl
 	return function(ctx, text)
 }
 
+// PolicyWarningReporter learns of every request the warn action lets through.
+// The warning names kinds, counts and keyed fingerprints, never a value.
 type PolicyWarningReporter interface {
-	ReportPolicyWarning(contract.ProtocolID, contract.ServiceID, string)
+	ReportPolicyWarning(privacy.Warning)
 }
 
-type PolicyWarningReporterFunc func(contract.ProtocolID, contract.ServiceID, string)
+type PolicyWarningReporterFunc func(privacy.Warning)
 
-func (function PolicyWarningReporterFunc) ReportPolicyWarning(
-	protocol contract.ProtocolID,
-	endpointID contract.ServiceID,
-	summary string,
-) {
-	function(protocol, endpointID, summary)
+func (function PolicyWarningReporterFunc) ReportPolicyWarning(warning privacy.Warning) {
+	function(warning)
 }
 
 type Handler struct {
 	builtinStates            builtintools.Store
 	searchRefs               searchRefStore
 	codexTurns               codexTurnStore
+	codexModels              codexCatalogModels
+	images                   imagecompress.Compressor
 	proxyCredentials         secretstore.SecretStore
 	affinities               responseAffinities
 	resolver                 endpoint.Resolver
@@ -471,24 +472,27 @@ type privacyOutcome struct {
 	toolArguments bool
 }
 
+// applyPrivacy runs the privacy policy on a request bound for service. A
+// backend that is not a configured provider passes an empty service, which is
+// never trusted.
 func (handler *Handler) applyPrivacy(
 	writer http.ResponseWriter,
 	request *http.Request,
 	classified Request,
-	endpointID contract.ServiceID,
+	service contract.Service,
 ) (func(), privacyOutcome, error) {
 	session := recordSessionFromContext(request.Context())
 	session.beginPrivacyAttempt()
 	if handler.privacyFilter == nil {
 		session.notePrivacyDecision("allow", contract.RequestStatusSucceeded)
-		session.notePrivacyOutcome(contract.PrivacyDecisionNone, nil)
+		session.notePrivacyOutcome(contract.PrivacyDecisionNone, nil, nil, nil)
 		return func() {}, privacyOutcome{}, nil
 	}
 	accessTokenID, _ := AccessTokenIDFromContext(request.Context())
 	policy, err := handler.privacyFilter.ResolvePolicy(request.Context(), privacy.Scope{
 		Protocol:      classified.Protocol,
 		Model:         classified.Model,
-		ServiceID:     endpointID,
+		ServiceID:     service.ID,
 		AccessTokenID: accessTokenID,
 	})
 	if err != nil {
@@ -498,7 +502,15 @@ func (handler *Handler) applyPrivacy(
 		// This branch deliberately does not read, replace, or otherwise touch
 		// request.Body. Disabled policy preserves the original byte path.
 		session.notePrivacyDecision("allow", contract.RequestStatusSucceeded)
-		session.notePrivacyOutcome(contract.PrivacyDecisionNone, nil)
+		session.notePrivacyOutcome(contract.PrivacyDecisionNone, nil, nil, nil)
+		return func() {}, privacyOutcome{}, nil
+	}
+	if service.PrivacyTrusted {
+		// A trusted provider gets the original byte path, as with a
+		// disabled policy, and its attempt keeps no restore mapping.
+		session.notePrivacyTrusted()
+		session.notePrivacyDecision("allow · trusted", contract.RequestStatusSucceeded)
+		session.notePrivacyOutcome(contract.PrivacyDecisionTrusted, nil, nil, nil)
 		return func() {}, privacyOutcome{}, nil
 	}
 	encoding := strings.ToLower(strings.TrimSpace(request.Header.Get("Content-Encoding")))
@@ -527,6 +539,9 @@ func (handler *Handler) applyPrivacy(
 			privacyBatchProgress(progress),
 		)
 	})
+	if session != nil {
+		inspectCtx = privacy.WithConversation(inspectCtx, string(session.sessionID))
+	}
 	result, err := handler.privacyFilter.Inspect(
 		inspectCtx,
 		policy,
@@ -536,29 +551,33 @@ func (handler *Handler) applyPrivacy(
 	if err != nil {
 		return finish, privacyOutcome{}, err
 	}
+	threshold := privacyThreshold(policy)
 	switch result.Decision {
 	case privacy.DecisionAllow:
 		session.notePrivacyDecision("allow", contract.RequestStatusSucceeded)
-		session.notePrivacyOutcome(contract.PrivacyDecisionAllow, nil)
+		session.notePrivacyOutcome(contract.PrivacyDecisionAllow, nil, result.SuppressedFindings, threshold)
 		return finish, privacyOutcome{}, nil
 	case privacy.DecisionWarn:
 		// This is a response-only signal. Never add it to request.Header, where
 		// it could cross the upstream boundary.
-		summary := privacy.WarningSummary(result.Findings)
-		writer.Header().Set(PolicyWarningHeader, summary)
+		writer.Header().Set(PolicyWarningHeader, privacy.WarningSummary(result.Findings))
 		if handler.policyWarningReporter != nil {
-			handler.policyWarningReporter.ReportPolicyWarning(
-				classified.Protocol,
-				endpointID,
-				summary,
-			)
+			handler.policyWarningReporter.ReportPolicyWarning(privacy.Warning{
+				RequestID:    session.requestID(),
+				ClientType:   session.inboundClientType(),
+				Protocol:     classified.Protocol,
+				ServiceID:    service.ID,
+				Findings:     result.Findings,
+				Notified:     result.Notified,
+				Fingerprints: result.Fingerprints,
+			})
 		}
 		session.notePrivacyDecision("warn", contract.RequestStatusSucceeded)
-		session.notePrivacyOutcome(contract.PrivacyDecisionWarn, nil)
+		session.notePrivacyOutcome(contract.PrivacyDecisionWarn, result.Findings, result.SuppressedFindings, threshold)
 		return finish, privacyOutcome{}, nil
 	case privacy.DecisionBlock:
 		session.notePrivacyDecision("block", contract.RequestStatusBlocked)
-		session.notePrivacyOutcome(contract.PrivacyDecisionBlock, result.Findings)
+		session.notePrivacyOutcome(contract.PrivacyDecisionBlock, result.Findings, result.SuppressedFindings, threshold)
 		session.noteProtectedValues(result.Protected)
 		return finish, privacyOutcome{}, errPrivacyBlocked
 	case privacy.DecisionRedact:
@@ -569,7 +588,7 @@ func (handler *Handler) applyPrivacy(
 			return finish, privacyOutcome{}, errMetadataTooLarge
 		}
 		buffered.Replace(result.Body)
-		session.notePrivacyOutcome(contract.PrivacyDecisionRedact, result.Findings)
+		session.notePrivacyOutcome(contract.PrivacyDecisionRedact, result.Findings, result.SuppressedFindings, threshold)
 		session.noteProtectedValues(result.Protected)
 		mappingCount := uniqueRedactionMappingCount(result.Redactions)
 		session.notePrivacyMapping(

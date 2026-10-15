@@ -126,7 +126,7 @@ func (handler *Handler) aggregateModelDiscovery(
 			}
 		}
 		session.notePrivacyDecision(decision, contract.RequestStatusSucceeded)
-		session.notePrivacyOutcome(outcome, nil)
+		session.notePrivacyOutcome(outcome, nil, nil, nil)
 	}
 	merged, succeeded := mergeDiscoveryEntries(results)
 	if succeeded == 0 {
@@ -220,6 +220,19 @@ func (handler *Handler) fetchModelDiscovery(
 		}}
 	}
 
+	if candidate.Service.Kind == contract.ServiceKindDroidSubscription {
+		// Factory publishes no model endpoint: the list is the configured one.
+		entries, synthesizeErr := synthesizeDiscoveryEntries(classified.Protocol, candidate.Service.Models)
+		if synthesizeErr != nil {
+			return discoveryResult{outcome: discoveryOutcomeFailed, failure: executionFailure{
+				kind:       executionFailureUpstream,
+				err:        synthesizeErr,
+				endpointID: candidate.Service.ID,
+			}}
+		}
+		return discoveryResult{outcome: discoveryOutcomeFetched, entries: entries}
+	}
+
 	fetchContext, cancelFetch := context.WithTimeout(request.Context(), defaultDiscoveryTimeout)
 	defer cancelFetch()
 	// Discovery fans out concurrently; only the aggregator may mutate the
@@ -240,7 +253,7 @@ func (handler *Handler) fetchModelDiscovery(
 		recorder,
 		fetchRequest,
 		classified,
-		candidate.Service.ID,
+		candidate.Service,
 	)
 	finishPrivacy()
 	if request.Context().Err() != nil {
@@ -376,6 +389,9 @@ func (handler *Handler) fetchModelDiscovery(
 		}
 	} else {
 		entries, entriesErr = parseDiscoveryEntries(classified.Protocol, discoveryBody)
+	}
+	if entriesErr == nil {
+		handler.codexModels.remember(entries)
 	}
 	if entriesErr != nil {
 		return discoveryResult{outcome: discoveryOutcomeFailed, failure: executionFailure{

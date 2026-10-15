@@ -11,13 +11,18 @@ import { Input } from "./components/ui/input";
 import { Field } from "./components/Field";
 import { Panel } from "./components/Panel";
 import { FormMessage } from "./components/FormMessage";
-import { applyLocale, i18n } from "./i18n";
+import {
+  applyLocale,
+  currentLocale,
+  LOCALE_NAMES,
+  LOCALES,
+  useT,
+} from "./i18n";
 import {
   CONSOLE_SIGNED_OUT,
   ConsoleError,
   consoleRequest,
 } from "./web-transport";
-import { useWebText } from "./web-copy";
 
 export interface ConsoleStatus {
   status: "setup_required" | "setup_expired" | "login_required";
@@ -29,28 +34,28 @@ export interface ConsoleStatus {
   password_max_length: number;
 }
 export function ConsoleLanguage() {
-  const t = useWebText();
+  const t = useT();
+  const next = LOCALES[(LOCALES.indexOf(currentLocale()) + 1) % LOCALES.length];
   return (
     <Button
       size="sm"
       variant="ghost"
-      aria-label={t("language")}
+      aria-label={t("settings.language")}
       onClick={() => {
-        const locale = i18n.language.startsWith("zh") ? "en" : "zh-CN";
         try {
-          localStorage.setItem("astrlink:console-locale", locale);
+          localStorage.setItem("astrlink:console-locale", next);
         } catch {
           /* Browsing with storage disabled still supports changing language. */
         }
-        void applyLocale(locale);
+        void applyLocale(next);
       }}
     >
-      {i18n.language.startsWith("zh") ? "English" : "中文"}
+      {LOCALE_NAMES[next]}
     </Button>
   );
 }
 export function ConsoleEntry({ children }: { children: ReactNode }) {
-  const t = useWebText();
+  const t = useT();
   const [resetNoticeDismissed, setResetNoticeDismissed] = useState(false);
   const [status, setStatus] = useState<ConsoleStatus | null>(null);
   const [error, setError] = useState("");
@@ -67,7 +72,7 @@ export function ConsoleEntry({ children }: { children: ReactNode }) {
       setSetupUntil(Date.now() + value.setup_seconds_left * 1000);
       setNow(Date.now());
     } catch {
-      setError(t("failed"));
+      setError(t("webConsole.failed"));
     }
   }, [t]);
   useEffect(() => {
@@ -103,13 +108,13 @@ export function ConsoleEntry({ children }: { children: ReactNode }) {
         >
           <DialogContent>
             <DialogHeader>
-              <DialogTitle>{t("resetTitle")}</DialogTitle>
+              <DialogTitle>{t("webConsole.resetTitle")}</DialogTitle>
               <DialogDescription>
-                {t("reset", { variable: status.reset_variable })}
+                {t("webConsole.reset", { variable: status.reset_variable })}
               </DialogDescription>
             </DialogHeader>
             <Button onClick={() => setResetNoticeDismissed(true)}>
-              {t("close")}
+              {t("common.close")}
             </Button>
           </DialogContent>
         </Dialog>
@@ -123,28 +128,28 @@ export function ConsoleEntry({ children }: { children: ReactNode }) {
     <main className="flex min-h-dvh items-center justify-center p-4">
       <Panel className="w-full max-w-md p-6">
         <div className="mb-4 flex items-center justify-between gap-2">
-          <h1 className="text-lg font-semibold">{t("title")}</h1>
+          <h1 className="text-lg font-semibold">{t("webConsole.title")}</h1>
           <ConsoleLanguage />
         </div>
         {status?.password_reset && (
           <FormMessage tone="warning">
-            {t("reset", { variable: status.reset_variable })}
+            {t("webConsole.reset", { variable: status.reset_variable })}
           </FormMessage>
         )}
         {!status ? (
           <>
-            <p>{t("loading")}</p>
+            <p>{t("common.loading")}</p>
             <Button
               onClick={() => {
                 setError("");
                 void refresh();
               }}
             >
-              {t("retryAction")}
+              {t("common.retry")}
             </Button>
           </>
         ) : expired ? (
-          <p>{t("expired")}</p>
+          <p>{t("webConsole.expired")}</p>
         ) : (
           <form
             className="grid gap-4"
@@ -152,7 +157,7 @@ export function ConsoleEntry({ children }: { children: ReactNode }) {
               event.preventDefault();
               if (busy || retry) return;
               if (setup && password !== confirmation) {
-                setError(t("mismatch"));
+                setError(t("webConsole.mismatch"));
                 return;
               }
               setBusy(true);
@@ -175,18 +180,18 @@ export function ConsoleEntry({ children }: { children: ReactNode }) {
                   cause instanceof ConsoleError &&
                   cause.code === "invalid_password"
                 )
-                  setError(t("invalid_password"));
+                  setError(t("webConsole.invalidPassword"));
                 else if (
                   cause instanceof ConsoleError &&
                   cause.code === "setup_expired"
                 )
-                  setError(t("expired"));
+                  setError(t("webConsole.expired"));
                 else if (
                   cause instanceof ConsoleError &&
                   cause.code === "already_configured"
                 )
-                  setError(t("alreadyConfigured"));
-                else setError(t("failed"));
+                  setError(t("webConsole.alreadyConfigured"));
+                else setError(t("webConsole.failed"));
                 await refresh();
               } finally {
                 setBusy(false);
@@ -196,15 +201,15 @@ export function ConsoleEntry({ children }: { children: ReactNode }) {
             {setup && (
               <>
                 <p className="text-sm text-muted-foreground">
-                  {t("protection")}
+                  {t("webConsole.protection")}
                 </p>
                 <p role="timer" className="text-sm">
-                  {t("countdown")}: {Math.floor(remaining / 60)}:
+                  {t("webConsole.countdown")}: {Math.floor(remaining / 60)}:
                   {String(remaining % 60).padStart(2, "0")}
                 </p>
               </>
             )}
-            <Field label={t("password")}>
+            <Field label={t("webConsole.password")}>
               <Input
                 type="password"
                 name="password"
@@ -217,12 +222,12 @@ export function ConsoleEntry({ children }: { children: ReactNode }) {
             {setup && (
               <>
                 <p className="text-xs text-muted-foreground">
-                  {t("bounds", {
+                  {t("webConsole.bounds", {
                     min: status.password_min_length,
                     max: status.password_max_length,
                   })}
                 </p>
-                <Field label={t("confirmation")}>
+                <Field label={t("webConsole.confirmation")}>
                   <Input
                     type="password"
                     name="confirmation"
@@ -246,18 +251,18 @@ export function ConsoleEntry({ children }: { children: ReactNode }) {
                     password !== confirmation))
               }
             >
-              {t(setup ? "setup" : "login")}
+              {t(setup ? "webConsole.setup" : "webConsole.login")}
             </Button>
             {!setup && (
               <p className="text-xs leading-relaxed text-muted-foreground">
-                {t("forgot")}
+                {t("webConsole.forgot")}
               </p>
             )}
           </form>
         )}
         {retry > 0 && (
           <FormMessage tone="warning">
-            {t("retry", { seconds: retry })}
+            {t("webConsole.retry", { seconds: retry })}
           </FormMessage>
         )}
         {error && <FormMessage tone="error">{error}</FormMessage>}
@@ -266,7 +271,7 @@ export function ConsoleEntry({ children }: { children: ReactNode }) {
   );
 }
 export function ConsoleLogout() {
-  const t = useWebText();
+  const t = useT();
   const [error, setError] = useState("");
   return (
     <>
@@ -279,11 +284,11 @@ export function ConsoleLogout() {
             await consoleRequest("/console/v1/logout", "POST");
             window.dispatchEvent(new Event(CONSOLE_SIGNED_OUT));
           } catch {
-            setError(t("failed"));
+            setError(t("webConsole.failed"));
           }
         }}
       >
-        {t("logout")}
+        {t("webConsole.logout")}
       </Button>
       {error && (
         <p role="alert" className="text-xs">

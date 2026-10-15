@@ -18,7 +18,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import App from "./App";
 import { AppErrorBoundary } from "./AppErrorBoundary";
 import { getPreferences } from "./bridge";
-import { applyLocale, i18n, useT } from "./i18n";
+import { applyLocale, i18n, isLocale, useT } from "./i18n";
 import { RawAccessApprovalWindow } from "./RawAccessApprovalWindow";
 import { isRawAccessApprovalWindow } from "./raw-access-approval-window";
 import { TrajectoryInspectorWindow } from "./TrajectoryInspectorWindow";
@@ -87,7 +87,7 @@ async function loadPreferences(): Promise<void> {
 if (isWebEdition) {
   try {
     const locale = localStorage.getItem("astrlink:console-locale");
-    if (locale === "en" || locale === "zh-CN") void applyLocale(locale);
+    if (isLocale(locale)) void applyLocale(locale);
   } catch {
     // The console also works when the browser disables persistent storage.
   }

@@ -103,11 +103,49 @@ Found in the v0.1.9 sync: upstream's new `manifest_tag` kept
 `/Calcium-Ion/AstrLink/releases/download/`, which would have rejected the fork's
 own `latest.json` once the fork published a stable release.
 
+Found again in the v0.2.10 sync, in two forms:
+
+- `release-updates.mjs`: the fork had replaced the module constant
+  `const repository = "Calcium-Ion/AstrLink"` with `releaseRepository()`.
+  Upstream's new `verifiedPlatform`, `uploadAssets` and `attachRelease` still
+  referenced the bare `repository`, so every publish would have thrown
+  `ReferenceError` at runtime. Thread the fork value through parameters, and
+  exercise the collect/extend/attach paths in tests so a bare reference fails.
+- `updates.rs`: upstream's new official-mirror path hardcoded the upstream
+  repository and download site. The fork gates it with a build-time
+  `OFFICIAL_MIRROR` flag derived next to the repository resolution, instead of
+  deleting upstream's code.
+
+### After merging: upstream signature changes inside fork code
+
+Upstream may change a shared function's return type (v0.2.10: `ProbeHTTP`
+returns `Discovery`, not `[]string`). The fork's own branches in that function
+merge cleanly and still return the old shape. Build and vet every module before
+running tests, and fix the fork side to the new type.
+
+### After merging: new upstream outbound paths
+
+The `X-AstrLink-*` strip lives in `transport/forwarder.go`. A new upstream
+sender that calls `HTTPClient.Do` directly (quota, profile, OAuth) never passes
+that strip, yet may reuse a helper that writes a gateway-local overlay header.
+
+- [ ] List the new outbound requests: `git diff <old-tag> <new-tag> -- core` and
+      look for `http.NewRequest`, `.Do(` and `Header.Set` on `+` lines.
+- [ ] For each helper that writes an overlay header (for example
+      `ApplyDroidAPIHeaders` writing `X-AstrLink-Factory-Endpoint`), check every
+      caller: it either goes through `forwarder.Forward`, or deletes the header
+      itself.
+- [ ] Add a loopback test that asserts on the headers the stub **received**, not
+      on the request object before sending.
+
+Found in the v0.2.10 sync: `subscription/droid.go` `droidUsage` sent
+`X-AstrLink-Factory-Endpoint` to Factory for EU accounts.
+
 ### Schema migrations
 
 The fork and upstream both append migrations, so they collide on version
-numbers. This has already happened twice for `service_identity_profiles` (48 →
-49 → 50).
+numbers. This has already happened three times for `service_identity_profiles`
+(48 → 49 → 50 → 53).
 
 - [ ] Upstream keeps its number. The fork's migration moves up.
 - [ ] A database that already applied the fork's old number needs
@@ -117,6 +155,13 @@ numbers. This has already happened twice for `service_identity_profiles` (48 →
       fail closed.
 - [ ] Probe whether the reclaimed schema is already present instead of replaying
       statements blindly.
+- [ ] When the reclaimed step creates many objects (v50 `config_sync` creates
+      27), derive the expected names from that step's own statements. None
+      present means replay, all present means rename only, and anything in
+      between fails closed.
+- [ ] Reject a fork-named row that is followed by later versions. Every fork
+      build recorded the profile step as its newest, so that shape is not a
+      known collision.
 - [ ] Use `CREATE TABLE IF NOT EXISTS` in the moved migration so it adopts a
       table created under the earlier numbering.
 - [ ] Look migrations up **by name** in tests. Index-based fixtures
@@ -142,6 +187,15 @@ See `core/internal/storage/migrate/identity_profile_history.go`.
       fork-owned scripts, reached through an indirection upstream already calls.
 - [ ] Do not gate a security-relevant step with a YAML `if:` on an env var that
       may be empty — resolve the mode in code so it fails closed.
+- [ ] Check every **new** upstream workflow for
+      `if: github.repository == 'Calcium-Ion/AstrLink'`. In the fork it skips
+      silently. In v0.2.10 that dropped Intel macOS from the release. Remove the
+      gate, add the fork's `ASTRLINK_RELEASE_REPOSITORY` and
+      `MACOS_SIGNING_MODE` env, and add the workflow to the bind list in
+      `release-updates.test.ts`.
+- [ ] On a `workflow_dispatch` retry, `github.sha` is the dispatch ref, not the
+      tag. A gate that checks the tagged commit must use the checked-out tag
+      (`git rev-parse HEAD`).
 
 ---
 

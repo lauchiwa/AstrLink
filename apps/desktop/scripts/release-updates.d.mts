@@ -56,3 +56,22 @@ export function publishRelease(
   tag: string,
   env?: NodeJS.ProcessEnv,
 ): void;
+
+export const releaseTargets: readonly UpdateTarget[];
+export function extendRelease(
+  input: string,
+  published: string,
+  output: string,
+  tag: string,
+  target: UpdateTarget,
+  publicKey: string,
+  repository?: string,
+  macosSigningMode?: MacOSSigningMode,
+): ReleaseManifest;
+export function attachRelease(
+  input: string,
+  output: string,
+  tag: string,
+  target: UpdateTarget,
+  env?: NodeJS.ProcessEnv,
+): void;

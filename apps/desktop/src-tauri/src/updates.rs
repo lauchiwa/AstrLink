@@ -29,10 +29,19 @@ const LATEST_MANIFEST: &str = concat!(
     env!("ASTRLINK_RELEASE_REPOSITORY"),
     "/releases/latest/download/latest.json"
 );
+// Fork deviation: upstream's download mirror serves only upstream's releases,
+// so a fork build updates only from its own GitHub repository. build.rs sets
+// this to 1 only when the release repository is Calcium-Ion/AstrLink; the
+// mirror code below stays as upstream wrote it, behind this one gate.
+const OFFICIAL_MIRROR: bool = matches!(env!("ASTRLINK_OFFICIAL_MIRROR").as_bytes(), b"1");
+const DOWNLOAD_SITE: &str = "https://download.astrlink.com";
+/// The download domain's CDN serves only `/releases/*`, so the list lives on the site.
+const MIRROR_RELEASE_API: &str = "https://astrlink.com/api/releases";
 const EVENT: &str = "app-update-status";
 const PUBLIC_KEY: &str = env!("TAURI_UPDATER_PUBLIC_KEY");
 const INTERVAL: Duration = Duration::from_secs(3 * 60 * 60);
 const MAX_PACKAGE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const DOWNLOAD_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -51,6 +60,8 @@ pub struct UpdatePreferences {
     pub auto_check: bool,
     pub auto_download: bool,
     pub channel: UpdateChannel,
+    /// Check and download updates through the project download site instead of GitHub.
+    pub official_mirror: bool,
 }
 impl Default for UpdatePreferences {
     fn default() -> Self {
@@ -58,6 +69,7 @@ impl Default for UpdatePreferences {
             auto_check: true,
             auto_download: true,
             channel: UpdateChannel::Preview,
+            official_mirror: false,
         }
     }
 }
@@ -86,17 +98,22 @@ pub struct UpdateSnapshot {
     release: Option<ReleaseInfo>,
     downloaded_bytes: u64,
     total_bytes: Option<u64>,
+    download_source: Option<String>,
     last_checked_at: Option<String>,
     error_code: Option<String>,
     error_detail: Option<String>,
     /// When GitHub accepts the next check after a rate limit.
     retry_at: Option<String>,
+    /// Fork: whether this build may offer the official mirror at all.
+    official_mirror_available: bool,
 }
 
 struct Inner {
     snapshot: UpdateSnapshot,
     generation: u64,
     pending: Option<Update>,
+    /// Release tag (v0.2.2), not the updater's version (0.2.2).
+    pending_tag: Option<String>,
     /// Wall-clock time, so a sleeping Mac ends the wait when the UI says it does.
     retry_after: Option<chrono::DateTime<chrono::Utc>>,
     /// The last `(notice, version)` announced, so periodic checks do not repeat it.
@@ -149,6 +166,22 @@ fn select_release(releases: &[GithubRelease], channel: UpdateChannel) -> Option<
         })
         .max_by(|a, b| a.0.cmp_precedence(&b.0))
         .map(|(_, r)| r)
+}
+
+/// A caller that switches only the source retries on its own; waking the
+/// scheduler as well would race it for the operation lock.
+fn reschedules(current: &UpdatePreferences, input: &UpdatePreferences) -> bool {
+    current.official_mirror == input.official_mirror
+        || UpdatePreferences {
+            official_mirror: current.official_mirror,
+            ..input.clone()
+        } != *current
+}
+
+/// Fork: a stored mirror preference takes effect only in builds that may use
+/// the mirror, so an older preference file keeps loading but changes nothing.
+fn uses_mirror(preferences: &UpdatePreferences) -> bool {
+    OFFICIAL_MIRROR && preferences.official_mirror
 }
 
 /// The update state worth the operator's attention. `available` only counts
@@ -219,6 +252,125 @@ fn github_asset_for_repository(url: &str, tag: &str, repository: &str) -> bool {
                     && !file.contains('/')
                     && !file.to_ascii_lowercase().contains("%2f")
             })
+}
+
+fn download_site_asset(url: &str, tag: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    parsed.scheme() == "https"
+        && parsed.host_str() == Some("download.astrlink.com")
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.port().is_none()
+        && parsed.query().is_none()
+        && parsed.fragment().is_none()
+        && parsed
+            .path()
+            .replace("%2B", "+")
+            .replace("%2b", "+")
+            .starts_with(&format!("/releases/download/{tag}/"))
+}
+
+fn official_asset(url: &str, tag: &str) -> bool {
+    official_asset_for(url, tag, REPOSITORY, OFFICIAL_MIRROR)
+}
+
+// Fork: the repository and mirror availability are parameters, as in
+// github_asset_for_repository, so tests cover both build configurations.
+fn official_asset_for(url: &str, tag: &str, repository: &str, mirror_available: bool) -> bool {
+    github_asset_for_repository(url, tag, repository)
+        || (mirror_available && download_site_asset(url, tag))
+}
+
+fn candidate_source(url: &reqwest::Url) -> &'static str {
+    if url.host_str() == Some("download.astrlink.com") {
+        "download_site"
+    } else {
+        "github"
+    }
+}
+
+/// `Update::download` verifies the signature, so signature failures surface as
+/// typed errors; map them to `verification` rather than a network `download`.
+fn updater_error_code(error: &tauri_plugin_updater::Error) -> &'static str {
+    use tauri_plugin_updater::Error;
+    match error {
+        Error::Minisign(_)
+        | Error::Base64(_)
+        | Error::SignatureUtf8(_)
+        | Error::SignedVersionMismatch { .. }
+        | Error::MissingSignedVersion => "verification",
+        _ => "download",
+    }
+}
+
+/// Rebuild the asset URL from constants and a validated tag/file pair so the
+/// original URL's query, fragment, credentials, port or extra path cannot leak.
+fn download_candidate(url: &str, tag: &str, mirror: bool) -> Option<reqwest::Url> {
+    download_candidate_for(url, tag, mirror, REPOSITORY, OFFICIAL_MIRROR)
+}
+
+// Fork: upstream hardcoded its own repository here; derive it from the
+// release repository slug instead, and use the mirror only where available.
+fn download_candidate_for(
+    url: &str,
+    tag: &str,
+    mirror: bool,
+    repository: &str,
+    mirror_available: bool,
+) -> Option<reqwest::Url> {
+    if !official_asset_for(url, tag, repository, mirror_available) {
+        return None;
+    }
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let prefix = if github_asset_for_repository(url, tag, repository) {
+        format!("/{repository}/releases/download/")
+    } else {
+        "/releases/download/".to_owned()
+    };
+    let path = parsed.path().replace("%2B", "+").replace("%2b", "+");
+    let file = path
+        .strip_prefix(&prefix)?
+        .strip_prefix(tag)?
+        .strip_prefix('/')?;
+    if file.is_empty()
+        || file.contains('/')
+        || file.contains('\\')
+        || file.contains("%2F")
+        || file.contains("%2f")
+        || file == "."
+        || file == ".."
+        || file.contains("..")
+    {
+        return None;
+    }
+    let encoded_tag = urlencoding(tag);
+    let encoded_file = urlencoding(file);
+    if mirror && mirror_available {
+        reqwest::Url::parse(&format!(
+            "{DOWNLOAD_SITE}/releases/download/{encoded_tag}/{encoded_file}"
+        ))
+        .ok()
+    } else {
+        reqwest::Url::parse(&format!(
+            "https://github.com/{repository}/releases/download/{encoded_tag}/{encoded_file}"
+        ))
+        .ok()
+    }
+}
+
+fn urlencoding(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
 }
 
 pub fn verify_package(bytes: &[u8], signature: &str, key: &str) -> Result<(), String> {
@@ -413,6 +565,23 @@ async fn fetch_releases(
     Ok(releases)
 }
 
+/// The mirror lists its 20 newest releases in GitHub's shape, outside GitHub's
+/// quota; its failures are never GitHub rate limits.
+async fn fetch_mirror_releases(
+    client: &reqwest::Client,
+    endpoint: &str,
+) -> Result<Vec<GithubRelease>, (&'static str, String)> {
+    client
+        .get(endpoint)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|e| ("network", e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| ("manifest", e.to_string()))
+}
+
 impl UpdateManager {
     pub fn new(app: &AppHandle) -> Result<Self, String> {
         #[cfg(target_os = "linux")]
@@ -440,13 +609,16 @@ impl UpdateManager {
                     release: None,
                     downloaded_bytes: 0,
                     total_bytes: None,
+                    download_source: None,
                     last_checked_at: None,
                     error_code: None,
                     error_detail: None,
                     retry_at: None,
+                    official_mirror_available: OFFICIAL_MIRROR,
                 },
                 generation: 0,
                 pending: None,
+                pending_tag: None,
                 retry_after: None,
                 notified: None,
             }),
@@ -496,6 +668,7 @@ impl UpdateManager {
                 return;
             }
             i.snapshot.phase = "error".into();
+            i.snapshot.download_source = None;
             i.snapshot.error_code = Some(code.into());
             i.snapshot.error_detail = Some(detail);
         });
@@ -539,14 +712,21 @@ impl UpdateManager {
         }
         app.state::<Arc<PreferencesStore>>()
             .replace_updates(input.clone())?;
-        let changed_channel = inner.snapshot.preferences.channel != input.channel;
+        let current = &inner.snapshot.preferences;
+        let changed_channel = current.channel != input.channel;
+        // Fork: without the mirror the source never changes with this preference.
+        let changed_mirror = OFFICIAL_MIRROR && current.official_mirror != input.official_mirror;
+        let reschedule = reschedules(current, &input);
         inner.snapshot.preferences = input;
+        if changed_channel || changed_mirror {
+            // Each channel and the mirror read separate sources, so a rate limit does not carry over.
+            inner.retry_after = None;
+            inner.snapshot.retry_at = None;
+        }
         if changed_channel {
             inner.generation += 1;
             inner.pending = None;
-            // Each channel reads its own GitHub source, so a rate limit does not carry over.
-            inner.retry_after = None;
-            inner.snapshot.retry_at = None;
+            inner.pending_tag = None;
             inner.snapshot.release = None;
             inner.snapshot.latest_version = None;
             inner.snapshot.phase = "idle".into();
@@ -554,6 +734,7 @@ impl UpdateManager {
             inner.snapshot.error_detail = None;
             inner.snapshot.downloaded_bytes = 0;
             inner.snapshot.total_bytes = None;
+            inner.snapshot.download_source = None;
             self.cancelled.notify_waiters();
         }
         if changed_channel {
@@ -561,7 +742,9 @@ impl UpdateManager {
         }
         drop(inner);
         self.publish(app, |_| {});
-        self.schedule.notify_one();
+        if reschedule {
+            self.schedule.notify_one();
+        }
         Ok(self.snapshot())
     }
     pub fn start(self: &Arc<Self>, app: AppHandle) {
@@ -599,6 +782,7 @@ impl UpdateManager {
         }
         self.publish(app, |i| {
             i.pending = None;
+            i.pending_tag = None;
             i.retry_after = None;
             i.snapshot.phase = "checking".into();
             i.snapshot.error_code = None;
@@ -631,13 +815,20 @@ impl UpdateManager {
             builder.build().map_err(|e| ("network", e.to_string()))
         };
         let follow = client(reqwest::redirect::Policy::default())?;
+        let mirror = uses_mirror(&prefs.updates);
         let mut retry_after = None;
-        let fetched = match prefs.updates.channel {
-            UpdateChannel::Stable => {
-                let direct = client(reqwest::redirect::Policy::none())?;
-                fetch_latest(&follow, &direct, LATEST_MANIFEST, &mut retry_after).await
+        let fetched = if mirror {
+            fetch_mirror_releases(&follow, MIRROR_RELEASE_API).await
+        } else {
+            match prefs.updates.channel {
+                UpdateChannel::Stable => {
+                    let direct = client(reqwest::redirect::Policy::none())?;
+                    fetch_latest(&follow, &direct, LATEST_MANIFEST, &mut retry_after).await
+                }
+                UpdateChannel::Preview => {
+                    fetch_releases(&follow, RELEASE_API, &mut retry_after).await
+                }
             }
-            UpdateChannel::Preview => fetch_releases(&follow, RELEASE_API, &mut retry_after).await,
         };
         let releases = match fetched {
             Ok(releases) => releases,
@@ -663,6 +854,7 @@ impl UpdateManager {
             self.publish(app, |i| {
                 if i.generation == generation {
                     i.pending = None;
+                    i.pending_tag = None;
                     i.snapshot.release = None;
                     i.snapshot.phase = "no_releases".into();
                     i.snapshot.latest_version = None;
@@ -683,6 +875,7 @@ impl UpdateManager {
             self.publish(app, |i| {
                 if i.generation == generation {
                     i.pending = None;
+                    i.pending_tag = None;
                     i.snapshot.release = None;
                     i.snapshot.phase = "up_to_date".into();
                 }
@@ -722,12 +915,19 @@ impl UpdateManager {
                 "missing_artifact",
                 "Release has no latest.json update manifest".into(),
             ))?;
+        let endpoint = if mirror {
+            format!(
+                "{DOWNLOAD_SITE}/releases/download/{}/latest.json",
+                urlencoding(&release.tag_name)
+            )
+        } else {
+            manifest.browser_download_url.clone()
+        };
         let mut updater = app
             .updater_builder()
             .pubkey(PUBLIC_KEY)
             .timeout(Duration::from_secs(30))
-            .endpoints(vec![manifest
-                .browser_download_url
+            .endpoints(vec![endpoint
                 .parse::<reqwest::Url>()
                 .map_err(|e| ("manifest", e.to_string()))?])
             .map_err(|e| ("manifest", e.to_string()))?;
@@ -745,11 +945,11 @@ impl UpdateManager {
                 "Release and update manifest versions disagree".into(),
             ))?;
         if version(&update.version) != Some(selected_version)
-            || !github_asset(update.download_url.as_str(), &release.tag_name)
+            || !official_asset(update.download_url.as_str(), &release.tag_name)
         {
             return Err((
                 "manifest",
-                "Update manifest does not match the selected GitHub release".into(),
+                "Update manifest does not match the selected release".into(),
             ));
         }
         update.timeout = Some(Duration::from_secs(30 * 60));
@@ -770,6 +970,7 @@ impl UpdateManager {
             i.snapshot.downloaded_bytes = cached.as_ref().map_or(0, |b| b.len() as u64);
             i.snapshot.total_bytes = cached.as_ref().map(|b| b.len() as u64);
             i.pending = Some(update);
+            i.pending_tag = Some(release.tag_name.clone());
         });
         Ok(())
     }
@@ -786,22 +987,40 @@ impl UpdateManager {
         let cancel = self.cancelled.notified();
         tokio::pin!(cancel);
         cancel.as_mut().enable();
-        let Some(mut update) = self.lock().pending.clone() else {
+        let (update, pending_tag) = {
+            let inner = self.lock();
+            (inner.pending.clone(), inner.pending_tag.clone())
+        };
+        let (Some(mut update), Some(pending_tag)) = (update, pending_tag) else {
             return;
         };
-        update.no_proxy = !app
-            .state::<Arc<PreferencesStore>>()
-            .snapshot()
-            .values
-            .use_system_proxy;
+        let prefs = app.state::<Arc<PreferencesStore>>().snapshot().values;
+        update.no_proxy = !prefs.use_system_proxy;
         if self.snapshot().phase == "ready" {
             return;
         }
+        let Some(candidate) = download_candidate(
+            update.download_url.as_str(),
+            &pending_tag,
+            uses_mirror(&prefs.updates),
+        ) else {
+            self.fail(
+                app,
+                generation,
+                "download",
+                "Update manifest does not name a supported release asset".into(),
+            );
+            return;
+        };
+        let source = candidate_source(&candidate).to_string();
+        update.download_url = candidate;
+        update.timeout = Some(DOWNLOAD_ATTEMPT_TIMEOUT);
         self.publish(app, |i| {
             if i.generation == generation {
                 i.snapshot.phase = "downloading".into();
                 i.snapshot.downloaded_bytes = 0;
                 i.snapshot.total_bytes = None;
+                i.snapshot.download_source = Some(source);
                 i.snapshot.error_code = None;
                 i.snapshot.error_detail = None;
             }
@@ -809,7 +1028,7 @@ impl UpdateManager {
         let mut bytes_downloaded = 0u64;
         let mut last_event = Instant::now();
         let task = update.download(
-            |bytes, total| {
+            move |bytes, total| {
                 bytes_downloaded += bytes as u64;
                 if last_event.elapsed() < Duration::from_millis(150) {
                     return;
@@ -824,38 +1043,60 @@ impl UpdateManager {
             },
             || {},
         );
-        let result = tokio::select! { result = task => result.map_err(|e| e.to_string()), _ = &mut cancel => return };
-        match result {
-            Ok(bytes) => {
-                let result = (|| -> Result<(), String> {
-                    if bytes.len() as u64 > MAX_PACKAGE_BYTES {
-                        return Err("Update package is too large".into());
+        let result = tokio::select! {
+            result = task => result,
+            _ = &mut cancel => {
+                self.publish(app, |i| {
+                    if i.generation == generation {
+                        i.snapshot.phase = "available".into();
+                        i.snapshot.downloaded_bytes = 0;
+                        i.snapshot.total_bytes = None;
+                        i.snapshot.download_source = None;
+                        i.snapshot.error_code = None;
+                        i.snapshot.error_detail = None;
                     }
-                    verify_package(&bytes, &update.signature, PUBLIC_KEY)?;
-                    // Serialize cache commit with channel changes, so cancelled downloads never reappear.
-                    let inner = self.lock();
-                    if inner.generation != generation {
-                        return Ok(());
-                    }
-                    fs::create_dir_all(&self.cache).map_err(|e| e.to_string())?;
-                    self.clear_cache();
-                    let path = self.cache_file(&update);
-                    fs::write(path.with_extension("part"), &bytes).map_err(|e| e.to_string())?;
-                    fs::rename(path.with_extension("part"), path).map_err(|e| e.to_string())?;
-                    Ok(())
-                })();
-                match result {
-                    Ok(()) => self.publish(app, |i| {
-                        if i.generation == generation {
-                            i.snapshot.phase = "ready".into();
-                            i.snapshot.downloaded_bytes = bytes.len() as u64;
-                            i.snapshot.total_bytes = Some(bytes.len() as u64);
-                        }
-                    }),
-                    Err(error) => self.fail(app, generation, "verification", error),
-                }
+                });
+                return;
             }
-            Err(error) => self.fail(app, generation, "download", error),
+        };
+        let bytes = match result {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.fail(
+                    app,
+                    generation,
+                    updater_error_code(&error),
+                    error.to_string(),
+                );
+                return;
+            }
+        };
+        let result = (|| -> Result<(), String> {
+            if bytes.len() as u64 > MAX_PACKAGE_BYTES {
+                return Err("Update package is too large".into());
+            }
+            verify_package(&bytes, &update.signature, PUBLIC_KEY)?;
+            // Serialize cache commit with channel changes, so cancelled downloads never reappear.
+            let inner = self.lock();
+            if inner.generation != generation {
+                return Ok(());
+            }
+            fs::create_dir_all(&self.cache).map_err(|e| e.to_string())?;
+            self.clear_cache();
+            let path = self.cache_file(&update);
+            fs::write(path.with_extension("part"), &bytes).map_err(|e| e.to_string())?;
+            fs::rename(path.with_extension("part"), path).map_err(|e| e.to_string())?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => self.publish(app, |i| {
+                if i.generation == generation {
+                    i.snapshot.phase = "ready".into();
+                    i.snapshot.downloaded_bytes = bytes.len() as u64;
+                    i.snapshot.total_bytes = Some(bytes.len() as u64);
+                }
+            }),
+            Err(error) => self.fail(app, generation, "verification", error),
         }
     }
     pub async fn install(&self, app: &AppHandle) -> Result<UpdateSnapshot, String> {
@@ -995,18 +1236,28 @@ mod tests {
             assert_eq!(notice(phase, false), None, "{phase}");
         }
         // Native notifications read the same catalogs; a missing key would
-        // surface raw, and zh-CN would silently fall back to English.
+        // surface raw, and another language would silently fall back to English.
         for kind in ["available", "manual", "ready"] {
             let title = format!("about.phase.{kind}");
             let body = format!("about.{kind}Notification");
             let vars = [("version", "1.1.0")];
             let en = i18n::t(i18n::Locale::En, &body, &vars);
+            let ja = i18n::t(i18n::Locale::Ja, &body, &vars);
             let zh = i18n::t(i18n::Locale::ZhCN, &body, &vars);
-            assert!(en.contains("1.1.0") && zh.contains("1.1.0"), "{body}");
+            assert!(
+                en.contains("1.1.0") && ja.contains("1.1.0") && zh.contains("1.1.0"),
+                "{body}"
+            );
             assert_ne!(en, zh, "{body}");
+            assert_ne!(en, ja, "{body}");
             assert_ne!(
                 i18n::t(i18n::Locale::En, &title, &[]),
                 i18n::t(i18n::Locale::ZhCN, &title, &[]),
+                "{title}"
+            );
+            assert_ne!(
+                i18n::t(i18n::Locale::En, &title, &[]),
+                i18n::t(i18n::Locale::Ja, &title, &[]),
                 "{title}"
             );
         }
@@ -1120,6 +1371,71 @@ mod tests {
             "network"
         );
         assert!(retry.is_none());
+    }
+
+    #[tokio::test]
+    async fn mirror_checks_read_github_shaped_releases_and_never_back_off() {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let listed = r#"[{"tag_name":"v1.1.0-beta.1","draft":false,"prerelease":true,
+            "body":"notes","body_html":"<p>notes</p>","html_url":"https://github.com/x",
+            "published_at":"2026-10-13T05:08:04Z","assets":[{"name":"latest.json",
+            "browser_download_url":"https://github.com/Calcium-Ion/AstrLink/releases/download/v1.1.0-beta.1/latest.json",
+            "download_url":"https://download.astrlink.com/releases/download/v1.1.0-beta.1/latest.json",
+            "digest":"sha256:00"}]}]"#;
+        let (url, server) = response_server("200 OK", "", listed);
+        let releases = fetch_mirror_releases(&client, &url).await.unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            select_release(&releases, UpdateChannel::Preview)
+                .unwrap()
+                .tag_name,
+            "v1.1.0-beta.1"
+        );
+        assert!(select_release(&releases, UpdateChannel::Stable).is_none());
+        for (status, headers, body, code) in [
+            ("503 Service Unavailable", "", "{}", "network"),
+            (
+                "429 Too Many Requests",
+                "Retry-After: 60\r\n",
+                "{}",
+                "network",
+            ),
+            ("200 OK", "", "invalid", "manifest"),
+        ] {
+            let (url, server) = response_server(status, headers, body);
+            let result = fetch_mirror_releases(&client, &url).await;
+            server.join().unwrap();
+            assert_eq!(result.unwrap_err().0, code, "{status} {body}");
+        }
+    }
+
+    #[test]
+    fn switching_only_the_mirror_leaves_the_retry_to_its_caller() {
+        let current = UpdatePreferences::default();
+        let mirror = UpdatePreferences {
+            official_mirror: true,
+            ..current.clone()
+        };
+        assert!(!reschedules(&current, &mirror));
+        assert!(reschedules(&current, &current));
+        assert!(reschedules(
+            &current,
+            &UpdatePreferences {
+                channel: UpdateChannel::Preview,
+                ..mirror.clone()
+            }
+        ));
+        assert!(reschedules(
+            &current,
+            &UpdatePreferences {
+                auto_download: false,
+                ..current.clone()
+            }
+        ));
     }
 
     #[tokio::test]
@@ -1320,7 +1636,203 @@ mod tests {
                 other
             ));
         }
+        // Upstream's download-site assets. Fork: accepted only by a build that
+        // may use the mirror; a fork build refuses them outright.
+        let site = "https://download.astrlink.com/releases/download/v1.0.0/AstrLink.exe";
+        assert!(download_site_asset(site, "v1.0.0"));
+        assert!(official_asset_for(
+            site,
+            "v1.0.0",
+            "Calcium-Ion/AstrLink",
+            true
+        ));
+        assert!(!official_asset_for(
+            site,
+            "v1.0.0",
+            "lauchiwa/AstrLink",
+            false
+        ));
+        assert_eq!(official_asset(site, "v1.0.0"), OFFICIAL_MIRROR);
+        for url in [
+            "http://github.com/Calcium-Ion/AstrLink/releases/download/v1.0.0/a",
+            "https://example.org/a",
+            "https://github.com/Calcium-Ion/AstrLink/releases/download/v0.1.0/a",
+            "https://github.com.evil/Calcium-Ion/AstrLink/releases/download/v1.0.0/a",
+            "http://download.astrlink.com/releases/download/v1.0.0/a",
+            "https://download.astrlink.com.evil/releases/download/v1.0.0/a",
+            "https://download.astrlink.com/releases/download/v0.1.0/a",
+            "https://download.astrlink.com/releases/download/v1.0.0/a?x=1",
+        ] {
+            for mirror_available in [false, true] {
+                assert!(
+                    !official_asset_for(url, "v1.0.0", "Calcium-Ion/AstrLink", mirror_available),
+                    "accepted {url}"
+                );
+            }
+            assert!(!official_asset(url, "v1.0.0"), "accepted {url}");
+        }
     }
+
+    #[test]
+    fn only_an_upstream_build_offers_the_official_mirror() {
+        // Fork: build.rs derives the gate from the same release repository.
+        assert_eq!(
+            OFFICIAL_MIRROR,
+            release_repository::official_mirror(REPOSITORY)
+        );
+        assert_eq!(OFFICIAL_MIRROR, REPOSITORY == "Calcium-Ion/AstrLink");
+        // A preference saved by an upstream build still loads, and only takes
+        // effect where the mirror exists.
+        let stored: UpdatePreferences =
+            serde_json::from_str(r#"{"official_mirror":true}"#).unwrap();
+        assert!(stored.official_mirror);
+        assert_eq!(uses_mirror(&stored), OFFICIAL_MIRROR);
+        assert!(!uses_mirror(&UpdatePreferences::default()));
+        if !OFFICIAL_MIRROR {
+            // Every download goes to this repository's GitHub release, even
+            // with the stored mirror preference on.
+            let own = format!("https://github.com/{REPOSITORY}/releases/download/v1.0.0/a.exe");
+            assert_eq!(
+                download_candidate(&own, "v1.0.0", uses_mirror(&stored))
+                    .unwrap()
+                    .as_str(),
+                own
+            );
+            assert_eq!(
+                download_candidate(&own, "v1.0.0", true).unwrap().as_str(),
+                own
+            );
+            assert!(download_candidate(
+                "https://download.astrlink.com/releases/download/v1.0.0/a.exe",
+                "v1.0.0",
+                true
+            )
+            .is_none());
+        }
+    }
+
+    // Fork: each case runs for an upstream build (mirror available) and a
+    // fork build (own repository only), plus this build's own configuration.
+    const BUILDS: [(&str, bool); 2] =
+        [("Calcium-Ion/AstrLink", true), ("lauchiwa/AstrLink", false)];
+
+    #[test]
+    fn download_candidate_follows_the_official_mirror_preference() {
+        let site = "https://download.astrlink.com/releases/download/v1.0.0/AstrLink.exe";
+        for (repository, available) in BUILDS {
+            let github =
+                format!("https://github.com/{repository}/releases/download/v1.0.0/AstrLink.exe");
+            let candidate = |source: &str, mirror| {
+                download_candidate_for(source, "v1.0.0", mirror, repository, available)
+                    .map(|url| url.to_string())
+            };
+            for source in [github.as_str(), site] {
+                if !available && source == site {
+                    assert_eq!(candidate(source, false), None);
+                    assert_eq!(candidate(source, true), None);
+                    continue;
+                }
+                assert_eq!(candidate(source, false).unwrap(), github);
+                assert_eq!(
+                    candidate(source, true).unwrap(),
+                    if available { site } else { github.as_str() }
+                );
+            }
+        }
+        let own = format!("https://github.com/{REPOSITORY}/releases/download/v1.0.0/AstrLink.exe");
+        assert_eq!(
+            download_candidate(&own, "v1.0.0", true).unwrap().as_str(),
+            if OFFICIAL_MIRROR { site } else { own.as_str() }
+        );
+    }
+
+    #[test]
+    fn download_candidate_percent_encodes_plus_tags() {
+        for (repository, available) in BUILDS {
+            let github = format!(
+                "https://github.com/{repository}/releases/download/v1.0.0+build.1/AstrLink.exe"
+            );
+            let encoded = format!(
+                "https://github.com/{repository}/releases/download/v1.0.0%2Bbuild.1/AstrLink.exe"
+            );
+            let candidate = |mirror| {
+                download_candidate_for(&github, "v1.0.0+build.1", mirror, repository, available)
+                    .unwrap()
+                    .to_string()
+            };
+            assert_eq!(candidate(false), encoded);
+            assert_eq!(
+                candidate(true),
+                if available {
+                    "https://download.astrlink.com/releases/download/v1.0.0%2Bbuild.1/AstrLink.exe"
+                } else {
+                    encoded.as_str()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn download_candidate_rejects_untrusted_or_malformed_assets() {
+        for (repository, available) in BUILDS {
+            let other = if available {
+                "lauchiwa/AstrLink"
+            } else {
+                "Calcium-Ion/AstrLink"
+            };
+            for source in [
+                "https://example.org/releases/download/v1.0.0/AstrLink.exe".to_owned(),
+                format!("https://github.com/{repository}/releases/download/v0.1.0/AstrLink.exe"),
+                format!(
+                    "https://github.com/{repository}/releases/download/v1.0.0/dir/AstrLink.exe"
+                ),
+                format!("https://github.com/{other}/releases/download/v1.0.0/AstrLink.exe"),
+                "https://download.astrlink.com/releases/download/v1.0.0/a?x=1".to_owned(),
+                "https://download.astrlink.com/releases/download/v1.0.0/a#x".to_owned(),
+                "https://download.astrlink.com/releases/download/v1.0.0/dir%2FAstrLink.exe"
+                    .to_owned(),
+            ] {
+                for mirror in [false, true] {
+                    assert!(
+                        download_candidate_for(&source, "v1.0.0", mirror, repository, available)
+                            .is_none(),
+                        "{repository}: {source}"
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn updater_errors_classify_signature_failures_as_verification() {
+        use tauri_plugin_updater::Error;
+        assert_eq!(
+            updater_error_code(&Error::Minisign(minisign_verify::Error::InvalidSignature)),
+            "verification"
+        );
+        assert_eq!(
+            updater_error_code(&Error::SignatureUtf8("bad".into())),
+            "verification"
+        );
+        assert_eq!(
+            updater_error_code(&Error::SignedVersionMismatch {
+                signed: "1.0.0".into(),
+                announced: "1.1.0".into(),
+            }),
+            "verification"
+        );
+        assert_eq!(
+            updater_error_code(&Error::MissingSignedVersion),
+            "verification"
+        );
+        assert_eq!(
+            updater_error_code(&Error::Network(
+                "Download request failed with status: 404 Not Found".into()
+            )),
+            "download"
+        );
+        assert_eq!(updater_error_code(&Error::ReleaseNotFound), "download");
+    }
+
     #[test]
     fn invalid_signatures_and_keys_fail_closed() {
         assert!(verify_package(b"tampered", "invalid", "invalid").is_err());

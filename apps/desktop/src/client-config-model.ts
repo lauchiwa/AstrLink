@@ -29,13 +29,33 @@ export interface ClientConfigModels {
   opusModel?: string;
   /** Claude Code only; CC Switch drops it. */
   fableModel?: string;
+  /**
+   * Pi only: the context window and output limit Pi's entry for the model
+   * names, in tokens. Pi's own defaults apply where they are absent.
+   */
+  contextWindow?: number;
+  maxTokens?: number;
 }
+
+/** The largest limit a Pi entry takes, in tokens. */
+export const maxPiLimit = 100_000_000;
+
+/** Claude Code takes every field; the other clients take `model` only. */
+const modelFields = [
+  "model",
+  "haikuModel",
+  "sonnetModel",
+  "opusModel",
+  "fableModel",
+] as const satisfies readonly (keyof ClientConfigModels)[];
 
 export type ClientConfigState =
   | "not_configured"
   | "configured"
   /** Still ours, pointing at a port the gateway no longer uses. */
   | "outdated"
+  /** Another AstrLink on this computer wrote it for its own address. */
+  | "elsewhere"
   /** A connection setting changed since AstrLink wrote it. */
   | "modified"
   /** Moved to CC Switch, which now holds the connection. */
@@ -45,16 +65,40 @@ export type ClientConfigState =
 
 export interface ClientConfigStatus {
   client: DirectClient;
+  /** The WSL distribution the client runs in; `null` for this computer. */
+  wsl: string | null;
   detected: boolean;
   paths: string[];
   state: ClientConfigState;
   token_id: string | null;
+  /**
+   * The models a config AstrLink wrote holds now. The client may have picked
+   * them itself since, like with Codex's `/model`.
+   */
+  models: ClientConfigModels;
+}
+
+export interface ClientConfigOverview {
+  /** This computer's clients, then each running WSL distribution's. */
+  clients: ClientConfigStatus[];
+  /** WSL distributions whose clients went unchecked, usually stopped ones. */
+  wsl_unchecked: string[];
+  /** Whether WSL clients reach the gateway at localhost (mirrored networking). */
+  wsl_localhost: boolean;
+  /**
+   * The WSL distribution whose config CC Switch writes, by client; `null` for
+   * this computer. CC Switch's directory settings decide it.
+   */
+  cc_switch_wsl: Record<"claude" | "codex", string | null>;
 }
 
 export type ClientConfigApplyOutcome =
   | { status: "applied" }
-  /** Nothing was written: these keys hold values AstrLink did not write. */
-  | { status: "needs_confirmation"; keys: string[] };
+  /**
+   * Nothing was written: `keys` hold values AstrLink did not write, or the
+   * config connects to another AstrLink at the `gateway` base URL.
+   */
+  | { status: "needs_confirmation"; keys: string[]; gateway: string | null };
 
 /** How Codex, which honours the system proxy, reaches one gateway address. */
 export type ClientProxyRoute =
@@ -77,6 +121,7 @@ const states: readonly ClientConfigState[] = [
   "not_configured",
   "configured",
   "outdated",
+  "elsewhere",
   "modified",
   "cc_switch",
   "invalid",
@@ -128,9 +173,40 @@ function arrayAt(value: unknown, path: string): unknown[] {
   return value;
 }
 
+const piLimits = ["contextWindow", "maxTokens"] as const;
+
+function parseModels(
+  value: unknown,
+  client: DirectClient,
+  path: string,
+): ClientConfigModels {
+  const fields: readonly string[] =
+    client === "claude" ? modelFields : ["model"];
+  return Object.fromEntries(
+    Object.entries(objectAt(value, path)).map(([key, model]) => {
+      if (client === "pi" && (piLimits as readonly string[]).includes(key)) {
+        const tokens =
+          typeof model === "string" && /^[1-9][0-9]{0,8}$/.test(model)
+            ? Number(model)
+            : 0;
+        if (tokens < 1 || tokens > maxPiLimit) {
+          invalid(`${path}.${key}`, "expected a token count");
+        }
+        return [key, tokens];
+      }
+      if (!fields.includes(key)) invalid(`${path}.${key}`, "unexpected field");
+      return [key, lineAt(model, `${path}.${key}`, 256)];
+    }),
+  );
+}
+
 function parseStatus(value: unknown, path: string): ClientConfigStatus {
   const status = objectAt(value, path);
-  exactKeys(status, ["client", "detected", "paths", "state", "token_id"], path);
+  exactKeys(
+    status,
+    ["client", "wsl", "detected", "paths", "state", "token_id", "models"],
+    path,
+  );
   if (
     typeof status.client !== "string" ||
     !(directClients as readonly string[]).includes(status.client)
@@ -163,27 +239,74 @@ function parseStatus(value: unknown, path: string): ClientConfigStatus {
   }
   return {
     client: status.client as DirectClient,
+    wsl: status.wsl === null ? null : lineAt(status.wsl, `${path}.wsl`, 255),
     detected: status.detected as boolean,
     paths,
     state,
     token_id: tokenID,
+    models: parseModels(
+      status.models,
+      status.client as DirectClient,
+      `${path}.models`,
+    ),
   };
 }
 
-/** Parses `client_config_status`: one entry per direct client, in order. */
-export function parseClientConfigStatuses(
+/**
+ * Parses `client_config_status`: one entry per direct client, in order, for
+ * this computer and then for each WSL distribution.
+ */
+export function parseClientConfigOverview(
   value: unknown,
-): ClientConfigStatus[] {
-  const statuses = arrayAt(value, "$").map((item, index) =>
-    parseStatus(item, `$[${index}]`),
+): ClientConfigOverview {
+  const root = objectAt(value, "$");
+  exactKeys(
+    root,
+    ["clients", "wsl_unchecked", "wsl_localhost", "cc_switch_wsl"],
+    "$",
   );
+  const clients = arrayAt(root.clients, "$.clients").map((item, index) =>
+    parseStatus(item, `$.clients[${index}]`),
+  );
+  const homes: (string | null)[] = [];
+  clients.forEach((status, index) => {
+    const position = index % directClients.length;
+    if (position === 0) homes.push(status.wsl);
+    if (
+      status.client !== directClients[position] ||
+      status.wsl !== homes[homes.length - 1]
+    ) {
+      invalid(`$.clients[${index}]`, "expected claude, codex, and pi per home");
+    }
+  });
   if (
-    statuses.length !== directClients.length ||
-    statuses.some((status, index) => status.client !== directClients[index])
+    clients.length % directClients.length !== 0 ||
+    homes[0] !== null ||
+    homes.slice(1).some((home) => home === null) ||
+    new Set(homes).size !== homes.length
   ) {
-    invalid("$", "expected claude, codex, and pi");
+    invalid("$.clients", "expected this computer first, then each WSL home");
   }
-  return statuses;
+  if (typeof root.wsl_localhost !== "boolean") {
+    invalid("$.wsl_localhost", "expected a boolean");
+  }
+  const ccSwitchWSL = objectAt(root.cc_switch_wsl, "$.cc_switch_wsl");
+  exactKeys(ccSwitchWSL, ["claude", "codex"], "$.cc_switch_wsl");
+  const distribution = (key: "claude" | "codex") =>
+    ccSwitchWSL[key] === null
+      ? null
+      : lineAt(ccSwitchWSL[key], `$.cc_switch_wsl.${key}`, 255);
+  return {
+    clients,
+    wsl_unchecked: arrayAt(root.wsl_unchecked, "$.wsl_unchecked").map(
+      (item, index) => lineAt(item, `$.wsl_unchecked[${index}]`, 255),
+    ),
+    wsl_localhost: root.wsl_localhost,
+    cc_switch_wsl: {
+      claude: distribution("claude"),
+      codex: distribution("codex"),
+    },
+  };
 }
 
 /** Parses `apply_client_config`. Conflicts are key names, never values. */
@@ -198,12 +321,16 @@ export function parseClientConfigApplyOutcome(
   if (outcome.status !== "needs_confirmation") {
     return invalid("$.status", "unknown status");
   }
-  exactKeys(outcome, ["status", "keys"], "$");
+  exactKeys(outcome, ["status", "keys", "gateway"], "$");
   const keys = arrayAt(outcome.keys, "$.keys").map((key, index) =>
     lineAt(key, `$.keys[${index}]`, 512),
   );
-  if (keys.length === 0) invalid("$.keys", "expected at least one key");
-  return { status: "needs_confirmation", keys };
+  const gateway =
+    outcome.gateway === null ? null : lineAt(outcome.gateway, "$.gateway", 512);
+  if (keys.length === 0 && gateway === null) {
+    invalid("$.keys", "expected a key or another gateway");
+  }
+  return { status: "needs_confirmation", keys, gateway };
 }
 
 /** Parses `preview_client_config_snippet`, which must hold no token. */

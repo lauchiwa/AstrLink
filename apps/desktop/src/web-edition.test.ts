@@ -60,6 +60,10 @@ it("uses the browser origin and the correct API version suffix in client snippet
     JSON.parse(webClientSnippet("claude", base)).env.ANTHROPIC_BASE_URL,
   ).toBe(base);
   expect(webClientSnippet("codex", base)).toContain(`base_url = "${base}/v1"`);
+  // Without it Codex hides its image generation and web search tools.
+  expect(webClientSnippet("codex", base)).toContain(
+    'http_headers = { x-openai-actor-authorization = "codex-imagegen" }\n',
+  );
   expect(webClientSnippet("gemini", base)).toContain(
     `GOOGLE_GEMINI_BASE_URL=${base}\n`,
   );

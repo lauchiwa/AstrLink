@@ -1,6 +1,6 @@
 import { useEffect, useId, useState } from "react";
 import { isTauri } from "@tauri-apps/api/core";
-import { Panel, PanelBody, PanelHeader } from "@/components/Panel";
+import { Panel, PanelHeader } from "@/components/Panel";
 import { DataField, DataRow } from "@/components/DataRow";
 import { Badge } from "@/components/ui/badge";
 import { StatusBadge } from "@/components/StatusBadge";
@@ -98,6 +98,15 @@ export function About({
       saveUpdatePreferences({ ...snapshot.preferences, ...patch }),
     );
   }
+  function switchToMirror() {
+    void run(async () => {
+      await saveUpdatePreferences({
+        ...snapshot.preferences,
+        official_mirror: true,
+      });
+      return checkAppUpdate();
+    });
+  }
   async function open(url: string) {
     try {
       await openExternalURL(url);
@@ -181,15 +190,9 @@ export function About({
         {/* Center the column inside the full-width scrollport, so its scrollbar
             stays at the workspace edge like every other page. */}
         <div className="mx-auto flex w-full max-w-5xl flex-col gap-3">
-          <Panel
-            className={cn(
-              "flex flex-col",
-              snapshot.release ? "min-h-64 flex-1" : "shrink-0",
-            )}
-            data-slot="about-update-panel"
-          >
+          <Panel data-slot="about-update-panel">
             <PanelHeader
-              className="shrink-0 flex-wrap items-center gap-3 px-5 py-4"
+              className="flex-wrap items-center gap-3 px-5 py-4"
               actions={
                 <>
                   <Button
@@ -228,12 +231,10 @@ export function About({
                 </div>
               </div>
             </PanelHeader>
-            <PanelBody
-              className={cn(
-                "space-y-3 px-5 pt-3",
-                snapshot.release ? "pb-4" : "pb-0",
-                !snapshot.release && "flex-none",
-              )}
+            {/* Not PanelBody: its contained overscroll keeps the wheel from
+                reaching the page scrollport even when it has nothing to scroll. */}
+            <div
+              className={cn("space-y-3 px-5 pt-3", snapshot.release && "pb-4")}
               data-slot="about-update-content"
             >
               <div
@@ -289,6 +290,19 @@ export function About({
                       {t("about.retryAt", { time: formatRetryWait(retryWait) })}
                     </p>
                   ) : null}
+                  {snapshot.error_code === "rate_limit" &&
+                  snapshot.official_mirror_available &&
+                  !snapshot.preferences.official_mirror ? (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="my-1.5"
+                      disabled={!native || working}
+                      onClick={switchToMirror}
+                    >
+                      {t("about.useOfficialMirror")}
+                    </Button>
+                  ) : null}
                   {snapshot.error_detail ? (
                     <details className="mt-1 text-xs">
                       <summary className="cursor-pointer">
@@ -313,6 +327,15 @@ export function About({
                       ? ` / ${(snapshot.total_bytes / 1024 / 1024).toFixed(1)} MB`
                       : ""}
                   </p>
+                  {snapshot.download_source ? (
+                    <p className="text-xs text-muted-foreground">
+                      {t("about.downloadSource.current", {
+                        source: t(
+                          `about.downloadSource.${snapshot.download_source}`,
+                        ),
+                      })}
+                    </p>
+                  ) : null}
                 </div>
               ) : null}
               {snapshot.release ? (
@@ -447,6 +470,30 @@ export function About({
                         </SelectContent>
                       </Select>
                     </DataRow>
+                    {/* Fork: builds from another repository never use upstream's mirror. */}
+                    {snapshot.official_mirror_available ? (
+                      <DataRow>
+                        <div className="min-w-0 flex-1">
+                          <Label
+                            htmlFor={`${id}-official-mirror`}
+                            className="text-sm font-normal"
+                          >
+                            {t("about.officialMirror")}
+                          </Label>
+                          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                            {t("about.preferenceHint.official_mirror")}
+                          </p>
+                        </div>
+                        <Switch
+                          id={`${id}-official-mirror`}
+                          checked={snapshot.preferences.official_mirror}
+                          disabled={preferencesDisabled}
+                          onCheckedChange={(official_mirror) =>
+                            save({ official_mirror })
+                          }
+                        />
+                      </DataRow>
+                    ) : null}
                     {(["auto_check", "auto_download"] as const).map((key) => (
                       <DataRow key={key}>
                         <div className="min-w-0 flex-1">
@@ -481,7 +528,7 @@ export function About({
                   />
                 </div>
               ) : null}
-            </PanelBody>
+            </div>
           </Panel>
           <LocalClientUpdates compact={Boolean(snapshot.release)} />
         </div>

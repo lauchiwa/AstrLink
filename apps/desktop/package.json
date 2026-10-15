@@ -18,7 +18,7 @@
     "test:watch": "vitest --maxWorkers=1",
     "tauri": "tauri",
     "sidecar:build": "bun scripts/build-sidecar.mjs",
-    "desktop:dev": "bun run branding:sync && bun run sidecar:build && tauri dev",
+    "desktop:dev": "bun run branding:sync && bun run sidecar:build && tauri dev --config src-tauri/tauri.dev.conf.json",
     "desktop:start": "bun run branding:sync && bun run sidecar:build && rsbuild build && tauri dev --no-watch --no-dev-server --config src-tauri/tauri.start.conf.json",
     "desktop:build": "bun run branding:sync && bun run sidecar:build && tauri build",
     "macos:notarize": "bun scripts/macos-release.mjs verify",
@@ -41,6 +41,7 @@
     "react-markdown": "10.1.0",
     "recharts": "3.10.1",
     "remark-gfm": "4.0.1",
+    "shiki": "4.4.3",
     "sonner": "^2.0.8",
     "tailwind-merge": "^3.6.0"
   },

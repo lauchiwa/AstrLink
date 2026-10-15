@@ -382,17 +382,15 @@ func planService(candidate contract.Service, request ResolveRequest, subscriptio
 			continue
 		}
 		upstreamProtocol, planType := request.Protocol, contract.PlanType("")
-		if native := candidate.Kind.ModelNativeProtocol(request.Model); native != "" && !request.Protocol.IsModelDiscovery() {
+		if format := candidate.ModelProtocol(request.Model); format != "" && request.Protocol.IsModelFormat() {
+			// The model's format decides how the provider is called; enabled
+			// protocols only choose which clients may enter.
 			if mode != contract.CapabilityModeNative {
 				continue
 			}
-			if !supportsProtocol(candidate, native, request.Model, request.Streaming, contract.CapabilityModeNative) {
-				narrow(capabilitySkip(candidate, native, request, contract.CapabilityModeNative))
-				continue
-			}
-			upstreamProtocol = native
-			if native != request.Protocol {
-				if !supportsModelConversion(runtime, request.Protocol, native, request.Streaming) {
+			upstreamProtocol = format
+			if format != request.Protocol {
+				if !supportsModelConversion(runtime, request.Protocol, format, request.Streaming) {
 					narrow(contract.RoutingSkipConversionUnavailable)
 					continue
 				}
@@ -442,6 +440,9 @@ func baseURLForService(service contract.Service, subscriptionBaseURL string) str
 	}
 	if service.Kind == contract.ServiceKindCopilotSubscription {
 		return accountauth.DefaultCopilotAPIBaseURL
+	}
+	if service.Kind == contract.ServiceKindDroidSubscription {
+		return accountauth.DefaultDroidAPIBaseURL
 	}
 	if service.Kind.IsSubscription() {
 		return subscriptionBaseURL

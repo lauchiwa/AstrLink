@@ -150,25 +150,27 @@ func TestStoreResolverRanksEveryServiceWithItsSkipReason(t *testing.T) {
 }
 
 func TestPlanServiceReportsTheFurthestFailedCheck(t *testing.T) {
+	// kimi-k3 is called in Chat; a Messages client needs its own entry row.
 	service := contract.Service{
 		ID: "service_opencode", Kind: contract.ServiceKindOpenCodeGo, Enabled: true,
 		Models:       []string{"kimi-k3"},
-		Capabilities: []contract.Capability{{Protocol: contract.ProtocolAnthropicMessages, Mode: contract.CapabilityModeNative, Streaming: true}},
+		Capabilities: []contract.Capability{{Protocol: contract.ProtocolOpenAIChat, Mode: contract.CapabilityModeNative, Streaming: true}},
 	}
 	request := ResolveRequest{Protocol: contract.ProtocolAnthropicMessages, Model: "kimi-k3", Streaming: true}
 	runtime := contract.RuntimeProfile{RelayKitAvailable: true, Edges: []contract.ConversionEdge{{From: request.Protocol, To: contract.ProtocolOpenAIChat, Streaming: true}}}
 	if _, skip := planService(service, request, "", runtime); skip != contract.RoutingSkipProtocolUnsupported {
-		t.Fatalf("missing native protocol skip = %q", skip)
+		t.Fatalf("missing entry protocol skip = %q", skip)
 	}
-	service.Capabilities = append(service.Capabilities, contract.Capability{Protocol: contract.ProtocolOpenAIChat, Mode: contract.CapabilityModeNative})
+	service.Capabilities = append(service.Capabilities, contract.Capability{Protocol: contract.ProtocolAnthropicMessages, Mode: contract.CapabilityModeNative})
 	if _, skip := planService(service, request, "", runtime); skip != contract.RoutingSkipStreamingUnsupported {
-		t.Fatalf("non-streaming native protocol skip = %q", skip)
+		t.Fatalf("non-streaming entry protocol skip = %q", skip)
 	}
 	service.Capabilities[1].Streaming = true
 	if _, skip := planService(service, request, "", contract.RuntimeProfile{}); skip != contract.RoutingSkipConversionUnavailable {
 		t.Fatalf("no converter skip = %q", skip)
 	}
-	if resolved, skip := planService(service, request, "", runtime); skip != "" || resolved.PlanType != contract.PlanTypeRelayKit {
+	if resolved, skip := planService(service, request, "", runtime); skip != "" || resolved.PlanType != contract.PlanTypeRelayKit ||
+		resolved.UpstreamProtocol != contract.ProtocolOpenAIChat {
 		t.Fatalf("converted plan = %#v, %q", resolved, skip)
 	}
 }

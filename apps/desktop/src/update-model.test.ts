@@ -26,6 +26,8 @@ describe("update IPC", () => {
 
   it("accepts browser snapshots and optional download lengths", () => {
     const value = browserUpdateSnapshot();
+    // Fork: the browser bootstrap never offers upstream's mirror.
+    expect(value.official_mirror_available).toBe(false);
     expect(parseUpdateSnapshot(value)).toEqual(value);
     expect(updateBusy({ ...value, phase: "downloading" })).toBe(true);
     expect(updateBusy({ ...value, phase: "ready" })).toBe(false);
@@ -45,6 +47,8 @@ describe("update IPC", () => {
       { repository: "fork/desktop/extra" },
       { retry_at: undefined },
       { retry_at: 60 },
+      { official_mirror_available: undefined },
+      { official_mirror_available: "true" },
     ]) {
       expect(() =>
         parseUpdateSnapshot({ ...browserUpdateSnapshot(), ...patch }),
@@ -55,6 +59,15 @@ describe("update IPC", () => {
         auto_check: true,
         auto_download: true,
         channel: "nightly",
+        official_mirror: false,
+      }),
+    ).toThrow();
+    expect(() =>
+      parseUpdatePreferences({
+        auto_check: true,
+        auto_download: true,
+        channel: "stable",
+        official_mirror: "yes",
       }),
     ).toThrow();
     expect(() =>

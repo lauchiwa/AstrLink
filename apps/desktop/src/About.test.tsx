@@ -110,8 +110,11 @@ describe("About updates", () => {
       phase: "downloading" as const,
       downloaded_bytes: 5,
       total_bytes: 10,
+      download_source: "download_site" as const,
     };
-    await render(downloading);
+    // Upstream's build, which offers the official mirror.
+    await render({ ...downloading, official_mirror_available: true });
+    expect(container.textContent).toContain("官方下载站");
     expect(
       container
         .querySelector('[role="progressbar"]')
@@ -124,19 +127,54 @@ describe("About updates", () => {
     );
     mocks.saveUpdatePreferences.mockResolvedValue({
       ...ready,
-      preferences: { ...ready.preferences, auto_check: false },
+      preferences: { ...ready.preferences, official_mirror: true },
     });
     await act(async () =>
       (container.querySelector('[role="switch"]') as HTMLButtonElement).click(),
     );
     expect(mocks.saveUpdatePreferences).toHaveBeenCalledWith({
-      auto_check: false,
+      auto_check: true,
       auto_download: true,
-      // Toggling auto-check must pass the channel through untouched, so assert
-      // the loaded value rather than restating whichever default ships today.
+      // Toggling a preference must pass the channel through untouched, so
+      // assert the loaded value rather than restating the shipped default.
       channel: ready.preferences.channel,
+      official_mirror: true,
     });
     expect(receive).toHaveBeenCalled();
+  });
+  it("hides the official mirror in builds from another repository", async () => {
+    // Fork: the default snapshot describes a fork build without the mirror.
+    expect(ready.official_mirror_available).toBe(false);
+    await render({
+      ...ready,
+      // A preference saved by an upstream build must not resurface the mirror.
+      preferences: { ...ready.preferences, official_mirror: true },
+      phase: "error",
+      release: null,
+      error_code: "rate_limit",
+      error_detail: "GitHub HTTP 403 Forbidden; 0 of 60 requests left",
+      retry_at: new Date(Date.now() + 30 * 60_000).toISOString(),
+    });
+    expect(button("改用官方镜像源")).toBeUndefined();
+    await render({ ...ready, phase: "error", error_code: "rate_limit" });
+    expect(button("改用官方镜像源")).toBeUndefined();
+    await act(async () =>
+      (
+        container.querySelector("button[aria-controls]") as HTMLButtonElement
+      ).click(),
+    );
+    expect(container.textContent).not.toContain("使用官方镜像源");
+    expect(container.querySelectorAll('[role="switch"]')).toHaveLength(2);
+    mocks.saveUpdatePreferences.mockResolvedValue(ready);
+    await act(async () =>
+      (container.querySelector('[role="switch"]') as HTMLButtonElement).click(),
+    );
+    // The first switch is now auto-check, and the stored mirror value passes
+    // through unchanged.
+    expect(mocks.saveUpdatePreferences).toHaveBeenCalledWith({
+      ...ready.preferences,
+      auto_check: false,
+    });
   });
   it("holds retries until GitHub's rate limit lifts", async () => {
     vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
@@ -166,6 +204,46 @@ describe("About updates", () => {
       vi.useRealTimers();
     }
   });
+  it("offers the official mirror while GitHub's rate limit holds checks", async () => {
+    const limited: UpdateSnapshot = {
+      ...ready,
+      official_mirror_available: true,
+      phase: "error",
+      release: null,
+      error_code: "rate_limit",
+      error_detail: "GitHub HTTP 403 Forbidden; 0 of 60 requests left",
+      retry_at: new Date(Date.now() + 30 * 60_000).toISOString(),
+    };
+    const mirrored = {
+      ...limited,
+      preferences: { ...limited.preferences, official_mirror: true },
+    };
+    mocks.saveUpdatePreferences.mockResolvedValue(mirrored);
+    mocks.checkAppUpdate.mockResolvedValue({
+      ...mirrored,
+      phase: "up_to_date",
+      error_code: null,
+      error_detail: null,
+      retry_at: null,
+    });
+    await render(limited);
+    expect(button("检查更新").disabled).toBe(true);
+    expect(button("改用官方镜像源").disabled).toBe(false);
+    await act(async () => button("改用官方镜像源").click());
+    expect(mocks.saveUpdatePreferences).toHaveBeenCalledWith({
+      ...limited.preferences,
+      official_mirror: true,
+    });
+    expect(mocks.checkAppUpdate).toHaveBeenCalledOnce();
+    expect(
+      mocks.saveUpdatePreferences.mock.invocationCallOrder[0],
+    ).toBeLessThan(mocks.checkAppUpdate.mock.invocationCallOrder[0]);
+    expect(receive).toHaveBeenLastCalledWith(
+      expect.objectContaining({ phase: "up_to_date" }),
+    );
+    await render(mirrored);
+    expect(button("改用官方镜像源")).toBeUndefined();
+  });
   it("reports command failures and retries checks", async () => {
     mocks.checkAppUpdate.mockRejectedValue(new Error("offline"));
     await render({ ...ready, phase: "idle", release: null });
@@ -178,5 +256,18 @@ describe("About updates", () => {
     });
     await act(async () => button("检查更新").click());
     expect(mocks.checkAppUpdate).toHaveBeenCalledTimes(2);
+  });
+  it("leaves scrolling to the page scrollport", async () => {
+    await render();
+    await act(async () =>
+      (
+        container.querySelector("button[aria-controls]") as HTMLButtonElement
+      ).click(),
+    );
+    const page = container.querySelector('[data-slot="about-workspace"]')!;
+    expect(page.className).toContain("overflow-y-auto");
+    // A nested overscroll-contained box stops the wheel even when it has
+    // nothing to scroll, so the page would not move under the pointer.
+    expect(page.querySelector('[class*="overscroll-"]')).toBeNull();
   });
 });

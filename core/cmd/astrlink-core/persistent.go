@@ -24,6 +24,7 @@ import (
 	"github.com/QuantumNous/astrlink/core/internal/relaykitbridge"
 	"github.com/QuantumNous/astrlink/core/internal/servicetest"
 	"github.com/QuantumNous/astrlink/core/internal/storage/sqlite"
+	syncengine "github.com/QuantumNous/astrlink/core/internal/sync"
 )
 
 // installOutboundProxy configures the outbound proxy once per process,
@@ -175,6 +176,17 @@ func openPersistentCore(ctx context.Context, options persistentOptions) (*persis
 	if err != nil {
 		return fail("configure local privacy filter: %w", err)
 	}
+	auditKey, err := store.GetAuditKey(ctx)
+	if err == nil {
+		err = privacyFilter.PersistPlaceholders(auditKey, store)
+		clear(auditKey)
+	}
+	if err != nil {
+		logf("privacy placeholders are renamed on restart: %v", err)
+	}
+	// The desktop polls this feed to notify about requests the warn action
+	// let through; it lives in memory only.
+	privacyWarnings := privacy.NewWarningFeed()
 	conversionEngine := relaykitbridge.NewEngine()
 	// One registry serves inference, gateway-initiated requests and
 	// learning, so a learned identity applies everywhere at once.
@@ -188,6 +200,10 @@ func openPersistentCore(ctx context.Context, options persistentOptions) (*persis
 	}
 	subscriptionManager.SetRiskEventStore(store)
 	pricingManager := pricing.NewManager(store, pricingClient)
+	syncEngine, err := syncengine.New(syncengine.Dependencies{Store: store, Logf: logf})
+	if err != nil {
+		return fail("configure configuration sync: %w", err)
+	}
 	subscriptionManager.SetUsageObservers(
 		func(ctx context.Context, account contract.SubscriptionAccount, usage contract.SubscriptionUsage) error {
 			current, err := store.GetService(ctx, account.ID)
@@ -228,13 +244,14 @@ func openPersistentCore(ctx context.Context, options persistentOptions) (*persis
 		),
 		PrivacyFilter: privacyFilter,
 		PolicyWarningReporter: ingress.PolicyWarningReporterFunc(
-			func(protocol contract.ProtocolID, endpointID contract.ServiceID, summary string) {
+			func(warning privacy.Warning) {
 				logf(
 					"privacy policy warning: protocol=%s service_id=%s findings=%s",
-					protocol,
-					endpointID,
-					summary,
+					warning.Protocol,
+					warning.ServiceID,
+					privacy.WarningSummary(warning.Findings),
 				)
+				privacyWarnings.Report(warning)
 			},
 		),
 		RequestRecords:           store,
@@ -259,6 +276,7 @@ func openPersistentCore(ctx context.Context, options persistentOptions) (*persis
 		PolicyStore:        store,
 		PrivacyModels:      privacyModel,
 		PrivacyFilter:      privacyFilter,
+		PrivacyWarnings:    privacyWarnings,
 		PolicyChanged:      privacyWorker.ApplyPolicy,
 		RequestRecords:     store,
 		AuditSettings:      store,
@@ -269,6 +287,7 @@ func openPersistentCore(ctx context.Context, options persistentOptions) (*persis
 		ClientIdentities:   identities,
 		IdentityCapture:    identityCapture,
 		Subscriptions:      subscriptionManager,
+		RateLimits:         resolver,
 		CodingPlans:        codingplan.New(store, nil),
 		ServiceModels:      persistentServiceModels(store, subscriptionManager),
 		ServiceTester:      servicetest.NewWithDependencies(gatewayDependencies, subscriptionManager.APIBaseURLFor),
@@ -278,16 +297,18 @@ func openPersistentCore(ctx context.Context, options persistentOptions) (*persis
 		ConversionEngine:   conversionEngine,
 		Shutdown:           options.shutdown,
 		ConsoleSessions:    options.consoleSessions,
+		Sync:               syncEngine,
 	})
 	if err != nil {
 		return fail("configure persistent control API: %w", err)
 	}
 	monitorCtx, stopMonitors := context.WithCancel(ctx)
 	var monitors sync.WaitGroup
-	monitors.Add(3)
+	monitors.Add(4)
 	go func() { defer monitors.Done(); pricingManager.Run(monitorCtx, logf) }()
 	go func() { defer monitors.Done(); subscriptionManager.RunUsageMonitor(monitorCtx) }()
 	go func() { defer monitors.Done(); rawVault.Run(monitorCtx) }()
+	go func() { defer monitors.Done(); syncEngine.Run(monitorCtx, logf) }()
 	return &persistentCore{
 		control:  handler,
 		rawVault: rawVault,
