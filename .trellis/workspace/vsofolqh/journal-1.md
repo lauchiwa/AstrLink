@@ -33,3 +33,25 @@ gcc，契约 Ruby 验证与 `-race` 未跑。
 STL 工具集耦合、磁盘耗尽伪装成编译错误；另记 Windows `core.autocrlf=true` 下
 `git status` 的 `M` 假象（本次 141 项，索引与工作树哈希逐个相等，`git diff`
 为空）。
+
+
+## Session 1: 同步上游正式版 v0.2.10
+<!-- trellis-session: v=2 fp=4c47548bcb8913a0 -->
+
+**Date**: 2026-10-16
+**Task**: 同步上游正式版 v0.2.10
+**Branch**: `main`
+
+### Summary
+
+非快进合并上游 v0.2.10（e8b9600），解决 16 个冲突：身份档案迁移 50→53 并 fail-closed 协调旧 fork-50 库；fork 构建关闭官方镜像更新；发布脚本穿入仓库与签名模式，Intel macOS 工作流在 fork 运行；修复 Droid 用量请求外发 X-AstrLink-Factory-Endpoint；补 ja 46 键；新增悬空身份档案同步回归测试。Go/桌面测试与 lint 通过；桌面 crate Rust 测试因 sidecar/MSVC 14.39 阻断，Ruby、gcc 缺失未跑。未推送。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `4df07bd` | Merge upstream v0.2.10 |
+
+### Status
+
+[OK] **Completed**
