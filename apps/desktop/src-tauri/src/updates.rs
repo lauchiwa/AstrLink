@@ -1422,10 +1422,12 @@ mod tests {
         };
         assert!(!reschedules(&current, &mirror));
         assert!(reschedules(&current, &current));
+        // Fork: the default channel is Preview, so switching to Stable is the
+        // channel change here (upstream switches to Preview from Stable).
         assert!(reschedules(
             &current,
             &UpdatePreferences {
-                channel: UpdateChannel::Preview,
+                channel: UpdateChannel::Stable,
                 ..mirror.clone()
             }
         ));
