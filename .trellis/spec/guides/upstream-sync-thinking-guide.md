@@ -123,6 +123,24 @@ returns `Discovery`, not `[]string`). The fork's own branches in that function
 merge cleanly and still return the old shape. Build and vet every module before
 running tests, and fix the fork side to the new type.
 
+### After merging: upstream tests that assume upstream defaults
+
+Where the fork changed a default (the update channel defaults to `Preview`, see
+`version-naming-guide.md`), a new upstream test that "changes" the setting to
+that value changes nothing, and its assertion fails. Such tests merge cleanly
+and fail only at run time.
+
+- [ ] Grep new upstream tests for the defaults the fork changed, e.g.
+      `UpdateChannel::Preview` in `apps/desktop/src-tauri/src/updates.rs`.
+- [ ] Switch the test to a value that differs from the fork's default, and add a
+      fork comment. Do not change the fork's default to satisfy the test.
+- [ ] When the desktop crate cannot be tested locally, treat the Rust tests as
+      unverified until CI passes.
+
+Found in the v0.2.10 sync:
+`switching_only_the_mirror_leaves_the_retry_to_its_caller` switched to `Preview`
+from what upstream assumed was `Stable`, and failed on all four desktop CI jobs.
+
 ### After merging: new upstream outbound paths
 
 The `X-AstrLink-*` strip lives in `transport/forwarder.go`. A new upstream
