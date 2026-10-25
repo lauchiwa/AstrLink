@@ -12,6 +12,8 @@ import {
   validProxyDraft,
   type ProxyDraft,
 } from "./service-proxy-model";
+import { isWebEdition } from "./edition";
+import { ServiceTerminalDialog } from "./ServiceTerminalDialog";
 import { ServiceTestDialog } from "./ServiceTestDialog";
 import { PricingWorkspace, ServiceBillingMeter } from "./PricingWorkspace";
 import { useServiceOrder } from "./use-service-order";
@@ -43,7 +45,7 @@ import {
   ChevronRight,
   Flask,
   Connect as Cable,
-  Menu as Ellipsis,
+  Ellipsis,
   Key as KeyRound,
   SquarePen as Pencil,
   Plus,
@@ -260,6 +262,8 @@ export interface ServiceManagerProps {
   onServiceSaved: (service: Service) => void;
   onServiceRemoved: (id: string) => void;
   onDirtyChange: (dirty: boolean) => void;
+  /** The gateway address a terminal opened for a provider connects to. */
+  inferenceURL?: string;
 }
 
 type Draft = {
@@ -1057,6 +1061,7 @@ export function ServiceManager({
   onServiceSaved,
   onServiceRemoved,
   onDirtyChange,
+  inferenceURL = "",
 }: ServiceManagerProps) {
   const routingDefaults = useRoutingDefaults(isReady);
   const gatewayTimeout = useGatewayResponseTimeout();
@@ -1154,6 +1159,7 @@ export function ServiceManager({
   );
   const pendingUsageIDs = useRef(new Set<string>());
   const [testingService, setTestingService] = useState<Service | null>(null);
+  const [terminalService, setTerminalService] = useState<Service | null>(null);
   const [billingService, setBillingService] = useState<string | null>(null);
   const copyFeedback = useCopyFeedback();
   const loadGeneration = useRef(0);
@@ -2757,7 +2763,17 @@ export function ServiceManager({
                                     {t("services.signOut")}
                                   </DropdownMenuItem>
                                 ) : null}
-                                {subscription ? (
+                                {isWebEdition ? null : (
+                                  <DropdownMenuItem
+                                    disabled={
+                                      acting || !isReady || !inferenceURL
+                                    }
+                                    onSelect={() => setTerminalService(service)}
+                                  >
+                                    {t("services.openInTerminal")}
+                                  </DropdownMenuItem>
+                                )}
+                                {subscription || !isWebEdition ? (
                                   <DropdownMenuSeparator />
                                 ) : null}
                                 <DropdownMenuItem
@@ -2791,6 +2807,14 @@ export function ServiceManager({
             key={testingService.id}
             service={testingService}
             onClose={() => setTestingService(null)}
+          />
+        ) : null}
+        {terminalService ? (
+          <ServiceTerminalDialog
+            key={terminalService.id}
+            service={terminalService}
+            inferenceURL={inferenceURL}
+            onClose={() => setTerminalService(null)}
           />
         ) : null}
         {confirmAction?.kind === "reset-usage" ? (

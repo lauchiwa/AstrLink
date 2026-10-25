@@ -168,23 +168,33 @@ function piLimit(text: string): number | null | undefined {
   return tokens >= 1 && tokens <= maxPiLimit ? tokens : null;
 }
 
-const stateTones: Record<
-  Exclude<ClientConfigState, "not_configured">,
-  StatusTone
-> = {
+/** A badge's label: the config's state, or that another token holds it. */
+type ConfigLabel = Exclude<ClientConfigState, "not_configured"> | "other_token";
+
+const stateTones: Record<ConfigLabel, StatusTone> = {
   configured: "positive",
   outdated: "pending",
   elsewhere: "neutral",
   modified: "pending",
   cc_switch: "neutral",
   invalid: "negative",
+  other_token: "neutral",
 };
 
-/** A config's state, once AstrLink or CC Switch wrote it. */
-function stateBadge(status: ClientConfigStatus) {
-  return status.state === "not_configured" ? null : (
-    <StatusBadge tone={stateTones[status.state]}>
-      {i18n.t(`clientSetup.state.${status.state}`)}
+/**
+ * A config's state, once AstrLink or CC Switch wrote it. The dialog sets up
+ * one token, so a config written with another token says so instead.
+ */
+function stateBadge(status: ClientConfigStatus, tokenId: string) {
+  if (status.state === "not_configured") return null;
+  const label: ConfigLabel =
+    status.token_id !== tokenId &&
+    ["configured", "outdated", "modified"].includes(status.state)
+      ? "other_token"
+      : status.state;
+  return (
+    <StatusBadge tone={stateTones[label]}>
+      {i18n.t(`clientSetup.state.${label}`)}
     </StatusBadge>
   );
 }
@@ -385,13 +395,15 @@ function DesktopClientSetupDialog({
     };
   }, []);
 
-  // The place a card stands for: the chosen one, else where it is installed.
+  // The place a card stands for: the chosen one, else where this token is
+  // configured, else where it is installed.
   const statusOf = (id: ClientConfigClient, place?: string | null) => {
     const places = placesOf(overview, id);
     return (
       (place !== undefined
         ? places.find((status) => status.wsl === place)
         : undefined) ??
+      places.find((status) => status.token_id === token.id) ??
       places.find((status) => status.detected) ??
       overview?.clients.find(
         (status) => status.client === id && status.wsl === null,
@@ -409,12 +421,19 @@ function DesktopClientSetupDialog({
   };
   const usable = (id: ClientConfigClient) =>
     ["direct", "cc-switch"].includes(availability(id));
+  const firstUsable = (preferred: (id: ClientConfigClient) => boolean) =>
+    clientSetupClients.find(({ id }) => usable(id) && preferred(id))?.id;
   // Wait for the status before picking a card, so the choice does not jump.
+  // Open on a client this token is configured in, else on one nobody set up,
+  // so a first write leaves other tokens' clients alone.
   const client =
     (choice && usable(choice) ? choice : null) ??
     (overview === null
       ? null
-      : (clientSetupClients.find(({ id }) => usable(id))?.id ?? null));
+      : (firstUsable((id) => statusOf(id)?.token_id === token.id) ??
+        firstUsable((id) => statusOf(id)?.state === "not_configured") ??
+        firstUsable(() => true) ??
+        null));
   const mode = client ? availability(client) : null;
   const places = client ? placesOf(overview, client) : [];
   const status = client ? statusOf(client, placeChoice) : undefined;
@@ -489,6 +508,8 @@ function DesktopClientSetupDialog({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [draftKey, piModel, limitsBlank]);
   const configured = status?.token_id != null;
+  // Writing over another token's config moves the client to this token.
+  const owned = status?.token_id === token.id;
   // CC Switch writes a client where its directory settings point, which for
   // Claude Code and Codex can be one WSL distribution. Only that place
   // offers its import.
@@ -518,13 +539,19 @@ function DesktopClientSetupDialog({
   }, [checksProxy, inferenceURL]);
 
   // Removing needs a readable file; an unreadable one is left for the user.
+  // Another token's config is removed from that token's dialog. A token this
+  // gateway lacks has no dialog, so its config can be removed from any.
   const removable =
-    mode === "direct" && configured && status && status.state !== "invalid"
+    mode === "direct" &&
+    configured &&
+    status &&
+    status.state !== "invalid" &&
+    (owned || !tokens.some((item) => item.id === status.token_id))
       ? { client: status.client, wsl: status.wsl }
       : null;
   const otherToken =
-    status?.token_id != null && status.token_id !== token.id
-      ? tokens.find((item) => item.id === status.token_id)
+    configured && !owned
+      ? tokens.find((item) => item.id === status?.token_id)
       : undefined;
 
   const hasEntry = (service: Service, protocol: string) =>
@@ -809,7 +836,7 @@ function DesktopClientSetupDialog({
         if (!card || card.state === "not_configured") return null;
         // Reads like the clients only CC Switch configures.
         if (card.state === "cc_switch") return t("clientSetup.state.cc_switch");
-        return stateBadge(card);
+        return stateBadge(card, token.id);
     }
   };
 
@@ -832,7 +859,9 @@ function DesktopClientSetupDialog({
         className="w-[calc(100vw_-_2rem)] max-w-none sm:max-w-3xl"
       >
         <DialogHeader className="text-left">
-          <DialogTitle>{t("clientSetup.title")}</DialogTitle>
+          <DialogTitle>
+            {t("clientSetup.configureToken", { name: token.name })}
+          </DialogTitle>
           <DialogDescription>{t("clientSetup.description")}</DialogDescription>
         </DialogHeader>
         <form className="grid gap-4" onSubmit={submit}>
@@ -902,7 +931,7 @@ function DesktopClientSetupDialog({
                         item.wsl === null
                           ? t("clientSetup.placeLocal")
                           : t("agentDebug.wslPlace", { name: item.wsl }),
-                      badge: stateBadge(item),
+                      badge: stateBadge(item, token.id),
                     }))}
                     value={place ?? localPlace}
                     onValueChange={(value) => {
@@ -965,10 +994,6 @@ function DesktopClientSetupDialog({
                 <FormMessage tone="error">
                   {t("clientSetup.invalidHint")}
                 </FormMessage>
-              ) : status?.state === "modified" ? (
-                <FormMessage tone="warning">
-                  {t("clientSetup.modifiedHint")}
-                </FormMessage>
               ) : status?.state === "cc_switch" ? (
                 <FormMessage tone="notice">
                   {t("clientSetup.ccSwitchManagedHint", { client: label })}
@@ -977,7 +1002,7 @@ function DesktopClientSetupDialog({
                 <FormMessage tone="notice">
                   {t("clientSetup.elsewhereHint", { client: label })}
                 </FormMessage>
-              ) : status?.token_id != null && status.token_id !== token.id ? (
+              ) : configured && !owned ? (
                 <FormMessage tone="notice">
                   {otherToken
                     ? t("clientSetup.usesToken", {
@@ -989,6 +1014,10 @@ function DesktopClientSetupDialog({
                         client: label,
                         current: token.name,
                       })}
+                </FormMessage>
+              ) : status?.state === "modified" ? (
+                <FormMessage tone="warning">
+                  {t("clientSetup.modifiedHint")}
                 </FormMessage>
               ) : null}
               {proxy ? (
@@ -1194,9 +1223,11 @@ function DesktopClientSetupDialog({
                 {t(
                   busy === "write"
                     ? "clientSetup.writing"
-                    : configured
+                    : owned
                       ? "clientSetup.update"
-                      : "clientSetup.write",
+                      : configured
+                        ? "clientSetup.useThisToken"
+                        : "clientSetup.write",
                 )}
               </Button>
             )}

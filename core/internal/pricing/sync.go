@@ -179,7 +179,7 @@ func (m *Manager) Run(ctx context.Context, logf func(string, ...any)) {
 				logf("price sync: %v", err)
 			}
 		}
-		// Fill missing prices and retry audio breakdowns after evaluator fixes,
+		// Fill missing prices and value entries earlier releases left unpriced,
 		// even when the catalog has not changed. Already valued entries stay fixed.
 		if pending, ok := m.store.(interface {
 			PriceUnpriced(context.Context) (int, error)

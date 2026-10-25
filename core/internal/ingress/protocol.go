@@ -279,7 +279,7 @@ func inspectConversationBestEffort(result *Request, request *http.Request, maxBo
 		return raw, nil
 	}
 	result.ReasoningEffort = extractReasoningEffort(result.Protocol, fields)
-	summary, err := conversationPolicy.InspectFields(convoProto, fields)
+	summary, err := conversationPolicyFor(detectClientType(request.Header)).InspectFields(convoProto, fields)
 	if err != nil {
 		return raw, nil
 	}
@@ -350,19 +350,10 @@ func inspectJSONMetadata(request *http.Request, protocol contract.ProtocolID, ma
 	if len(raw) == 0 {
 		return requestMetadata{}, nil
 	}
-	decoder := json.NewDecoder(bytes.NewReader(raw))
 	var fields map[string]json.RawMessage
-	decodeErr := decoder.Decode(&fields)
-	if decodeErr == nil {
-		var extra json.RawMessage
-		if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-			decodeErr = errInvalidMetadata
-		}
-	}
-	if decodeErr != nil {
-		return requestMetadata{}, errInvalidMetadata
-	}
-	if fields == nil {
+	// The full body is already buffered. Unmarshal validates exactly one
+	// document without a Decoder allocating another full-size input buffer.
+	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
 		return requestMetadata{}, errInvalidMetadata
 	}
 	var metadata requestMetadata
@@ -395,7 +386,7 @@ func inspectJSONMetadata(request *http.Request, protocol contract.ProtocolID, ma
 	if convoProto, ok := convoProtocol(protocol); ok {
 		// The summary walks the history once; conversation cursors and the
 		// preview both come from it so the two never disagree.
-		summary, err := conversationPolicy.InspectFields(convoProto, fields)
+		summary, err := conversationPolicyFor(detectClientType(request.Header)).InspectFields(convoProto, fields)
 		if err == nil {
 			metadata.Conversation = summary
 			metadata.ConversationID = conversationCursor(summary, metadata.PreviousResponseID)
@@ -404,6 +395,12 @@ func inspectJSONMetadata(request *http.Request, protocol contract.ProtocolID, ma
 	}
 	if text := builtinToolPreview(protocol, fields); text != "" {
 		metadata.InputPreview = sanitizePreview(text)
+	}
+	// This validated JSON body is replayable already. Reuse classification's
+	// bytes instead of buffering them again when preparing retry attempts.
+	// Best-effort inspection of opaque protocols keeps its original semantics.
+	request.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(raw)), nil
 	}
 	metadata.raw = raw
 	return metadata, nil

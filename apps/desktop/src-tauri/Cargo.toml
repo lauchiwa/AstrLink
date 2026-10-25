@@ -47,8 +47,9 @@ tauri-plugin-opener = "=2.5.4"
 # deep-link: a second launch forwards its astrlink:// link to the running app.
 tauri-plugin-single-instance = { version = "=2.4.3", features = ["deep-link"] }
 tauri-plugin-shell = "=2.3.5"
-tauri-plugin-updater = "=2.12.0"
-tokio = { version = "=1.47.1", features = ["sync", "time", "macros"] }
+# Release updates use v2 installers; legacy v1 ZIP support pulls in vulnerable zip.
+tauri-plugin-updater = { version = "=2.12.0", default-features = false, features = ["rustls-tls", "system-proxy"] }
+tokio = { version = "=1.51.6", features = ["sync", "time", "macros"] }
 zeroize = { version = "=1.9.0", features = ["serde"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

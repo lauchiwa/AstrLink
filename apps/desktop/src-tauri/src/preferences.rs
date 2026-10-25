@@ -17,7 +17,7 @@ const LEGACY_INFERENCE_PORT: u16 = 8317;
 pub const DEFAULT_MAX_CONCURRENT_INSPECTIONS: u16 = 16;
 pub const MIN_MAX_CONCURRENT_INSPECTIONS: u16 = 4;
 pub const MAX_MAX_CONCURRENT_INSPECTIONS: u16 = 128;
-pub const DEFAULT_RESPONSE_START_TIMEOUT_SECONDS: u32 = 0;
+pub const DEFAULT_RESPONSE_START_TIMEOUT_SECONDS: u32 = 600;
 pub const MAX_RESPONSE_START_TIMEOUT_SECONDS: u32 = 86400;
 const FILE_NAME: &str = "desktop-preferences.json";
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -223,6 +223,7 @@ impl TrayPreferences {
 pub struct Preferences {
     pub close_behavior: CloseBehavior,
     pub autostart: bool,
+    pub autostart_hidden: bool,
     pub core_auto_start: bool,
     pub core_auto_recover: bool,
     pub use_system_proxy: bool,
@@ -250,6 +251,7 @@ impl Default for Preferences {
         Self {
             close_behavior: CloseBehavior::HideToTray,
             autostart: false,
+            autostart_hidden: false,
             core_auto_start: true,
             core_auto_recover: true,
             use_system_proxy: true,
@@ -639,6 +641,30 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    #[test]
+    fn autostart_hidden_defaults_off_for_existing_preferences_and_is_persisted() {
+        let directory = temporary_directory("autostart-hidden");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join(FILE_NAME), br#"{"autostart":true}"#).unwrap();
+        let store = load(&directory);
+        let mut values = store.snapshot().values;
+        assert!(values.autostart);
+        assert!(!values.autostart_hidden);
+        assert_eq!(store.snapshot().load_warning, None);
+
+        values.autostart_hidden = true;
+        store.replace(values).unwrap();
+        assert!(load(&directory).snapshot().values.autostart_hidden);
+
+        let mut values = store.snapshot().values;
+        values.autostart = false;
+        store.replace(values).unwrap();
+        let reloaded = load(&directory).snapshot().values;
+        assert!(!reloaded.autostart);
+        assert!(reloaded.autostart_hidden);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn saved_preferences_are_owner_only() {
@@ -691,6 +717,7 @@ mod tests {
         );
         assert!(snapshot.values.use_system_proxy);
         assert_eq!(snapshot.values.max_request_body_mib, 0);
+        assert_eq!(snapshot.values.response_start_timeout_seconds, 600);
         assert_eq!(snapshot.load_warning, None);
         assert_eq!(snapshot.values.inference_port, 18317);
         // Starting Core must not make a new install look like a legacy install.
@@ -712,6 +739,26 @@ mod tests {
             fs::write(&path, bytes).unwrap();
             let snapshot = load(&directory).snapshot();
             assert_eq!(snapshot.values.inference_port, expected_port);
+            assert_eq!(snapshot.load_warning, None);
+            assert_eq!(fs::read_to_string(&path).unwrap(), bytes);
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn response_start_timeout_defaults_without_overwriting_saved_values() {
+        let directory = temporary_directory("response-start-timeout");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(FILE_NAME);
+        for (bytes, expected) in [
+            (r#"{"locale":"en"}"#, 600),
+            (r#"{"response_start_timeout_seconds":0}"#, 0),
+            (r#"{"response_start_timeout_seconds":90}"#, 90),
+            (r#"{"response_start_timeout_seconds":600}"#, 600),
+        ] {
+            fs::write(&path, bytes).unwrap();
+            let snapshot = load(&directory).snapshot();
+            assert_eq!(snapshot.values.response_start_timeout_seconds, expected);
             assert_eq!(snapshot.load_warning, None);
             assert_eq!(fs::read_to_string(&path).unwrap(), bytes);
         }

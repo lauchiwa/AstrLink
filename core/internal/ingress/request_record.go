@@ -1,6 +1,7 @@
 package ingress
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -188,16 +189,19 @@ type recordSession struct {
 	routingSettings *contract.RoutingSettings
 	// sentReasoningEffort is the level the current attempt sent when the
 	// reasoning settings changed the client's; nil keeps the client's level.
-	sentReasoningEffort   *string
-	pendingAttempt        *pendingAttemptRecord
-	recovery              *contract.RequestRecovery
-	modelRedirect         *contract.RequestModelRedirect
-	id                    contract.RequestID
-	startedAt             time.Time
-	classified            Request
-	accessTokenID         *contract.AccessTokenID
-	scanner               *usageScanner
-	upstreamScanner       *usageScanner
+	sentReasoningEffort *string
+	pendingAttempt      *pendingAttemptRecord
+	recovery            *contract.RequestRecovery
+	modelRedirect       *contract.RequestModelRedirect
+	id                  contract.RequestID
+	startedAt           time.Time
+	classified          Request
+	accessTokenID       *contract.AccessTokenID
+	scanner             *usageScanner
+	upstreamScanner     *usageScanner
+	// outputFlushedAt is when the stream last stored its output; only the
+	// goroutine reading the upstream body touches it.
+	outputFlushedAt       time.Time
 	status                contract.RequestStatus
 	httpStatus            int
 	hasHTTPStatus         bool
@@ -287,6 +291,9 @@ type recordSession struct {
 	persistBlobs   AuditBlobPersister
 	persistLogf    func(string, ...any)
 	persistedAudit map[storage.AuditDirection]bool
+	// Keep serialized metadata so pointer-backed fields cannot mutate the last
+	// successful snapshot. Unchanged capture/progress callbacks need no write.
+	persistedMetadata []byte
 }
 
 func newRecordSession(
@@ -425,22 +432,40 @@ func (session *recordSession) persistAvailableAudit(ctx context.Context) {
 	session.syncCaptureTees()
 	persistCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
-	if session.persistStore != nil {
-		if err := session.persistStore.UpsertRequestRecord(persistCtx, session.recordSnapshot(nil, nil)); err != nil {
-			logRequestRecordFailure(session.persistLogf, "live_audit_upsert", err)
-			return
-		}
+	if err := session.persistMetadata(persistCtx); err != nil {
+		logRequestRecordFailure(session.persistLogf, "live_audit_upsert", err)
+		return
 	}
+	before := session.liveAuditSummary()
 	if session.persistBlobs != nil {
 		session.persistReadyAuditBlobs(persistCtx, session.persistBlobs, session.persistLogf)
 		session.settleRequestExposure(persistCtx, session.persistBlobs, session.persistLogf)
 	}
-	if session.persistStore == nil {
+	if session.liveAuditSummary() == before {
 		return
 	}
-	if err := session.persistStore.UpsertRequestRecord(persistCtx, session.recordSnapshot(nil, nil)); err != nil {
+	if err := session.persistMetadata(persistCtx); err != nil {
 		logRequestRecordFailure(session.persistLogf, "live_audit_upsert", err)
 	}
+}
+
+func (session *recordSession) persistMetadata(ctx context.Context) error {
+	if session.persistStore == nil {
+		return nil
+	}
+	record := session.recordSnapshot(nil, nil)
+	metadata, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	if bytes.Equal(metadata, session.persistedMetadata) {
+		return nil
+	}
+	if err := session.persistStore.UpsertRequestRecord(ctx, record); err != nil {
+		return err
+	}
+	session.persistedMetadata = metadata
+	return nil
 }
 
 func (session *recordSession) persistReadyAuditBlobs(
@@ -569,6 +594,7 @@ func (session *recordSession) recordSnapshot(
 		decision := session.privacyDecision
 		record.PrivacyDecision = &decision
 	}
+	record.Output = session.upstreamScanner.outputActivity()
 	if session.upstreamScanner != nil && !session.upstreamScanner.firstOutputAt.IsZero() {
 		firstTokenMs := int(max(0, session.upstreamScanner.firstOutputAt.Sub(session.startedAt).Milliseconds()))
 		record.FirstTokenMs = &firstTokenMs
@@ -1014,6 +1040,7 @@ func (body *upstreamResponseCaptureBody) Read(p []byte) (int, error) {
 		body.upstreamError.observe(p[:n])
 		if body.session.upstreamScanner != nil {
 			body.session.upstreamScanner.observe(p[:n])
+			body.session.flushLiveOutput()
 		}
 	}
 	return n, err
@@ -1083,7 +1110,7 @@ func (session *recordSession) persistLiveMetadata(ctx context.Context) {
 	}
 	persistCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
-	if err := session.persistStore.UpsertRequestRecord(persistCtx, session.recordSnapshot(nil, nil)); err != nil {
+	if err := session.persistMetadata(persistCtx); err != nil {
 		logRequestRecordFailure(session.persistLogf, "live_metadata_upsert", err)
 	}
 }
@@ -1140,11 +1167,25 @@ func (session *recordSession) failFromHTTPError() bool {
 	return true
 }
 
+// failFromStreamError fails a delivered stream that the upstream ended with
+// an error event.
+func (session *recordSession) failFromStreamError() bool {
+	if session == nil || session.upstreamScanner == nil || session.upstreamScanner.failure == nil {
+		return false
+	}
+	session.status = contract.RequestStatusFailed
+	if session.errorSummary == nil {
+		summary := streamFailureSummary(session.upstreamScanner.protocol, session.upstreamScanner.failure)
+		session.errorSummary = &summary
+	}
+	return true
+}
+
 func (session *recordSession) noteSucceeded() {
 	if session == nil {
 		return
 	}
-	if session.failFromHTTPError() {
+	if session.failFromStreamError() || session.failFromHTTPError() {
 		return
 	}
 	session.status = contract.RequestStatusSucceeded
@@ -2125,7 +2166,7 @@ func errorSummaryFromInference(code, message string, retryable bool) contract.Er
 	case "invalid_access_token", "token_query_forbidden":
 		category = "auth"
 	case "upstream_unavailable", "upstream_timeout", "credential_unavailable",
-		"upstream_stream_interrupted", "upstream_http_error":
+		"upstream_stream_interrupted", "upstream_stream_failed", "upstream_http_error":
 		category = "upstream"
 	case "missing_protocol_capability", "endpoint_resolver_unavailable":
 		category = "routing"

@@ -350,7 +350,11 @@ func TestServePersistentIdentityWithConsoleSession(t *testing.T) {
 	inference.cookie = nil
 	inference.token = token
 	identityStatus(t, inference.control("GET", path, "", ""), 401)
-	identityStatus(t, inference.send("POST", "/v1/responses", identityInferenceBody, http.Header{"Content-Type": {"application/json"}, "Origin": {"https://browser.example"}}), 403)
+	// Upstream lets a browser origin call inference with an access token
+	// (ddad083), so the pre-auth case is a browser origin without one.
+	browser := inference
+	browser.token = ""
+	identityStatus(t, browser.send("POST", "/v1/responses", identityInferenceBody, http.Header{"Content-Type": {"application/json"}, "Origin": {"https://browser.example"}}), 401)
 	status := client.control("GET", path, "", "")
 	identityStatus(t, status, 200)
 	var capture contract.IdentityCaptureStatus

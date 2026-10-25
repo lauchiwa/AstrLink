@@ -14,6 +14,11 @@ import {
 } from "./service-test-model";
 import { parseChannelBindingAudit } from "./channel-binding-model";
 import {
+  parseTerminalChoices,
+  type ServiceTerminalRequest,
+  type TerminalChoice,
+} from "./service-terminal-model";
+import {
   parseClientIdentities,
   parseRoutingSettings,
   type ClientIdentities,
@@ -37,7 +42,11 @@ import {
   parsePrivacySummary,
   type PrivacySummary,
 } from "./privacy-summary-model";
-import type { UsageSummary, UsageWindow } from "./usage-range";
+import {
+  hourlyUsageWindow,
+  type UsageSummary,
+  type UsageWindow,
+} from "./usage-range";
 
 import {
   browserSnapshot,
@@ -102,10 +111,12 @@ import {
   parseAuditContent,
   parsePurgeResult,
   parseRequestRecord,
+  parseRequestActivity,
   parseRequestRecordPage,
   parseRequestSessionDetail,
   parseRequestSessionPage,
   type AuditContent,
+  type RequestActivity,
   type RequestRecord,
   type RequestRecordListQuery,
   type RequestRecordPage,
@@ -218,6 +229,25 @@ async function invoke<T>(
   }
 }
 
+const pendingHistoryReads = new Map<string, Promise<unknown>>();
+
+// Several panels can ask for the same history snapshot at once. Share only
+// in-flight reads; settled results and failures must never delay a refresh.
+function invokeHistoryRead(
+  command: "get_usage_summary" | "get_request_session",
+  args: Record<string, unknown>,
+): Promise<unknown> {
+  const key = JSON.stringify([command, args]);
+  const existing = pendingHistoryReads.get(key);
+  if (existing) return existing;
+  const pending = invoke<unknown>(command, args).finally(() => {
+    if (pendingHistoryReads.get(key) === pending)
+      pendingHistoryReads.delete(key);
+  });
+  pendingHistoryReads.set(key, pending);
+  return pending;
+}
+
 // These local reads should finish promptly. A stuck native event loop must not
 // leave settings loading forever or keep displaying an old ready snapshot.
 async function invokeDesktopRead(
@@ -252,16 +282,19 @@ export async function restartCore(): Promise<AppSnapshot> {
     throw new Error(i18n.t("bridge.restartDesktopOnly"));
   }
 
+  pendingHistoryReads.clear();
   return parseAppSnapshot(await invoke<unknown>("restart_core"));
 }
 
 export async function startCore(): Promise<AppSnapshot> {
   requireNativeBridge();
+  pendingHistoryReads.clear();
   return parseAppSnapshot(await invoke<unknown>("start_core"));
 }
 
 export async function stopCore(): Promise<AppSnapshot> {
   requireNativeBridge();
+  pendingHistoryReads.clear();
   return parseAppSnapshot(await invoke<unknown>("stop_core"));
 }
 
@@ -724,6 +757,9 @@ function compactQuery(
   ) {
     compact.local_access_token_ids = query.local_access_token_ids;
   }
+  if (query.models !== undefined && query.models.length > 0) {
+    compact.models = query.models;
+  }
   if (query.status !== undefined) compact.status = query.status;
   return compact;
 }
@@ -742,12 +778,25 @@ export async function listRequestSessions(
   );
 }
 
+/**
+ * The spans of model calls running at or after `since`, for the live board.
+ * It covers every model call, whatever the request list is filtered to.
+ */
+export async function getRequestActivity(
+  since: string,
+): Promise<RequestActivity> {
+  requireNativeBridge();
+  return parseRequestActivity(
+    await invoke<unknown>("get_request_activity", { since }),
+  );
+}
+
 export async function getRequestSession(
   sessionId: string,
 ): Promise<RequestSessionDetail> {
   requireNativeBridge();
   return parseRequestSessionDetail(
-    await invoke<unknown>("get_request_session", { sessionId }),
+    await invokeHistoryRead("get_request_session", { sessionId }),
   );
 }
 
@@ -970,11 +1019,11 @@ export async function getUsageSummary(
 ): Promise<UsageSummary> {
   requireNativeBridge();
   return parseUsageSummary(
-    await invoke<unknown>("get_usage_summary", {
+    await invokeHistoryRead("get_usage_summary", {
       from: window.from,
       to: window.to,
       timeZone: window.time_zone || "UTC",
-      bucket: window.preset === "1d" ? "hour" : "day",
+      bucket: hourlyUsageWindow(window) ? "hour" : "day",
     }),
     window,
   );
@@ -990,7 +1039,7 @@ export async function getPrivacySummary(
       from: window.from,
       to: window.to,
       timeZone: window.time_zone || "UTC",
-      bucket: window.preset === "1d" ? "hour" : "day",
+      bucket: hourlyUsageWindow(window) ? "hour" : "day",
     }),
     window,
   );
@@ -1102,6 +1151,29 @@ export async function copyClientConfigSnippet(
   return parseClientConfigCopied(
     await invoke<unknown>("copy_client_config_snippet", { ...input }),
   );
+}
+
+/** Terminal apps installed here, the platform's own first. */
+export async function listTerminalApps(): Promise<TerminalChoice[]> {
+  if (!hasNativeBridge()) return [];
+  return parseTerminalChoices(await invoke<unknown>("list_terminal_apps"));
+}
+
+/** The folder the user picked, or null when they closed the picker. */
+export async function pickTerminalDirectory(
+  start: string | null,
+): Promise<string | null> {
+  requireNativeBridge();
+  const picked = await invoke<unknown>("pick_terminal_directory", { start });
+  return typeof picked === "string" ? picked : null;
+}
+
+/** Opens a terminal whose client reaches the gateway through one provider. */
+export async function openServiceTerminal(
+  request: ServiceTerminalRequest,
+): Promise<void> {
+  requireNativeBridge();
+  await invoke("open_service_terminal", { request });
 }
 
 /** Whether the OS has an app registered for CC Switch's import links. */

@@ -10,15 +10,15 @@ import (
 )
 
 // The fork shipped identity profiles before upstream assigned the same versions
-// to its own steps, three times: 48 went to answer timing, 49 to privacy token
-// kinds and audit chunks, and 50 to config sync. Profiles therefore moved
-// 48 -> 49 -> 50 -> 53.
+// to its own steps, four times: 48 went to answer timing, 49 to privacy token
+// kinds and audit chunks, 50 to config sync, and 53 to session cursor lookup
+// order. Profiles therefore moved 48 -> 49 -> 50 -> 53 -> 56.
 //
 // A database carrying any earlier numbering records a name this Core no longer
 // expects at that version, which verifyHistory would reject. Reconcile only
-// these three known collisions, in Up's existing transaction: apply the
+// these four known collisions, in Up's existing transaction: apply the
 // upstream schema that version is now supposed to carry, then rename the
-// recorded name. Version 53 afterwards adopts the existing profile table
+// recorded name. Version 56 afterwards adopts the existing profile table
 // without changing any profile row. All other history mismatches still fail
 // closed.
 func (runner *Runner) reconcileIdentityProfileHistory(ctx context.Context, transaction Transaction) error {
@@ -33,17 +33,19 @@ func (runner *Runner) reconcileIdentityProfileHistory(ctx context.Context, trans
 			claimed[49] = migration
 		case migration.Version == 50 && migration.Name == "config_sync":
 			claimed[50] = migration
-		case migration.Version == 53 && migration.Name == "service_identity_profiles":
+		case migration.Version == 53 && migration.Name == "session_cursor_lookup_order":
+			claimed[53] = migration
+		case migration.Version == 56 && migration.Name == "service_identity_profiles":
 			profiles = true
 		}
 	}
 	if !profiles {
 		return nil
 	}
-	// Ascending: a database at 49 or 50 was reconciled through the lower
+	// Ascending: a database at 49, 50, or 53 was reconciled through the lower
 	// versions first, so each must hold its upstream schema before the next
 	// one is touched.
-	for _, version := range []int64{48, 49, 50} {
+	for _, version := range []int64{48, 49, 50, 53} {
 		upstream := claimed[version]
 		if upstream == nil {
 			continue
@@ -126,7 +128,14 @@ func (runner *Runner) claimedVersionApplied(
 	var query string
 	switch version {
 	case 50:
-		return createdObjectsApplied(ctx, transaction, upstream)
+		return createdObjectsApplied(ctx, transaction, upstream, nil)
+	case 53:
+		// session_cursor_lookup_order also adds columns, backfills them, and
+		// drops the indexes its new ones replace. Those statements run in the
+		// same transaction as its CREATEs, so the created objects alone tell
+		// whether the step ran; a replay over a half-altered table would still
+		// fail on the first duplicate column rather than succeed silently.
+		return createdObjectsApplied(ctx, transaction, upstream, []string{"ALTER TABLE ", "UPDATE ", "DROP INDEX "})
 	case 48:
 		query = `SELECT COUNT(*) FROM pragma_table_info('request_records') WHERE name = 'first_answer_ms'`
 	case 49:
@@ -146,16 +155,24 @@ func (runner *Runner) claimedVersionApplied(
 // so it cannot silently drop out of the probe.
 var createdObjectPattern = regexp.MustCompile(`^CREATE (?:TABLE|INDEX|TRIGGER) (\w+)`)
 
-// createdObjectsApplied probes a reclaimed step made only of plain CREATE
-// statements, such as config_sync. The expected objects come from the step's
-// own statements, so the probe cannot drift from what it would replay. None
-// present means replay, all present means only rename, and anything in between
-// is an out-of-band partial state that fails closed: replaying would stop at
-// the first existing object, and renaming would skip the missing ones.
-func createdObjectsApplied(ctx context.Context, transaction Transaction, upstream *Migration) (bool, error) {
+// createdObjectsApplied probes a reclaimed step by the objects its plain CREATE
+// statements name, such as config_sync. The expected objects come from the
+// step's own statements, so the probe cannot drift from what it would replay.
+// None present means replay, all present means only rename, and anything in
+// between is an out-of-band partial state that fails closed: replaying would
+// stop at the first existing object, and renaming would skip the missing ones.
+//
+// skipped lists the statement prefixes a caller has shown need no probe of
+// their own. Any other statement that is not a plain CREATE fails closed, so a
+// statement cannot silently drop out of the probe.
+func createdObjectsApplied(ctx context.Context, transaction Transaction, upstream *Migration, skipped []string) (bool, error) {
 	names := make([]string, 0, len(upstream.Statements))
 	for _, statement := range upstream.Statements {
-		match := createdObjectPattern.FindStringSubmatch(strings.TrimSpace(statement))
+		statement = strings.TrimSpace(statement)
+		if hasAnyPrefix(statement, skipped) {
+			continue
+		}
+		match := createdObjectPattern.FindStringSubmatch(statement)
 		if match == nil {
 			return false, fmt.Errorf("%w: migration %d (%s) has a statement the reconciliation cannot probe", ErrMigrationHistory, upstream.Version, upstream.Name)
 		}
@@ -185,4 +202,13 @@ func createdObjectsApplied(ctx context.Context, transaction Transaction, upstrea
 	default:
 		return false, fmt.Errorf("%w: migration %d (%s) is partially applied: %d of %d objects present", ErrMigrationHistory, upstream.Version, upstream.Name, present, len(names))
 	}
+}
+
+func hasAnyPrefix(value string, prefixes []string) bool {
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(value, prefix) {
+			return true
+		}
+	}
+	return false
 }

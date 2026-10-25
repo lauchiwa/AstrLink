@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -40,10 +41,14 @@ const (
 	maxOpenConns     = 8
 	maxIdleConns     = 4
 	busyTimeoutMS    = 5000
+	busyStepMS       = 10
 	slowListAfter    = time.Second
 )
 
 type Store struct {
+	serviceDocuments  serviceDocumentCache
+	usageSummaries    historyCache
+	requestSessions   historyCache
 	channelBindingsMu chan struct{}
 	db                *sql.DB
 	keys              *keyRing
@@ -167,13 +172,10 @@ func openDatabase(ctx context.Context, absolutePath string) (*sql.DB, error) {
 	if err := prepareDatabaseFiles(absolutePath); err != nil {
 		return nil, err
 	}
-	database, err := sql.Open(driverName, sqliteFileDSN(absolutePath))
-	if err != nil {
-		return nil, fmt.Errorf("open sqlite database: %w", err)
-	}
+	database := openWriterDatabase(sqliteWALDSN(absolutePath, busyStepMS))
 	// WAL in the DSN applies to every pooled connection. A small pool lets
-	// request-record lists share the file with ingress upserts; SQLite still
-	// serializes writers and busy_timeout covers the wait.
+	// request-record lists share the file with ingress upserts. The connector
+	// serializes writers with context-aware admission before SQLite is entered.
 	database.SetMaxOpenConns(maxOpenConns)
 	database.SetMaxIdleConns(maxIdleConns)
 	if err := requireWALMode(ctx, database); err != nil {
@@ -186,8 +188,8 @@ func openDatabase(ctx context.Context, absolutePath string) (*sql.DB, error) {
 // openReadOnly opens an existing database for reading only; see WithReadOnly.
 func openReadOnly(ctx context.Context, absolutePath string, settings openOptions) (*Store, error) {
 	database, err := sql.Open(driverName, fmt.Sprintf(
-		"file:%s?mode=ro&_pragma=busy_timeout(%d)&_pragma=query_only(1)",
-		filepath.ToSlash(absolutePath), busyTimeoutMS,
+		"%s?mode=ro&_pragma=busy_timeout(%d)&_pragma=query_only(1)",
+		sqliteFileURI(absolutePath), busyTimeoutMS,
 	))
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite database: %w", err)
@@ -284,11 +286,23 @@ func initialize(ctx context.Context, database *sql.DB, settings openOptions) (*S
 }
 
 func sqliteFileDSN(absolutePath string) string {
+	return sqliteWALDSN(absolutePath, busyTimeoutMS)
+}
+
+func sqliteWALDSN(absolutePath string, busyMS int) string {
 	return fmt.Sprintf(
-		"file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(%d)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)",
-		filepath.ToSlash(absolutePath),
-		busyTimeoutMS,
+		"%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(%d)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)&_txlock=immediate",
+		sqliteFileURI(absolutePath), busyMS,
 	)
+}
+
+func sqliteFileURI(absolutePath string) string {
+	path := filepath.ToSlash(absolutePath)
+	if !strings.HasPrefix(path, "/") {
+		// An absolute Windows drive path is a URI path, not a hostname.
+		path = "/" + path
+	}
+	return (&url.URL{Scheme: "file", Path: path}).String()
 }
 
 func requireWALMode(ctx context.Context, database *sql.DB) error {
@@ -359,15 +373,25 @@ func (store *Store) CreateAccessToken(ctx context.Context, candidate storagecont
 	if err := validateNewAccessToken(candidate); err != nil {
 		return record, fmt.Errorf("%w: %v", storagecontract.ErrInvalidArgument, err)
 	}
-	return retryConfigWrite(ctx, store.db, func(ctx context.Context, transaction *sql.Tx) (storagecontract.AccessTokenMetadata, error) {
-		// Write first, before insertAccessTokenTx reads the count, so another
-		// connection's write makes this wait on busy_timeout instead of failing
-		// a deferred read transaction upgrade with SQLITE_BUSY.
-		if _, err := transaction.ExecContext(ctx, `UPDATE local_access_tokens SET id = id WHERE 0`); err != nil {
-			return storagecontract.AccessTokenMetadata{}, fmt.Errorf("lock access tokens: %w", err)
-		}
-		return store.insertAccessTokenTx(ctx, transaction, candidate, store.now().UTC())
-	})
+	transaction, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return record, fmt.Errorf("begin access token create: %w", err)
+	}
+	defer rollbackOnError(transaction, &err)
+	// Write first, before insertAccessTokenTx reads the count, so another
+	// connection's write makes this wait on busy_timeout instead of failing
+	// a deferred read transaction upgrade with SQLITE_BUSY.
+	if _, err = transaction.ExecContext(ctx, `UPDATE local_access_tokens SET id = id WHERE 0`); err != nil {
+		return storagecontract.AccessTokenMetadata{}, fmt.Errorf("lock access tokens: %w", err)
+	}
+	record, err = store.insertAccessTokenTx(ctx, transaction, candidate, store.now().UTC())
+	if err != nil {
+		return storagecontract.AccessTokenMetadata{}, err
+	}
+	if err = transaction.Commit(); err != nil {
+		return storagecontract.AccessTokenMetadata{}, fmt.Errorf("commit access token create: %w", err)
+	}
+	return record, nil
 }
 
 func (store *Store) ListAccessTokens(ctx context.Context) ([]storagecontract.AccessTokenMetadata, error) {
@@ -739,11 +763,6 @@ VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		storagecontract.AccessTokenSourceUser,
 		createdAtText,
 	); err != nil {
-		// Only a constraint failure is a conflict. A busy/snapshot error must
-		// surface unchanged: the stale snapshot cannot decide uniqueness.
-		if !isSQLiteConstraint(err) {
-			return storagecontract.AccessTokenMetadata{}, fmt.Errorf("insert access token metadata: %w", err)
-		}
 		var exists int
 		scanErr := transaction.QueryRowContext(ctx, `SELECT EXISTS(
     SELECT 1 FROM local_access_tokens WHERE id = ? OR name_key = ? OR token_hash = ?

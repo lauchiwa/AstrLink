@@ -282,6 +282,11 @@ describe("routing decision metadata", () => {
       parseRequestRecord({ ...fullRecord, routing_decision: decision })
         .routing_decision,
     ).toStrictEqual(decision);
+    const pinned = { selected: "client_pin", skipped: [] };
+    expect(
+      parseRequestRecord({ ...fullRecord, routing_decision: pinned })
+        .routing_decision,
+    ).toStrictEqual(pinned);
     // No provider could serve the call: every exclusion, no selection.
     const unserved = { skipped: decision.skipped };
     expect(
@@ -536,6 +541,12 @@ describe("request-record IPC contract", () => {
       privacy_ignored: [
         { kind: "private_person", reason: "low_confidence", count: 2 },
         { kind: "email", reason: "allowlisted", count: 1, confidence },
+        {
+          kind: "common_secret",
+          reason: "astrlink_identifier",
+          count: 3,
+          confidence,
+        },
       ],
     });
     expect(parsed.privacy_findings).toEqual([
@@ -545,6 +556,12 @@ describe("request-record IPC contract", () => {
     expect(parsed.privacy_ignored).toEqual([
       { kind: "private_person", reason: "low_confidence", count: 2 },
       { kind: "email", reason: "allowlisted", count: 1, confidence },
+      {
+        kind: "common_secret",
+        reason: "astrlink_identifier",
+        count: 3,
+        confidence,
+      },
     ]);
     expect(parseRequestRecord(fullRecord)).not.toHaveProperty(
       "privacy_ignored",

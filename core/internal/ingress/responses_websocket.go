@@ -50,8 +50,8 @@ type responsesWSSession struct {
 }
 
 func (handler *Handler) serveResponsesWebSocket(writer http.ResponseWriter, request *http.Request) {
-	// The normal local boundary has already checked Origin, Host and credentials.
-	upgrader := websocket.Upgrader{HandshakeTimeout: 10 * time.Second}
+	// The normal boundary has already checked Host and the API token.
+	upgrader := websocket.Upgrader{HandshakeTimeout: 10 * time.Second, CheckOrigin: func(*http.Request) bool { return true }}
 	client, err := upgrader.Upgrade(writer, request, nil)
 	if err != nil {
 		return

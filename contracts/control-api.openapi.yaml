@@ -1512,8 +1512,9 @@ paths:
       description: >-
         Returns successful request counts and tokens, failed request counts,
         and sparse calendar, service and model buckets in one response.
-        Retry children, pending, blocked and cancelled requests are excluded.
-        Legacy succeeded requests with HTTP errors count as failed. Service,
+        Retry children are excluded. Pending, blocked and cancelled requests
+        appear only in status_counts. Legacy succeeded requests with HTTP
+        errors count as failed. Service,
         model and local access-token buckets contain successful and failed request
         counts; token usage is accumulated only for successful requests. No
         pagination cap applies.
@@ -2033,7 +2034,10 @@ paths:
         Returns the fixed kind and pattern pairs used by the builtin Regex
         detector. Intended to seed custom_regex_rules; the catalog itself is
         not editable. Custom mode compiles patterns only and does not reuse
-        built-in validators such as Luhn or IBAN checks.
+        built-in validators such as Luhn or IBAN checks, or boundary checks
+        such as the one that keeps a local access token from matching inside
+        a longer base64url run. Value groups are part of the patterns and
+        apply in custom mode too.
       responses:
         "200":
           description: Built-in Regex rules.
@@ -2820,6 +2824,7 @@ paths:
             uniqueItems: true
             items:
               $ref: ./protocol-capabilities.schema.json#/$defs/ResourceId
+        - $ref: "#/components/parameters/ModelFilter"
         - name: status
           in: query
           schema:
@@ -3505,6 +3510,46 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+  /control/v1/request-activity:
+    x-astrlink-implementation-status: implemented
+    get:
+      x-astrlink-role: observer
+      tags: [Requests]
+      operationId: getRequestActivity
+      summary: List the spans of model calls that overlap a recent window.
+      description: |
+        Returns root model calls still running or ended at or after since, so a
+        client can chart how many conversations ran at once. A call that ended
+        earlier on tool calls it asked for is returned too while its
+        conversation has made no later call before since, because the client
+        may still be running those tools. Calls that started more than an hour
+        before since, model discovery, and calls a Core restart interrupted are
+        left out. Retries stay inside their root's span. Does not return
+        request or response content.
+      parameters:
+        - name: since
+          in: query
+          required: true
+          description: Start of the window. It must lie within the last hour.
+          schema:
+            type: string
+            format: date-time
+      responses:
+        "200":
+          description: >
+            Calls overlapping the window and earlier calls whose tools may
+            still be running, newest first.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RequestActivity"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
   /control/v1/request-sessions:
     x-astrlink-implementation-status: implemented
     get:
@@ -3548,6 +3593,7 @@ paths:
             uniqueItems: true
             items:
               $ref: ./protocol-capabilities.schema.json#/$defs/ResourceId
+        - $ref: "#/components/parameters/ModelFilter"
         - name: status
           in: query
           description: >
@@ -3682,6 +3728,23 @@ components:
       schema:
         type: string
         format: date-time
+    ModelFilter:
+      name: model
+      in: query
+      description: >
+        Restrict to root records that name any of these models as the requested
+        model, its routing redirect target, or the model a recovery sent
+        upstream. Matches are exact. Repeat the parameter for multiple models.
+      style: form
+      explode: true
+      schema:
+        type: array
+        maxItems: 100
+        uniqueItems: true
+        items:
+          type: string
+          minLength: 1
+          maxLength: 256
     ServiceId:
       name: service_id
       in: path
@@ -4031,11 +4094,22 @@ components:
           properties:
             token_id:
               $ref: ./protocol-capabilities.schema.json#/$defs/ResourceId
+    BillingServiceGroup:
+      description: >-
+        Amounts billed to one service. A root request that failed over counts
+        once under every service that served one of its attempts.
+      allOf:
+        - { $ref: "#/components/schemas/BillingAmounts" }
+        - type: object
+          required: [service_id]
+          properties:
+            service_id:
+              $ref: ./protocol-capabilities.schema.json#/$defs/ResourceId
     BillingSummary:
       allOf:
         - { $ref: "#/components/schemas/BillingAmounts" }
         - type: object
-          required: [from, to, by_model, by_token]
+          required: [from, to, by_model, by_token, by_service]
           properties:
             from: { type: string, format: date-time }
             to: { type: string, format: date-time }
@@ -4053,6 +4127,11 @@ components:
               type: array
               items:
                 $ref: "#/components/schemas/BillingTokenGroup"
+            by_service:
+              type: array
+              description: Ranked by amount, then root requests, then service ID.
+              items:
+                $ref: "#/components/schemas/BillingServiceGroup"
     BillingPeriod:
       type: object
       required:
@@ -4165,6 +4244,19 @@ components:
         total_tokens: { type: integer, minimum: 0 }
         cache_read_tokens: { type: integer, minimum: 0 }
         cache_write_tokens: { type: integer, minimum: 0 }
+    UsageStatusCounts:
+      type: object
+      additionalProperties: false
+      description: >-
+        Root inference requests in the window by stored status. succeeded and
+        failed equal totals.requests and totals.failed_requests.
+      required: [succeeded, failed, blocked, cancelled, pending]
+      properties:
+        succeeded: { type: integer, minimum: 0 }
+        failed: { type: integer, minimum: 0 }
+        blocked: { type: integer, minimum: 0 }
+        cancelled: { type: integer, minimum: 0 }
+        pending: { type: integer, minimum: 0 }
     UsageDayBucket:
       allOf:
         - $ref: "#/components/schemas/UsageTotals"
@@ -4219,6 +4311,7 @@ components:
       required:
         [
           totals,
+          status_counts,
           by_day,
           by_hour,
           by_service,
@@ -4230,6 +4323,8 @@ components:
         totals:
           $ref: "#/components/schemas/UsageTotals"
           unevaluatedProperties: false
+        status_counts:
+          $ref: "#/components/schemas/UsageStatusCounts"
         by_day:
           type: array
           items: { $ref: "#/components/schemas/UsageDayBucket" }
@@ -4674,7 +4769,7 @@ components:
         service_id: { type: string }
         model: { type: string, maxLength: 256 }
         base_url: { type: string, maxLength: 2048, format: uri }
-      description: Upstream execution requires an enabled native Responses provider and an executor model that supports the hosted tool; the executor chooses the image model. service_images (image generation only) calls the OpenAI Images API of an enabled newapi, openai or openai_compatible provider with its own credential; model is the image model. service_search (web search only) calls the /alpha/search API of an enabled codex_subscription or newapi provider with its own credential; model names the search model. External search uses Tavily; external images use OpenAI Images with a configured model. Credentials are stored separately. Enabled configurations require the selected backend's fields.
+      description: Upstream execution requires an enabled native Responses provider and an executor model that supports the hosted tool; the executor chooses the image model. service_images (image generation only) calls the OpenAI Images API of an enabled newapi, openai or openai_compatible provider with its own credential; model is the image model. service_search (web search only) calls the /alpha/search API of an enabled codex_subscription or newapi provider with its own credential; model names the search model. External search uses Tavily, and a DeepSeek base URL switches to its search and fetch endpoints automatically; external images use OpenAI Images with a configured model. Credentials are stored separately. Enabled configurations require the selected backend's fields.
     BuiltinTools:
       type: object
       additionalProperties: false
@@ -5917,7 +6012,13 @@ components:
           type: string
           minLength: 1
           maxLength: 512
-          description: Go RE2 regular expression; compiled by Core on save and inspect.
+          description: >
+            Go RE2 regular expression; compiled by Core on save and inspect.
+            Each match is replaced as a whole unless the pattern has a capture
+            group named value, as in `token=(?P<value>[A-Za-z0-9_-]{12,})`;
+            then only the first value group that took part in the match is
+            replaced, and a match whose value group is empty is not a finding.
+            Other capture groups do not change what is replaced.
       additionalProperties: false
     PolicyRegexBuiltinRulesResponse:
       type: object
@@ -5985,12 +6086,15 @@ components:
             - allowlisted
             - placeholder
             - unrepresentable
+            - astrlink_identifier
           description: >
             Why the span was left in the request. Absent on accepted findings.
             placeholder means the value already belonged to a placeholder
             namespace, so redacting it again would make the innermost original
             unrecoverable. unrepresentable means the kind ran out of reserved
-            stand-ins and fell back to a token placeholder.
+            stand-ins and fell back to a token placeholder. astrlink_identifier
+            means the value is an identifier AstrLink generated itself, such as
+            a local access token id or a request id, which grants no access.
       additionalProperties: false
     PolicyDryRunRedaction:
       type: object
@@ -6153,7 +6257,7 @@ components:
         unsupported_reason:
           oneOf:
             - type: string
-              enum: [cpu_only]
+              enum: [cpu_only, requires_macos_26]
             - type: "null"
       additionalProperties: false
     PrivacyModelCatalogItem:
@@ -6381,6 +6485,7 @@ components:
         - error
         - label_mapping
         - installed_at
+        - preparation
       properties:
         id:
           $ref: "#/components/schemas/PrivacyModelInstallationId"
@@ -6462,6 +6567,36 @@ components:
           oneOf:
             - type: string
               format: date-time
+            - type: "null"
+        preparation:
+          description: |
+            Runtime state, never stored. Core prepares a Core ML installation
+            as soon as the policy selects it, and at startup when the policy
+            already uses it: the worker starts, compiles the model for this
+            device and warms it up. Null for every other installation,
+            including CPU installations, which still start on their first
+            request.
+          oneOf:
+            - $ref: "#/components/schemas/PrivacyModelPreparation"
+            - type: "null"
+      additionalProperties: false
+    PrivacyModelPreparation:
+      type: object
+      required: [state, fallback]
+      properties:
+        state:
+          type: string
+          enum: [preparing, ready, failed]
+        fallback:
+          description: |
+            The detector of the previous policy, which inspects requests
+            while the model is preparing and after it failed. Null when no
+            detector inspected requests before (and always once ready):
+            requests then wait for the model within the usual timeouts, and
+            fail with `safety_engine_unavailable` once it has failed.
+          oneOf:
+            - type: string
+              enum: [local_model, regex]
             - type: "null"
       additionalProperties: false
     PrivacyModelInstallationList:
@@ -6899,6 +7034,8 @@ components:
           type: [integer, "null"]
           minimum: 0
           description: Milliseconds from sending the upstream request to the first generated content that is not reasoning (text, a refusal, a tool call, or media). At least first_token_ms; the difference is how long the model thought before answering. Null without first_token_ms, for calls that only reasoned, and on historical rows.
+        output:
+          $ref: "#/components/schemas/OutputActivity"
         usage:
           oneOf:
             - $ref: "#/components/schemas/Usage"
@@ -7075,14 +7212,16 @@ components:
       required: [kind, reason, count]
       description: |
         Matches of one kind the policy left in the request for one reason. A
-        match that was already a placeholder is not counted. Never carries the
-        matched value.
+        match that was already a placeholder is not counted. astrlink_identifier
+        counts identifiers AstrLink generated itself, such as local access token
+        ids, which grant no access. Never carries the matched value.
       properties:
         kind:
           $ref: "#/components/schemas/PrivacyCanonicalKind"
         reason:
           type: string
-          enum: [kind_disabled, low_confidence, allowlisted]
+          enum:
+            [kind_disabled, low_confidence, allowlisted, astrlink_identifier]
         count:
           type: integer
           minimum: 1
@@ -7209,6 +7348,7 @@ components:
           response_affinity,
           websocket_connection,
           failover,
+          client_pin,
         ]
       description: |
         Why the attempt used service_id. Absent when no provider could be selected.
@@ -7217,6 +7357,7 @@ components:
         response_affinity: the provider that produced previous_response_id.
         websocket_connection: the provider the Responses WebSocket connection is bound to.
         failover: an earlier provider of this request was rejected or failed.
+        client_pin: the provider the request named in X-AstrLink-Service; no other provider could serve it.
     RoutingSkip:
       type: object
       additionalProperties: false
@@ -7292,6 +7433,61 @@ components:
           type: integer
           minimum: 0
       additionalProperties: false
+    OutputActivity:
+      type: object
+      description: >
+        What a call's response produces. While the call streams, kind is the
+        part arriving now and is refreshed at most twice a second; once the
+        call ends, the last part. After a call that ended on a tool call, the
+        client is running the named tools. Absent before any output and on
+        historical records.
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          enum: [reasoning, text, tool]
+        tools:
+          type: array
+          description: Names of the tool calls the response made, in order.
+          maxItems: 8
+          items:
+            type: string
+            minLength: 1
+            maxLength: 64
+      additionalProperties: false
+    RequestActivity:
+      type: object
+      required: [now, calls]
+      properties:
+        now:
+          type: string
+          format: date-time
+          description: The gateway's clock when the calls were read; chart the window against it.
+        calls:
+          type: array
+          items:
+            $ref: "#/components/schemas/RequestActivityCall"
+      additionalProperties: false
+    RequestActivityCall:
+      type: object
+      required: [session_id, started_at, completed_at, status]
+      properties:
+        session_id:
+          $ref: ./protocol-capabilities.schema.json#/$defs/ResourceId
+        client_type:
+          $ref: "#/components/schemas/ClientType"
+        started_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: [string, "null"]
+          format: date-time
+          description: Null while the call is running.
+        status:
+          $ref: "#/components/schemas/RequestStatus"
+        output:
+          $ref: "#/components/schemas/OutputActivity"
+      additionalProperties: false
     RequestSession:
       type: object
       required:
@@ -7365,6 +7561,10 @@ components:
           oneOf:
             - $ref: ./protocol-capabilities.schema.json#/$defs/ResourceId
             - type: "null"
+        output:
+          allOf:
+            - $ref: "#/components/schemas/OutputActivity"
+          description: The latest call's output, so a list can tell whether a conversation is thinking, answering, or running tools.
         privacy_warned:
           type: boolean
           description: Present and true when the privacy policy's warn action let at least one call of the session through.

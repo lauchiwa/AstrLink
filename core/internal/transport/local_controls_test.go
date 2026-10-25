@@ -66,6 +66,8 @@ func TestLocalControlsNeverReachHTTPOrWebSocketUpstream(t *testing.T) {
 			request.Header.Set(OpenAIActorAuthorizationHeader, "inbound-local-switch")
 			request.Header["X-OPENAI-ACTOR-AUTHORIZATION"] = []string{"another-local-switch"}
 			request.Header.Set("X-AstrLink-Console", "local-console")
+			// ingress.ServiceHeader: a client's provider pin is read locally.
+			request.Header.Set("X-AstrLink-Service", "service_local")
 			response := httptest.NewRecorder()
 			if socketMode {
 				socket := &ResponsesSocket{}

@@ -534,7 +534,8 @@ impl Default for CoreInner {
             inference_listen: crate::preferences::InferenceListen::Loopback,
             started_launch: None,
             max_concurrent_inspections: 16,
-            response_start_timeout_seconds: 0,
+            response_start_timeout_seconds:
+                crate::preferences::DEFAULT_RESPONSE_START_TIMEOUT_SECONDS,
             max_request_body_mib: 0,
             use_system_proxy: true,
             locale: Locale::En,
@@ -2558,6 +2559,25 @@ impl CoreManager {
             .map_err(|error| format!("request session list returned invalid JSON: {error}"))
     }
 
+    pub async fn get_request_activity(&self, since: &str) -> Result<serde_json::Value, String> {
+        if !timestamp_query_charset_ok(since) {
+            return Err("request activity since has an invalid timestamp charset".to_string());
+        }
+        let (_, body) = self
+            .authenticated_control(
+                Method::GET,
+                &format!(
+                    "/control/v1/request-activity?since={}",
+                    percent_encode_query(since)
+                ),
+                None,
+                None,
+            )
+            .await?;
+        serde_json::from_slice(&body)
+            .map_err(|error| format!("request activity returned invalid JSON: {error}"))
+    }
+
     pub async fn get_request_session(&self, session_id: &str) -> Result<serde_json::Value, String> {
         validate_resource_id(session_id)?;
         let (_, body) = self
@@ -3931,7 +3951,12 @@ fn validate_privacy_dry_run_kind(kind: &str) -> Result<(), String> {
 fn validate_privacy_suppression_reason(value: &serde_json::Value) -> Result<(), String> {
     match value.as_str() {
         Some(
-            "low_confidence" | "kind_disabled" | "allowlisted" | "placeholder" | "unrepresentable",
+            "low_confidence"
+            | "kind_disabled"
+            | "allowlisted"
+            | "placeholder"
+            | "unrepresentable"
+            | "astrlink_identifier",
         ) => Ok(()),
         _ => Err("privacy policy dry-run finding reason is unknown".to_string()),
     }
@@ -4273,7 +4298,7 @@ fn validate_privacy_model_variants(value: &serde_json::Value) -> Result<(), Stri
         }
         let supported = variant["supported"].as_bool().expect("validated boolean");
         let reason = match variant["unsupported_reason"].as_str() {
-            Some("cpu_only") => Some("cpu_only"),
+            Some(reason @ ("cpu_only" | "requires_macos_26")) => Some(reason),
             None if variant["unsupported_reason"].is_null() => None,
             _ => return Err("privacy model variant unsupported_reason is invalid".to_string()),
         };
@@ -4311,6 +4336,7 @@ fn validate_privacy_model_installation(installation: &serde_json::Value) -> Resu
             "error",
             "label_mapping",
             "installed_at",
+            "preparation",
         ],
         "privacy model installation",
     )?;
@@ -4425,7 +4451,31 @@ fn validate_privacy_model_installation(installation: &serde_json::Value) -> Resu
             return Err("privacy model installation lifecycle fields are inconsistent".to_string())
         }
     }
+    if status != "ready" && !object["preparation"].is_null() {
+        return Err(
+            "privacy model installation preparation needs a ready installation".to_string(),
+        );
+    }
+    validate_privacy_model_preparation(&object["preparation"])?;
     validate_label_mapping(&object["label_mapping"])
+}
+
+/// Core prepares the policy's Core ML model ahead of requests; `fallback`
+/// names the previous detector that inspects requests until it is ready.
+fn validate_privacy_model_preparation(value: &serde_json::Value) -> Result<(), String> {
+    if value.is_null() {
+        return Ok(());
+    }
+    validate_exact_object_keys(value, &["state", "fallback"], "privacy model preparation")?;
+    let fallback = match value["fallback"].as_str() {
+        Some(kind @ ("local_model" | "regex")) => Some(kind),
+        None if value["fallback"].is_null() => None,
+        _ => return Err("privacy model preparation fallback is invalid".to_string()),
+    };
+    match (value["state"].as_str(), fallback) {
+        (Some("preparing" | "failed"), _) | (Some("ready"), None) => Ok(()),
+        _ => Err("privacy model preparation state is invalid".to_string()),
+    }
 }
 
 fn validate_label_mapping(value: &serde_json::Value) -> Result<(), String> {
@@ -5114,6 +5164,7 @@ fn build_request_record_query(query: &serde_json::Value) -> Result<String, Strin
     let mut protocol: Option<&str> = None;
     let mut service_id: Option<&str> = None;
     let mut local_access_token_ids: Vec<&str> = Vec::new();
+    let mut models: Vec<&str> = Vec::new();
     let mut status: Option<&str> = None;
 
     for (key, value) in object {
@@ -5197,6 +5248,26 @@ fn build_request_record_query(query: &serde_json::Value) -> Result<String, Strin
                     local_access_token_ids.push(text);
                 }
             }
+            "models" => {
+                let values = value.as_array().ok_or_else(|| {
+                    "request record query models must be an array of strings".to_string()
+                })?;
+                if values.len() > 100 {
+                    return Err("request record query models has too many entries".to_string());
+                }
+                for value in values {
+                    let text = value.as_str().ok_or_else(|| {
+                        "request record query models must be an array of strings".to_string()
+                    })?;
+                    if text.is_empty()
+                        || text.chars().count() > 256
+                        || text.chars().any(char::is_control)
+                    {
+                        return Err("request record query model is invalid".to_string());
+                    }
+                    models.push(text);
+                }
+            }
             "status" => {
                 let text = value
                     .as_str()
@@ -5238,6 +5309,9 @@ fn build_request_record_query(query: &serde_json::Value) -> Result<String, Strin
             "local_access_token_id={}",
             percent_encode_query(value)
         ));
+    }
+    for value in models {
+        pairs.push(format!("model={}", percent_encode_query(value)));
     }
     if let Some(value) = status {
         pairs.push(format!("status={}", percent_encode_query(value)));
@@ -6360,6 +6434,24 @@ mod tests {
             "?service_id=service_01&local_access_token_id=token_01&local_access_token_id=token_02&status=succeeded&kind=inference"
         );
         assert_eq!(
+            build_request_session_query(&serde_json::json!({
+                "kind": "inference",
+                "models": ["claude-opus-5-5", "gpt-6.1/sol 模型"]
+            }))
+            .unwrap(),
+            "?model=claude-opus-5-5&model=gpt-6.1%2Fsol%20%E6%A8%A1%E5%9E%8B&kind=inference"
+        );
+        for models in [
+            serde_json::json!("claude-opus-5-5"),
+            serde_json::json!([""]),
+            serde_json::json!([1]),
+            serde_json::json!(["model\nname"]),
+            serde_json::json!(["m".repeat(257)]),
+            serde_json::json!(vec!["model"; 101]),
+        ] {
+            assert!(build_request_session_query(&serde_json::json!({"models": models})).is_err());
+        }
+        assert_eq!(
             build_request_session_query(&serde_json::json!({})).unwrap(),
             ""
         );
@@ -7101,6 +7193,14 @@ mod tests {
         });
         assert!(parse_privacy_dry_run_result(&serde_json::to_vec(&result).unwrap()).is_ok());
 
+        let mut own_identifier = result.clone();
+        own_identifier["suppressed_findings"][0]["kind"] = serde_json::json!("common_secret");
+        own_identifier["suppressed_findings"][0]["reason"] =
+            serde_json::json!("astrlink_identifier");
+        assert!(
+            parse_privacy_dry_run_result(&serde_json::to_vec(&own_identifier).unwrap()).is_ok()
+        );
+
         let mut unknown_reason = result.clone();
         unknown_reason["suppressed_findings"][0]["reason"] = serde_json::json!("vibes");
         assert!(
@@ -7124,6 +7224,39 @@ mod tests {
             .unwrap()
             .remove("style");
         assert!(parse_privacy_dry_run_result(&serde_json::to_vec(&legacy).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn privacy_model_variants_accept_only_known_unsupported_reasons() {
+        let unsupported = |reason: serde_json::Value| {
+            let mut variant = privacy_variant_value();
+            variant["id"] = serde_json::json!("coreml_fp16_gpu");
+            variant["recommended"] = serde_json::json!(false);
+            variant["supported"] = serde_json::json!(false);
+            variant["unsupported_reason"] = reason;
+            variant
+        };
+        for reason in ["cpu_only", "requires_macos_26"] {
+            let variants = serde_json::json!([
+                privacy_variant_value(),
+                unsupported(serde_json::json!(reason))
+            ]);
+            assert!(
+                validate_privacy_model_variants(&variants).is_ok(),
+                "{reason}"
+            );
+        }
+        for variant in [
+            unsupported(serde_json::json!("requires_macos_15")),
+            unsupported(serde_json::Value::Null),
+            {
+                let mut supported = unsupported(serde_json::json!("requires_macos_26"));
+                supported["supported"] = serde_json::json!(true);
+                supported
+            },
+        ] {
+            assert!(validate_privacy_model_variants(&serde_json::json!([variant])).is_err());
+        }
     }
 
     fn privacy_variant_value() -> serde_json::Value {
@@ -7160,8 +7293,44 @@ mod tests {
             "estimated_ram_bytes": 420_000_000,
             "error": null,
             "label_mapping": {"EMAIL": "email", "MISC": null},
-            "installed_at": null
+            "installed_at": null,
+            "preparation": null
         })
+    }
+
+    #[test]
+    fn validates_policy_model_preparation_state() {
+        let mut installation = privacy_installation_value();
+        installation["status"] = serde_json::json!("ready");
+        installation["bytes_downloaded"] = serde_json::json!(180_000_000);
+        installation["installed_at"] = serde_json::json!("2026-10-17T10:30:00Z");
+        assert!(validate_privacy_model_installation(&installation).is_ok());
+        for preparation in [
+            serde_json::json!({"state": "preparing", "fallback": "local_model"}),
+            serde_json::json!({"state": "preparing", "fallback": null}),
+            serde_json::json!({"state": "failed", "fallback": "regex"}),
+            serde_json::json!({"state": "ready", "fallback": null}),
+        ] {
+            installation["preparation"] = preparation;
+            assert!(validate_privacy_model_installation(&installation).is_ok());
+        }
+        for preparation in [
+            serde_json::json!({"state": "compiling", "fallback": null}),
+            serde_json::json!({"state": "ready", "fallback": "regex"}),
+            serde_json::json!({"state": "preparing", "fallback": "cloud"}),
+            serde_json::json!({"state": "preparing"}),
+            serde_json::json!({"state": "preparing", "fallback": null, "progress": 1}),
+            serde_json::json!("preparing"),
+        ] {
+            installation["preparation"] = preparation;
+            assert!(validate_privacy_model_installation(&installation).is_err());
+        }
+        let mut downloading = privacy_installation_value();
+        downloading["preparation"] = serde_json::json!({"state": "preparing", "fallback": null});
+        assert!(validate_privacy_model_installation(&downloading).is_err());
+        let mut missing = privacy_installation_value();
+        missing.as_object_mut().unwrap().remove("preparation");
+        assert!(validate_privacy_model_installation(&missing).is_err());
     }
 
     #[test]

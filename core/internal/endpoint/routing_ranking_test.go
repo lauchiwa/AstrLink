@@ -174,3 +174,66 @@ func TestPlanServiceReportsTheFurthestFailedCheck(t *testing.T) {
 		t.Fatalf("converted plan = %#v, %q", resolved, skip)
 	}
 }
+
+// A request that names a provider gets that provider alone, even behind
+// higher-priority ones, and learns why it cannot be used instead of moving on.
+func TestStoreResolverKeepsToTheNamedService(t *testing.T) {
+	http := func(id contract.ServiceID, models []string) contract.Service {
+		return contract.ServiceFromEndpoint(resolverEndpoint(id, contract.CapabilityModeNative, true, models))
+	}
+	disabled := http("svc_disabled", nil)
+	disabled.Enabled = false
+	resolver, err := NewStoreResolver(rankingStore{
+		services: []contract.Service{http("svc_first", nil), http("svc_second", nil), disabled, http("svc_unlisted", []string{"other"}), http("svc_limited", nil)},
+		order:    []contract.ServiceID{"svc_disabled", "svc_first", "svc_second", "svc_unlisted", "svc_limited"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver.RecordRateLimit(Resolved{
+		Service: http("svc_limited", nil), Mode: contract.CapabilityModeNative,
+		UpstreamProtocol: contract.ProtocolOpenAIResponses, UpstreamModel: "gpt-5",
+	}, time.Minute)
+	resolve := func(service contract.ServiceID) ([]Resolved, []RankedService, error) {
+		return resolver.ResolveRankedCandidates(context.Background(), ResolveRequest{
+			Protocol: contract.ProtocolOpenAIResponses, Model: "gpt-5", Streaming: true, AllCandidates: true, Service: service,
+		})
+	}
+
+	candidates, ranking, err := resolve("svc_second")
+	if err != nil || len(candidates) != 1 || candidates[0].Service.ID != "svc_second" {
+		t.Fatalf("named candidates = %#v, %v", candidates, err)
+	}
+	// Providers ranked ahead were never considered, so the record lists none.
+	if !reflect.DeepEqual(ranking, []RankedService{{ServiceID: "svc_second"}}) {
+		t.Fatalf("named ranking = %#v", ranking)
+	}
+
+	for _, test := range []struct {
+		service contract.ServiceID
+		want    PinnedServiceError
+	}{
+		{"svc_disabled", PinnedServiceError{Service: "svc_disabled", Name: "svc_disabled", Reason: contract.RoutingSkipDisabled}},
+		{"svc_unlisted", PinnedServiceError{Service: "svc_unlisted", Name: "svc_unlisted", Reason: contract.RoutingSkipModelNotListed}},
+		{"svc_missing", PinnedServiceError{Service: "svc_missing"}},
+	} {
+		candidates, ranking, err := resolve(test.service)
+		var pinned *PinnedServiceError
+		if !errors.As(err, &pinned) || *pinned != test.want || len(candidates) != 0 {
+			t.Fatalf("%s: candidates = %#v, err = %#v", test.service, candidates, err)
+		}
+		if test.want.Name != "" && (len(ranking) != 1 || ranking[0].Skip != test.want.Reason) {
+			t.Fatalf("%s: ranking = %#v", test.service, ranking)
+		}
+	}
+
+	// A cooling-down provider is reported as such; nothing else stands in.
+	_, ranking, err = resolve("svc_limited")
+	var limited *RateLimitedCandidatesError
+	if !errors.As(err, &limited) || len(limited.Limits) != 1 || limited.Limits[0].Service != "svc_limited" {
+		t.Fatalf("named rate-limited err = %#v", err)
+	}
+	if !reflect.DeepEqual(ranking, []RankedService{{ServiceID: "svc_limited", Skip: contract.RoutingSkipRateLimited}}) {
+		t.Fatalf("named rate-limited ranking = %#v", ranking)
+	}
+}

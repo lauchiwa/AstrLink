@@ -129,6 +129,16 @@ func TestCaptureAPIFingerprintIsAClosedReadOnlyProjection(t *testing.T) {
 	}
 }
 
+// Upstream dropped the identity body limit (220bdb7): ingress already bounds
+// the body, and long histories or images must not turn an official client into
+// a third-party one midway through a session. Capture follows the recognizer.
+func TestCaptureAPIFingerprintRecognizesAClaudeBodyPastTheOldLimit(t *testing.T) {
+	body := []byte(`{"metadata":{"user_id":"{}"},"messages":[{"role":"user","content":"` + strings.Repeat("x", 2<<20) + `"}]}`)
+	if _, ok := CaptureIdentityFingerprint(contract.IdentityClientClaudeCode, claudeClientHeaders("2.1.300"), body); !ok {
+		t.Fatal("a long Claude Code request lost its identity")
+	}
+}
+
 func TestCaptureAPIFingerprintRejectsAmbiguousOrUnrecognizedRequests(t *testing.T) {
 	claudeBody := []byte(`{"metadata":{"user_id":"{}"}}`)
 	for _, test := range []struct {
@@ -148,7 +158,6 @@ func TestCaptureAPIFingerprintRejectsAmbiguousOrUnrecognizedRequests(t *testing.
 		{"codex too large UA", contract.IdentityClientCodexCLI, func(h http.Header) { h.Set("User-Agent", h.Get("User-Agent")+strings.Repeat("x", 1024)) }, nil},
 		{"claude missing body signal", contract.IdentityClientClaudeCode, nil, nil},
 		{"claude invalid body", contract.IdentityClientClaudeCode, nil, []byte(`{"metadata":`)},
-		{"claude oversized body", contract.IdentityClientClaudeCode, nil, bytes.Repeat([]byte(" "), maxUserIDScan+1)},
 		{"claude missing beta", contract.IdentityClientClaudeCode, func(h http.Header) { h.Del("Anthropic-Beta") }, claudeBody},
 		{"claude oversized recognition signals", contract.IdentityClientClaudeCode, func(h http.Header) {
 			for range 4 {

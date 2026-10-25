@@ -415,7 +415,7 @@ routing_decision = openapi.dig("components", "schemas", "RequestRoutingDecision"
 raise "request records must explain the provider choice" unless request_record.dig("properties", "routing_decision", "$ref") == "#/components/schemas/RequestRoutingDecision" &&
                                                                routing_decision.fetch("required") == %w[skipped] &&
                                                                routing_decision.dig("properties", "skipped", "maxItems") == 64
-raise "RoutingSelection wire values drifted" unless openapi.dig("components", "schemas", "RoutingSelection", "enum") == %w[priority session_binding response_affinity websocket_connection failover]
+raise "RoutingSelection wire values drifted" unless openapi.dig("components", "schemas", "RoutingSelection", "enum") == %w[priority session_binding response_affinity websocket_connection failover client_pin]
 raise "RoutingSkipReason wire values drifted" unless openapi.dig("components", "schemas", "RoutingSkipReason", "enum") == %w[
   disabled not_connected risk_paused model_not_listed protocol_unsupported streaming_unsupported
   conversion_unavailable circuit_open rate_limited websocket_disabled websocket_unsupported
@@ -545,12 +545,17 @@ installation = openapi.dig("components", "schemas", "PrivacyModelInstallation")
 expected_installation_fields = %w[
   id source catalog_id catalog_source name license languages repo_id revision
   variant_id variant_name quantization adapter status bytes_downloaded bytes_total
-  estimated_ram_bytes error label_mapping installed_at
+  estimated_ram_bytes error label_mapping installed_at preparation
 ]
 raise "privacy installation shape drifted" unless installation.fetch("required") == expected_installation_fields &&
                                                    installation.fetch("properties").keys == expected_installation_fields
 catalog_source_values = installation.dig("properties", "catalog_source", "oneOf", 0, "enum")
 raise "privacy catalog provenance values drifted" unless catalog_source_values == %w[official community]
+preparation = openapi.dig("components", "schemas", "PrivacyModelPreparation")
+raise "privacy model preparation shape drifted" unless preparation.fetch("required") == %w[state fallback] &&
+                                                       preparation.fetch("properties").keys == %w[state fallback] &&
+                                                       preparation.dig("properties", "state", "enum") == %w[preparing ready failed] &&
+                                                       preparation.dig("properties", "fallback", "oneOf", 0, "enum") == %w[local_model regex]
 installation_source_values = installation.dig("properties", "source", "enum")
 raise "privacy installation source values drifted" unless installation_source_values == %w[catalog custom local]
 

@@ -38,6 +38,10 @@ const bridgeMocks = vi.hoisted(() => ({
   probeServiceProxy: vi.fn(),
   testService: vi.fn(),
   updateService: vi.fn(),
+  listTerminalApps: vi.fn(),
+  getClientConfigStatus: vi.fn(),
+  openServiceTerminal: vi.fn(),
+  pickTerminalDirectory: vi.fn(),
 }));
 
 vi.mock("./bridge", () => bridgeMocks);
@@ -309,6 +313,59 @@ describe("ServiceManager", () => {
     container.remove();
   });
 
+  it("opens a terminal for one provider from its menu once the gateway runs", async () => {
+    bridgeMocks.listTerminalApps.mockResolvedValue([
+      { id: "terminal", name: "Terminal" },
+    ]);
+    bridgeMocks.getClientConfigStatus.mockResolvedValue({
+      clients: [],
+      wsl_unchecked: [],
+      wsl_localhost: false,
+      cc_switch_wsl: { claude: null, codex: null },
+    });
+    const render = (inferenceURL: string) =>
+      root.render(
+        <ServiceManager
+          catalogError={null}
+          catalogStatus="ready"
+          inferenceURL={inferenceURL}
+          isReady
+          onDirtyChange={() => {}}
+          onRefresh={() => {}}
+          onServiceRemoved={() => {}}
+          onServiceSaved={() => {}}
+          onViewChange={() => {}}
+          protocols={[]}
+          services={[gatewayService]}
+          view={{ kind: "list" }}
+        />,
+      );
+    // Without a gateway address the terminal would have nothing to reach.
+    await act(async () => render(""));
+    await openServiceOverflow(gatewayService.name);
+    const item = [...document.querySelectorAll('[role="menuitem"]')].find(
+      (candidate) => candidate.textContent === "在终端打开…",
+    );
+    expect(item?.getAttribute("aria-disabled")).toBe("true");
+    await act(async () => {
+      document.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+      );
+    });
+    await settleClosedLayer();
+
+    await act(async () => render("http://127.0.0.1:18317"));
+    await openServiceOverflow(gatewayService.name);
+    await chooseMenuItem("在终端打开…");
+    await act(async () => {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    });
+    expect(document.querySelector('[role="dialog"]')?.textContent).toContain(
+      `在终端打开「${gatewayService.name}」`,
+    );
+    expect(bridgeMocks.listTerminalApps).toHaveBeenCalledOnce();
+  });
+
   it("shows per-provider cache and TPS, changes period and refreshes unavailable statistics", async () => {
     bridgeMocks.getUsageSummary.mockResolvedValueOnce({
       by_service: [
@@ -351,7 +408,7 @@ describe("ServiceManager", () => {
           )!,
       );
     expect(meters()).toHaveLength(2);
-    expect(meters()[0].textContent).toContain("26.0%");
+    expect(meters()[0].textContent).toContain("缓存命中率26.0%");
     expect(meters()[0].textContent).toContain("49.0 tok/s");
     expect(meters()[1].textContent).toContain("—");
     // Missing values keep their units only as invisible spacers.

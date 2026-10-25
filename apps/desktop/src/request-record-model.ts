@@ -122,7 +122,8 @@ export interface PrivacyConfidence {
 export type PrivacyIgnoreReason =
   | "kind_disabled"
   | "low_confidence"
-  | "allowlisted";
+  | "allowlisted"
+  | "astrlink_identifier";
 
 /** Matches of one kind the policy left in the request for one reason. */
 export interface PrivacyIgnored {
@@ -157,6 +158,17 @@ export type RequestEventKind =
   | "restore"
   | "completed";
 
+export type OutputKind = "reasoning" | "text" | "tool";
+
+/**
+ * What a call's response produces: the part arriving now while it streams,
+ * the last part once it ended, and the tool calls it made, in order.
+ */
+export interface OutputActivity {
+  kind: OutputKind;
+  tools: string[];
+}
+
 /** The routing-settings redirect applied to a call: client model → routed model. */
 export interface RequestModelRedirect {
   from: string;
@@ -169,7 +181,8 @@ export type RoutingSelection =
   | "session_binding"
   | "response_affinity"
   | "websocket_connection"
-  | "failover";
+  | "failover"
+  | "client_pin";
 
 /** Why routing excluded a provider before any attempt. */
 export type RoutingSkipReason =
@@ -272,6 +285,8 @@ export interface RequestRecord {
   input_protocol: string;
   requested_model: string | null;
   model_redirect?: RequestModelRedirect;
+  /** Absent before any output and on historical records. */
+  output?: OutputActivity;
   reasoning_effort?: string | null;
   streaming: boolean;
   route_id: string | null;
@@ -340,6 +355,8 @@ export interface RequestSession {
   status: SessionStatus;
   requested_model: string | null;
   model_redirect?: RequestModelRedirect;
+  /** Absent before any output and on historical records. */
+  output?: OutputActivity;
   reasoning_effort?: string | null;
   input_protocol: string;
   service_id: string | null;
@@ -360,6 +377,24 @@ export interface RequestSessionDetail extends RequestSession {
   turns: RequestRecord[];
 }
 
+/** One root model call's span. Retries stay inside it. */
+export interface RequestActivityCall {
+  session_id: string;
+  /** Original inbound client; absent on historical records. */
+  client_type?: ClientType;
+  started_at: string;
+  completed_at: string | null;
+  status: RequestStatus;
+  /** What the call produced; absent before any output and on old records. */
+  output?: OutputActivity;
+}
+
+/** Model calls that overlap a recent window, with the gateway's clock. */
+export interface RequestActivity {
+  now: string;
+  calls: RequestActivityCall[];
+}
+
 export type RequestSessionKind = "inference" | "discovery";
 
 export function isModelDiscoveryProtocol(protocol: string): boolean {
@@ -375,6 +410,8 @@ export interface RequestSessionListQuery {
   protocol?: string;
   service_id?: string;
   local_access_token_ids?: string[];
+  /** Roots asking for, redirected to, or served by any of these models. */
+  models?: string[];
   // Filters on record status, not on the aggregated session outcome, so it
   // cannot name a session-only status such as interrupted.
   status?: RequestStatus;
@@ -393,6 +430,8 @@ export interface RequestRecordListQuery {
   protocol?: string;
   service_id?: string;
   local_access_token_ids?: string[];
+  /** Roots asking for, redirected to, or served by any of these models. */
+  models?: string[];
   status?: RequestStatus;
 }
 
@@ -808,6 +847,7 @@ const privacyIgnoreReasons = new Set<PrivacyIgnoreReason>([
   "kind_disabled",
   "low_confidence",
   "allowlisted",
+  "astrlink_identifier",
 ]);
 
 function optionalPrivacyIgnored(
@@ -916,12 +956,37 @@ function optionalModelRedirect(
   return redirect ? { model_redirect: redirect } : {};
 }
 
+const outputKinds = new Set<OutputKind>(["reasoning", "text", "tool"]);
+
+function optionalOutput(
+  value: unknown,
+  path: string,
+): { output?: OutputActivity } {
+  if (value == null) return {};
+  const output = objectAt(value, path);
+  // A kind a newer Core added reads as no output instead of failing the list.
+  if (
+    typeof output.kind !== "string" ||
+    !outputKinds.has(output.kind as OutputKind)
+  ) {
+    return {};
+  }
+  if (output.tools != null && !Array.isArray(output.tools)) {
+    invalid(`${path}.tools`, "array");
+  }
+  const tools = ((output.tools as unknown[] | undefined) ?? []).filter(
+    (name): name is string => typeof name === "string" && name !== "",
+  );
+  return { output: { kind: output.kind as OutputKind, tools } };
+}
+
 const routingSelections = new Set<RoutingSelection>([
   "priority",
   "session_binding",
   "response_affinity",
   "websocket_connection",
   "failover",
+  "client_pin",
 ]);
 
 const routingSkipReasons = new Set<RoutingSkipReason>([
@@ -1074,6 +1139,7 @@ function parseRequestRecordAt(value: unknown, path: string): RequestRecord {
       `${path}.requested_model`,
     ),
     ...optionalModelRedirect(record.model_redirect, `${path}.model_redirect`),
+    ...optionalOutput(record.output, `${path}.output`),
     reasoning_effort:
       record.reasoning_effort == null
         ? null
@@ -1318,6 +1384,7 @@ function parseRequestSessionAt(value: unknown, path: string): RequestSession {
       `${path}.requested_model`,
     ),
     ...optionalModelRedirect(session.model_redirect, `${path}.model_redirect`),
+    ...optionalOutput(session.output, `${path}.output`),
     reasoning_effort:
       session.reasoning_effort == null
         ? null
@@ -1354,6 +1421,35 @@ export function parseRequestSessionPage(value: unknown): RequestSessionPage {
       parseRequestSessionAt(item, `$.items[${index}]`),
     ),
     next_cursor: nextCursor,
+  };
+}
+
+export function parseRequestActivity(value: unknown): RequestActivity {
+  const activity = objectAt(value, "$");
+  if (!Array.isArray(activity.calls)) invalid("$.calls", "array");
+  return {
+    now: stringAt(activity.now, "$.now"),
+    calls: activity.calls.map((item, index) => {
+      const path = `$.calls[${index}]`;
+      const call = objectAt(item, path);
+      if (
+        typeof call.status !== "string" ||
+        !statuses.has(call.status as RequestStatus)
+      ) {
+        invalid(`${path}.status`, "unknownStatus");
+      }
+      return {
+        session_id: stringAt(call.session_id, `${path}.session_id`),
+        ...optionalClientType(call.client_type),
+        started_at: stringAt(call.started_at, `${path}.started_at`),
+        completed_at: nullableStringAt(
+          call.completed_at,
+          `${path}.completed_at`,
+        ),
+        status: call.status as RequestStatus,
+        ...optionalOutput(call.output, `${path}.output`),
+      };
+    }),
   };
 }
 

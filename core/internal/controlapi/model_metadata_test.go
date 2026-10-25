@@ -10,12 +10,11 @@ import (
 	"github.com/QuantumNous/astrlink/core/contract"
 	"github.com/QuantumNous/astrlink/core/internal/modelmeta"
 	"github.com/QuantumNous/astrlink/core/internal/pricing"
-	"github.com/QuantumNous/astrlink/core/internal/storage/sqlite"
 )
 
 func TestModelMetadataFollowsRoutingAndPriceBindings(t *testing.T) {
 	ctx := context.Background()
-	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "metadata.db"))
+	store, err := openControlTestStore(t, ctx, filepath.Join(t.TempDir(), "metadata.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

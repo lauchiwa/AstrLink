@@ -14,11 +14,12 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  collectRelease,
   attachRelease,
+  collectRelease,
   extendRelease,
   macOSSigningMode,
   newestStable,
+  publishRelease,
   publishingRepository,
   releaseRepository,
   releaseTargets,
@@ -66,6 +67,8 @@ function stagePlatform(
   target: string,
   bytes: Buffer,
   signature: string,
+  repository = releaseRepository(),
+  mode = macOSSigningMode(),
 ) {
   const dir = path.join(input, target);
   mkdirSync(dir);
@@ -76,10 +79,8 @@ function stagePlatform(
     path.join(dir, `${target}.json`),
     JSON.stringify({
       target,
-      repository: releaseRepository(),
-      ...(target.startsWith("darwin-")
-        ? { macos_signing_mode: macOSSigningMode() }
-        : {}),
+      repository,
+      ...(target.startsWith("darwin-") ? { macos_signing_mode: mode } : {}),
       tag: "v1.0.0",
       version: "1.0.0",
       file: filename,
@@ -88,6 +89,47 @@ function stagePlatform(
     }),
   );
 }
+/** Answers the gh calls of a Release publish and keeps what it uploads. */
+function fakeGitHub(release?: object) {
+  const calls: string[][] = [];
+  const uploaded = new Map<string, number>();
+  const gh = (args: string[]) => {
+    calls.push(args);
+    const [command, action] = args;
+    if (command === "api")
+      return JSON.stringify(
+        action.endsWith("/generate-notes")
+          ? { body: "Generated notes" }
+          : [release ? [release] : []],
+      );
+    if (action === "upload")
+      for (const file of args.slice(6))
+        uploaded.set(path.basename(file), readFileSync(file).length);
+    if (action === "view")
+      return JSON.stringify({
+        assets: [...uploaded].map(([name, size]) => ({ name, size })),
+      });
+    return "";
+  };
+  const uploads = () =>
+    calls
+      .filter(([, action]) => action === "upload")
+      .map((args) => args.slice(6).map((file) => path.basename(file)));
+  return { gh, calls, uploads };
+}
+const releaseEnv = (
+  publicKey: string,
+  repository = releaseRepository(),
+  mode = macOSSigningMode(),
+) => ({
+  GITHUB_REPOSITORY: repository,
+  ASTRLINK_RELEASE_REPOSITORY: repository,
+  MACOS_SIGNING_MODE: mode,
+  GITHUB_SHA: "0123456789abcdef",
+  TAURI_UPDATER_PUBLIC_KEY: publicKey,
+});
+const manifestNotes = (output: string) =>
+  JSON.parse(readFileSync(path.join(output, "latest.json"), "utf8")).notes;
 const temporary: string[] = [];
 const directory = () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), "astrlink-update-test-"));
@@ -224,12 +266,14 @@ describe("release updates", () => {
     );
     expect(workflow).not.toContain('TAURI_BUNDLER_DMG_IGNORE_CI: "true"');
     // Bundling is split from the build so a retry does not rebuild. Both halves
-    // must still carry the generated signing policy.
-    expect(workflow).toContain(
-      "tauri build --ci --no-bundle --config src-tauri/tauri.signing.conf.json",
-    );
-    expect(workflow).toContain(
-      "tauri bundle --ci --verbose --bundles app,dmg --config src-tauri/tauri.signing.conf.json",
+    // must still carry the generated signing policy, after upstream's ONNX
+    // Runtime config. Shell line continuations are joined before matching.
+    const commands = workflow.replace(/\s*\\\n\s*/g, " ");
+    const configs =
+      "--config src-tauri/binaries/tauri.onnxruntime.conf.json --config src-tauri/tauri.signing.conf.json";
+    expect(commands).toContain(`tauri build --ci --no-bundle ${configs}`);
+    expect(commands).toContain(
+      `tauri bundle --ci --verbose --bundles app,dmg ${configs}`,
     );
     // Keep upstream's notarization step rather than replacing it, so the next
     // sync does not re-conflict on that hunk. The ad-hoc policy adapts by
@@ -767,6 +811,161 @@ describe("release updates", () => {
       expect(() =>
         attachRelease(directory(), output, "v1.0.0", "darwin-x86_64", env),
       ).toThrow("current Actions repository");
+    expect(existsSync(output)).toBe(false);
+  });
+  // Fork: upstream's two publish tests run against both repositories and both
+  // macOS signing modes. Ad-hoc releases must carry the not-notarized notice
+  // on the release page as well as in latest.json, so notes written ahead of
+  // CI get it prepended once and are written back.
+  for (const repository of ["lauchiwa/AstrLink", "Calcium-Ion/AstrLink"])
+    for (const mode of ["adhoc", "developer-id"] as const) {
+      const adhoc = mode === "adhoc";
+      // What collectRelease puts before the notes: the notice alone, as it
+      // reads with empty notes, then a blank line.
+      const noticeFor = (input: string, publicKey: string) =>
+        adhoc
+          ? `${
+              collectRelease(
+                input,
+                path.join(directory(), "notice"),
+                "v1.0.0",
+                publicKey,
+                "",
+                new Date(),
+                repository,
+                mode,
+              ).notes
+            }\n\n`
+          : "";
+      it(`adds the packages to a release written ahead of CI and keeps its notes (${repository}, ${mode})`, () => {
+        const bytes = Buffer.from("signed installer"),
+          keys = signingFixture(bytes),
+          input = directory();
+        for (const target of releaseTargets)
+          stagePlatform(input, target, bytes, keys.signature, repository, mode);
+        const withNotice = (notes: string) =>
+          noticeFor(input, keys.publicKey) + notes;
+        // Saved as a draft, or already published as a pre-release; written
+        // with or without the notice, e.g. by an earlier attempt.
+        for (const draft of [true, false])
+          for (const body of ["Written notes", withNotice("Written notes")]) {
+            const output = path.join(directory(), "release");
+            const github = fakeGitHub({
+              tag_name: "v1.0.0",
+              draft,
+              prerelease: !draft,
+              body,
+              assets: [],
+            });
+            publishRelease(
+              input,
+              output,
+              "v1.0.0",
+              releaseEnv(keys.publicKey, repository, mode),
+              github.gh,
+            );
+            // No new release and no generated notes; latest.json goes up last.
+            expect(
+              github.calls.map((args) => args.slice(0, 2).join(" ")),
+            ).toEqual([
+              `api repos/${repository}/releases`,
+              "release upload",
+              "release view",
+              "release upload",
+              "release view",
+              "release edit",
+            ]);
+            expect(github.uploads()[1]).toEqual(["latest.json"]);
+            expect(github.uploads().flat().sort()).toEqual(
+              readdirSync(output)
+                .filter((name) => name !== "release-notes.txt")
+                .sort(),
+            );
+            const edit = github.calls.at(-1)!;
+            expect(edit).toEqual(
+              expect.arrayContaining([
+                "--draft=false",
+                "--prerelease=false",
+                "--latest=true",
+              ]),
+            );
+            const notes = withNotice("Written notes");
+            expect(manifestNotes(output)).toBe(notes);
+            expect(notes.split("not notarized")).toHaveLength(adhoc ? 2 : 1);
+            if (body === notes) expect(edit).not.toContain("--notes-file");
+            else
+              expect(
+                readFileSync(edit[edit.indexOf("--notes-file") + 1], "utf8"),
+              ).toBe(notes);
+          }
+      });
+      it(`drafts a new release with generated notes and never replaces a complete one (${repository}, ${mode})`, () => {
+        const bytes = Buffer.from("signed installer"),
+          keys = signingFixture(bytes),
+          input = directory(),
+          env = releaseEnv(keys.publicKey, repository, mode);
+        for (const target of releaseTargets)
+          stagePlatform(input, target, bytes, keys.signature, repository, mode);
+        const withNotice = (notes: string) =>
+          noticeFor(input, keys.publicKey) + notes;
+
+        const fresh = fakeGitHub(),
+          output = path.join(directory(), "release");
+        publishRelease(input, output, "v1.0.0", env, fresh.gh);
+        const create = fresh.calls.find(([, action]) => action === "create")!;
+        expect(create).toContain("--draft");
+        expect(create).toEqual(expect.arrayContaining(["--repo", repository]));
+        expect(
+          readFileSync(create[create.indexOf("--notes-file") + 1], "utf8"),
+        ).toBe(withNotice("Generated notes"));
+        expect(fresh.calls.at(-1)).toContain("--notes-file");
+        expect(manifestNotes(output)).toBe(withNotice("Generated notes"));
+
+        const published = fakeGitHub({
+          tag_name: "v1.0.0",
+          draft: false,
+          prerelease: false,
+          body: "Written notes",
+          assets: [{ name: "latest.json" }],
+        });
+        const refused = path.join(directory(), "refused");
+        expect(() =>
+          publishRelease(input, refused, "v1.0.0", env, published.gh),
+        ).toThrow("Refusing to overwrite");
+        expect(published.uploads()).toEqual([]);
+        expect(existsSync(refused)).toBe(false);
+
+        // The Intel macOS package waits for the same point.
+        for (const release of [
+          { isDraft: true, assets: [{ name: "latest.json" }] },
+          { isDraft: false, assets: [] },
+        ])
+          expect(() =>
+            attachRelease(
+              input,
+              directory(),
+              "v1.0.0",
+              "darwin-x86_64",
+              env,
+              () => JSON.stringify(release),
+            ),
+          ).toThrow("not published yet");
+      });
+    }
+  it("refuses to publish outside the current Actions repository before calling GitHub", () => {
+    const github = fakeGitHub();
+    const output = path.join(directory(), "release");
+    for (const env of [
+      {},
+      {
+        GITHUB_REPOSITORY: "lauchiwa/AstrLink",
+        ASTRLINK_RELEASE_REPOSITORY: "Calcium-Ion/AstrLink",
+      },
+    ])
+      expect(() =>
+        publishRelease(directory(), output, "v1.0.0", env, github.gh),
+      ).toThrow("current Actions repository");
+    expect(github.calls).toEqual([]);
     expect(existsSync(output)).toBe(false);
   });
 });

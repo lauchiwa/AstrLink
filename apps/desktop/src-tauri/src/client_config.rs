@@ -322,6 +322,15 @@ pub async fn reveal_access_token(
         .ok_or_else(|| "access token is unavailable".to_string())
 }
 
+/// The token AstrLink last set `client` up with in `home`, whatever the
+/// config holds now.
+pub fn configured_token(home: Home, client: Client) -> Result<Option<String>, String> {
+    let _lock = host_files::lock();
+    Ok(read_records(&home)?
+        .get(client)
+        .map(|record| record.token_id.clone()))
+}
+
 /// A token's list entry: its display name and non-secret hint.
 pub async fn token_summary(
     manager: &CoreManager,

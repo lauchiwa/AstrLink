@@ -182,12 +182,17 @@ type TokenGroup struct {
 	TokenID string `json:"token_id"`
 	Amounts
 }
+type ServiceGroup struct {
+	ServiceID string `json:"service_id"`
+	Amounts
+}
 type Summary struct {
 	From time.Time `json:"from"`
 	To   time.Time `json:"to"`
 	Amounts
-	ByModel []Group      `json:"by_model"`
-	ByToken []TokenGroup `json:"by_token"`
+	ByModel   []Group        `json:"by_model"`
+	ByToken   []TokenGroup   `json:"by_token"`
+	ByService []ServiceGroup `json:"by_service"`
 }
 type Period struct {
 	ID           string     `json:"id"`

@@ -13,27 +13,40 @@ import {
   type ReactNode,
 } from "react";
 import {
+  Brain,
   ChevronDown,
   ChevronUp,
   Copy,
   SlidersHorizontal as ListFilter,
-  Menu as Ellipsis,
+  Ellipsis,
+  LoaderCircle,
   MessageSquare,
   RefreshCw,
+  SquarePen,
   SlidersHorizontal as Settings2,
   Shredder as Trash2,
   X,
 } from "@/components/icons";
 
 import { ConfirmDialog as AppConfirmDialog } from "@/components/ConfirmDialog";
+import { ToolKindIcon } from "@/components/ToolKindIcon";
 import { ClientTypeIcon, clientTypeName } from "@/components/ClientTypeIcon";
 import { DataRow } from "@/components/DataRow";
 import { EmptyState } from "@/components/EmptyState";
 import { ScrollWorkspace } from "@/components/ScrollWorkspace";
 import { FilterSelect } from "@/components/FilterSelect";
+import {
+  FilterChips,
+  FilterMenu,
+  type FilterChip,
+} from "@/components/FilterMenu";
 import { ServiceSelect } from "@/components/ServiceSelect";
 import { FormMessage } from "@/components/FormMessage";
 import { MultiFilterSelect } from "@/components/MultiFilterSelect";
+import {
+  customRangeLabel,
+  UsageRangePicker,
+} from "@/components/UsageRangePicker";
 import { HelpPopover } from "@/components/HelpPopover";
 import { IconButton } from "@/components/IconButton";
 import { ModelLabel } from "@/components/ModelLabel";
@@ -60,9 +73,14 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Separator } from "@/components/ui/separator";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { ActivitySlot } from "@/components/ui/activity-slot";
 import { cn } from "@/lib/utils";
 
 import { AuditPartSection, HTTPMetaSection } from "./AuditReviewer";
@@ -93,7 +111,7 @@ import { copyButtonLabel, useCopyFeedback } from "./copy-feedback";
 import { compactTitle } from "./file-path-spans";
 import { formatCompactNumber } from "./format-compact-number";
 import { currentLocale, i18n, useT } from "./i18n";
-import { useLiveClock } from "./live-clock";
+import { LIVE_CLOCK_INTERVAL_MS, useLiveClock } from "./live-clock";
 import { notify } from "./notify";
 import { PageHeader } from "./PageHeader";
 import {
@@ -120,6 +138,7 @@ import {
   liveDurationMs,
   sessionRuntimeMs,
   type RecordFilters,
+  type RecordsTarget,
 } from "./request-live-model";
 import {
   CLIENT_TYPES,
@@ -130,18 +149,34 @@ import {
   statusTone,
   type AuditContent,
   type ClientType,
+  type RequestActivityCall,
   type RequestRecord,
   type RequestSession,
   type RequestSessionDetail,
   type RequestSessionKind,
+  type RequestSessionListQuery,
+  type RequestStatus,
   type SessionStatus,
 } from "./request-record-model";
+import {
+  RequestActivityBoard,
+  useRequestActivityFeed,
+} from "./RequestActivityBoard";
+import {
+  conversationActivity,
+  laneAction,
+  laneTrail,
+  splitActiveSessions,
+  type LaneAction,
+  type LaneStep,
+} from "./request-activity-model";
 import { RequestConversation } from "./RequestConversation";
 import { RequestPrivacyAudit } from "./RequestPrivacyAudit";
 import { RequestTrajectory } from "./RequestTrajectory";
 import {
   applyQueuedSessions,
   groupSessionsByDate,
+  listOnlyFiltersActive,
   mergeLiveSessions,
   removeSessions,
   replaceSession,
@@ -151,7 +186,14 @@ import {
   sessionSummary,
 } from "./session-live-model";
 import { protocolEntryPath } from "./service-presets";
-import type { UsageWindow } from "./usage-range";
+import {
+  isCustomUsageRange,
+  resolveUsageWindow,
+  usageRangeKey,
+  USAGE_RANGE_PRESETS,
+  type UsageRange,
+} from "./usage-range";
+import type { ConversationContentCache } from "./use-conversation-content";
 
 const PAGE_LIMIT = 50;
 const POLL_INTERVAL_MS = 1000;
@@ -174,6 +216,28 @@ const EMPTY_FILTERS: RecordFilters = {
   clientType: "",
   localAccessTokenIds: [],
 };
+
+/** The list filters a target sets; the rest start cleared. */
+function targetFilters(target: RecordsTarget | undefined): RecordFilters {
+  return {
+    ...EMPTY_FILTERS,
+    serviceId: target?.serviceId ?? "",
+    localAccessTokenIds: target?.tokenId ? [target.tokenId] : [],
+  };
+}
+
+function sameFilters(left: RecordFilters, right: RecordFilters): boolean {
+  return (
+    left.status === right.status &&
+    left.serviceId === right.serviceId &&
+    left.protocol === right.protocol &&
+    left.clientType === right.clientType &&
+    left.localAccessTokenIds.length === right.localAccessTokenIds.length &&
+    left.localAccessTokenIds.every(
+      (id, index) => id === right.localAccessTokenIds[index],
+    )
+  );
+}
 
 type RecordsView = "monitor" | "detail";
 type RecordsKind = RequestSessionKind | "all";
@@ -307,21 +371,22 @@ export function RequestRecords({
   accessTokensReady,
   coreSessionKey,
   initialDetailTab = "conversation",
-  initialFailedWithin,
-  initialLocalAccessTokenId,
   isReady,
   services,
+  target,
 }: {
   accessTokens: AccessTokenSummary[];
   accessTokensReady: boolean;
   coreSessionKey: string | null;
   /** The reading tab a session opens on until the operator picks one. */
   initialDetailTab?: "conversation" | "trajectory";
-  /** Lists the conversations with a call that failed in this window. */
-  initialFailedWithin?: Pick<UsageWindow, "from" | "to">;
-  initialLocalAccessTokenId?: string;
   isReady: boolean;
   services: (RoutableService & RequestService)[];
+  /**
+   * The narrowing another page opened the list on. Each navigation is a new
+   * object, so opening the same target again restores what was cleared.
+   */
+  target?: RecordsTarget;
 }) {
   const t = i18n.t.bind(i18n);
   const servicesById = useMemo(
@@ -333,35 +398,50 @@ export function RequestRecords({
     [accessTokens],
   );
   const [view, setView] = useState<RecordsView>("monitor");
+  const moreFiltersTriggerRef = useRef<HTMLButtonElement>(null);
   const [kind, setKind] = useState<RecordsKind>("inference");
-  const [filters, setFilters] = useState<RecordFilters>(() => ({
-    ...EMPTY_FILTERS,
-    localAccessTokenIds: initialLocalAccessTokenId
-      ? [initialLocalAccessTokenId]
-      : [],
-  }));
-  const tokenFilter = () =>
-    filters.localAccessTokenIds.length
-      ? filters.localAccessTokenIds
-      : undefined;
-  const localAccessTokenFilterKey = filters.localAccessTokenIds.join("\u0000");
-  const [failedWithin, setFailedWithin] = useState(initialFailedWithin ?? null);
-  // Core matches the status of each call in the window, not a conversation's
-  // outcome, so a conversation that failed and then recovered still lists.
-  // That keeps every failure the tray counted for today on screen.
-  const failedQuery = failedWithin
-    ? {
-        status: "failed" as const,
-        from: failedWithin.from,
-        to: failedWithin.to,
-      }
-    : {};
-  const failedWithinKey = failedWithin
-    ? `:failed:${failedWithin.from}/${failedWithin.to}`
+  const [filters, setFilters] = useState<RecordFilters>(() =>
+    targetFilters(target),
+  );
+  const [models, setModels] = useState<string[]>(() => target?.models ?? []);
+  const [dateRange, setDateRange] = useState<UsageRange | null>(
+    () => target?.range ?? null,
+  );
+  // Core matches the status of each call, not a conversation's outcome, so a
+  // conversation that failed and then recovered still lists. That keeps every
+  // call the tray or the overview counted on screen.
+  const [callStatus, setCallStatus] = useState<RequestStatus | null>(
+    () => target?.status ?? null,
+  );
+  const callStatusLabel = callStatus
+    ? t("records.callStatus", { status: statusLabel(callStatus) })
     : "";
-  // Core applies the token filter, so each selection retains its own list.
+  // Core applies the token, model, time and call status filters, so each
+  // combination retains its own list.
+  const serverFilterKey = [
+    filters.localAccessTokenIds.join("\u0000"),
+    models.join("\u0000"),
+    dateRange === null ? "" : usageRangeKey(dateRange),
+    callStatus ?? "",
+  ].join("\u0001");
+  // A preset range moves with the clock, so every read resolves it again.
+  const sessionQuery = (cursor?: string): RequestSessionListQuery => {
+    const window =
+      dateRange === null ? null : resolveUsageWindow(dateRange, new Date());
+    return {
+      limit: PAGE_LIMIT,
+      kind: kind === "all" ? undefined : kind,
+      local_access_token_ids: filters.localAccessTokenIds.length
+        ? filters.localAccessTokenIds
+        : undefined,
+      ...(models.length ? { models } : {}),
+      ...(window ? { from: window.from, to: window.to } : {}),
+      ...(callStatus ? { status: callStatus } : {}),
+      ...(cursor === undefined ? {} : { cursor }),
+    };
+  };
   const [live, setLive] = useWorkspaceSnapshot<LiveState>(
-    `request-list:${coreSessionKey}:${kind}:${localAccessTokenFilterKey}${failedWithinKey}`,
+    `request-list:${coreSessionKey}:${kind}:${serverFilterKey}`,
     {
       items: [],
       queued: [],
@@ -371,7 +451,7 @@ export function RequestRecords({
   const [listStatus, setListStatus] = useWorkspaceSnapshot<
     "blocked" | "loading" | "ready" | "error"
   >(
-    `request-list-status:${coreSessionKey}:${kind}:${localAccessTokenFilterKey}${failedWithinKey}`,
+    `request-list-status:${coreSessionKey}:${kind}:${serverFilterKey}`,
     "blocked",
   );
   const [listError, setListError] = useState<string | null>(null);
@@ -423,6 +503,8 @@ export function RequestRecords({
   const listGenerationRef = useRef(0);
   const auditGenerationRef = useRef(0);
   const auditCacheRef = useRef<Map<string, AuditContent>>(new Map());
+  // Goes wherever the audit cache goes: both hold what was decrypted.
+  const conversationCacheRef = useRef<ConversationContentCache>(new Map());
   const pollInFlightRef = useRef(false);
   const pollFailureRef = useRef(0);
   const manualPollRef = useRef<(() => void) | null>(null);
@@ -460,6 +542,34 @@ export function RequestRecords({
         .length,
     [filters, live.queued],
   );
+  // Core pages ignore the list-only filters, so a narrowed list keeps reading
+  // earlier pages until it shows `target` matches or reaches the oldest one.
+  // Otherwise a rare status matched nothing among the loaded pages and read as
+  // no match at all. `asked` is the cursor last read: a page that failed is
+  // read again only from load earlier. A new filter or list starts over.
+  const narrowed = listOnlyFiltersActive(filters);
+  const fillKey = [
+    coreSessionKey,
+    kind,
+    serverFilterKey,
+    filters.status,
+    filters.serviceId,
+    filters.protocol,
+    filters.clientType,
+  ].join("\u0000");
+  const [fill, setFill] = useState<{
+    key: string;
+    target: number;
+    asked: string | null;
+  }>({ key: fillKey, target: PAGE_LIMIT, asked: null });
+  const fillTarget = fill.key === fillKey ? fill.target : PAGE_LIMIT;
+  const fillAsked = fill.key === fillKey ? fill.asked : null;
+  const filling =
+    narrowed &&
+    listStatus === "ready" &&
+    live.nextCursor !== null &&
+    live.nextCursor !== fillAsked &&
+    visibleItems.length < fillTarget;
   // Only rows on screen count, so a filter change never deletes sessions the
   // operator can no longer see.
   const selectableItems = useMemo(
@@ -513,7 +623,10 @@ export function RequestRecords({
   useEffect(() => {
     if (!selectedId) return;
     let cancelled = false;
+    let running = false;
     const load = async () => {
+      if (cancelled || running) return;
+      running = true;
       try {
         const detail = await getRequestSession(selectedId);
         if (cancelled) return;
@@ -535,6 +648,8 @@ export function RequestRecords({
         });
       } catch {
         /* detail view shows missing via selectedSession === null */
+      } finally {
+        running = false;
       }
     };
     const fresh = freshDetailRef.current === selectedId;
@@ -545,7 +660,9 @@ export function RequestRecords({
         cancelled = true;
       };
     }
-    const timer = window.setInterval(() => void load(), POLL_INTERVAL_MS);
+    const timer = window.setInterval(() => {
+      if (!document.hidden) void load();
+    }, POLL_INTERVAL_MS);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
@@ -581,12 +698,40 @@ export function RequestRecords({
       ...(seen.has("unknown") ? (["unknown"] as const) : []),
     ];
   }, [allRecords, filters.clientType]);
+  // Every model a loaded call named. Core narrows the list to the chosen
+  // models, so names an earlier list showed stay: choosing one model must not
+  // drop the others from the menu or move the rows below them.
+  const [calledModels, setCalledModels] = useWorkspaceSnapshot<
+    readonly string[]
+  >(`request-models:${coreSessionKey}`, []);
+  useEffect(() => {
+    setCalledModels((current) => {
+      const names = new Set(current);
+      allRecords.forEach((session) => {
+        if (session.requested_model) names.add(session.requested_model);
+        if (session.model_redirect?.to) names.add(session.model_redirect.to);
+      });
+      return names.size === current.length ? current : [...names];
+    });
+  }, [allRecords, setCalledModels]);
+  // The models providers list, plus any a loaded call named and the ones
+  // chosen, so a choice never drops out of its own list.
+  const modelOptions = useMemo(() => {
+    const names = new Set([...models, ...calledModels]);
+    services.forEach((service) =>
+      service.models.forEach((model) => names.add(model)),
+    );
+    return [...names]
+      .sort((left, right) => left.localeCompare(right))
+      .map((model) => ({ value: model, label: model }));
+  }, [calledModels, models, services]);
 
   useEffect(() => {
     const generation = generationRef.current + 1;
     generationRef.current = generation;
     auditGenerationRef.current += 1;
     auditCacheRef.current.clear();
+    conversationCacheRef.current.clear();
     pollFailureRef.current = 0;
     pollInFlightRef.current = false;
     atTopRef.current = true;
@@ -602,30 +747,20 @@ export function RequestRecords({
     setAuditContent(null);
     setAuditLoading(false);
     setAuditError(null);
-    const initialTokenIds = initialLocalAccessTokenId
-      ? [initialLocalAccessTokenId]
-      : [];
-    setFilters((current) => {
-      const sameTokenSelection =
-        current.localAccessTokenIds.length === initialTokenIds.length &&
-        current.localAccessTokenIds.every(
-          (id, index) => id === initialTokenIds[index],
-        );
-      if (
-        sameTokenSelection &&
-        current.status === EMPTY_FILTERS.status &&
-        current.serviceId === EMPTY_FILTERS.serviceId &&
-        current.protocol === EMPTY_FILTERS.protocol &&
-        current.clientType === EMPTY_FILTERS.clientType
-      ) {
-        return current;
-      }
-      return { ...EMPTY_FILTERS, localAccessTokenIds: initialTokenIds };
-    });
-    // Every tray click is a new target object, so clicking again restores the
-    // narrowing after the operator cleared it. The count covers model calls.
-    setFailedWithin(initialFailedWithin ?? null);
-    if (initialFailedWithin) setKind("inference");
+    const initialFilters = targetFilters(target);
+    setFilters((current) =>
+      sameFilters(current, initialFilters) ? current : initialFilters,
+    );
+    const initialModels = target?.models ?? [];
+    setModels((current) =>
+      current.join("\u0000") === initialModels.join("\u0000")
+        ? current
+        : initialModels,
+    );
+    setDateRange(target?.range ?? null);
+    setCallStatus(target?.status ?? null);
+    // The counts a target comes from cover model calls only.
+    if (target?.status || target?.models?.length) setKind("inference");
     setSettingsOpen(false);
     setSettings(null);
     setSettingsDraft(null);
@@ -661,7 +796,7 @@ export function RequestRecords({
         if (generationRef.current !== generation) return;
         setRawSealingError(rawSealingErrorMessage(requestError));
       });
-  }, [coreSessionKey, initialFailedWithin, initialLocalAccessTokenId, isReady]);
+  }, [coreSessionKey, isReady, target]);
 
   useEffect(() => {
     if (!accessTokensReady) return;
@@ -689,12 +824,7 @@ export function RequestRecords({
     );
     if (!isReady) return;
     pollInFlightRef.current = true;
-    void listRequestSessions({
-      limit: PAGE_LIMIT,
-      kind: kind === "all" ? undefined : kind,
-      local_access_token_ids: tokenFilter(),
-      ...failedQuery,
-    })
+    void listRequestSessions(sessionQuery())
       .then((page) => {
         if (listGenerationRef.current !== generation) return;
         // Coming back to the page usually finds the list it left. Keeping
@@ -725,13 +855,7 @@ export function RequestRecords({
     return () => {
       listGenerationRef.current += 1;
     };
-  }, [
-    coreSessionKey,
-    failedWithinKey,
-    isReady,
-    kind,
-    localAccessTokenFilterKey,
-  ]);
+  }, [coreSessionKey, isReady, kind, serverFilterKey]);
 
   useEffect(() => {
     if (!isReady) return;
@@ -745,12 +869,7 @@ export function RequestRecords({
       }
       pollInFlightRef.current = true;
       try {
-        const page = await listRequestSessions({
-          limit: PAGE_LIMIT,
-          kind: kind === "all" ? undefined : kind,
-          local_access_token_ids: tokenFilter(),
-          ...failedQuery,
-        });
+        const page = await listRequestSessions(sessionQuery());
         if (listGenerationRef.current !== generation) return;
         setLive((current) => {
           // Rows must not shift under a pointer about to check one.
@@ -820,13 +939,7 @@ export function RequestRecords({
       document.removeEventListener("visibilitychange", onVisibilityChange);
       manualPollRef.current = null;
     };
-  }, [
-    coreSessionKey,
-    failedWithinKey,
-    isReady,
-    kind,
-    localAccessTokenFilterKey,
-  ]);
+  }, [coreSessionKey, isReady, kind, serverFilterKey]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -858,6 +971,7 @@ export function RequestRecords({
     () => () => {
       auditGenerationRef.current += 1;
       auditCacheRef.current.clear();
+      conversationCacheRef.current.clear();
     },
     [],
   );
@@ -1090,6 +1204,7 @@ export function RequestRecords({
 
   const clearDecrypted = () => {
     auditCacheRef.current.clear();
+    conversationCacheRef.current.clear();
     auditGenerationRef.current += 1;
     setAuditContent(null);
     setAuditError(null);
@@ -1113,17 +1228,13 @@ export function RequestRecords({
     const generation = listGenerationRef.current;
     const cursor = live.nextCursor;
     setLoadingMore(true);
-    setError(null);
     try {
-      const page = await listRequestSessions({
-        limit: PAGE_LIMIT,
-        kind: kind === "all" ? undefined : kind,
-        local_access_token_ids: tokenFilter(),
-        ...failedQuery,
-        cursor,
-      });
+      const page = await listRequestSessions(sessionQuery(cursor));
       if (listGenerationRef.current !== generation) return;
       setLive((current) => {
+        // A first page that landed meanwhile restarted the list from a newer
+        // cursor; this page would leave a gap behind it.
+        if (current.nextCursor !== cursor) return current;
         const known = new Set(
           [...current.items, ...current.queued].map((session) => session.id),
         );
@@ -1143,6 +1254,26 @@ export function RequestRecords({
       if (listGenerationRef.current === generation) setLoadingMore(false);
     }
   };
+
+  // Reads the next page now; a narrowed list then reads on until it shows a
+  // page more of matches.
+  const loadEarlier = () => {
+    setError(null);
+    setFill({
+      key: fillKey,
+      target: visibleItems.length + PAGE_LIMIT,
+      asked: live.nextCursor,
+    });
+    void loadMore();
+  };
+
+  // Reading back on its own leaves the error banner alone, so it never hides
+  // a failure the operator has not seen yet.
+  useEffect(() => {
+    if (!filling || loadingMore) return;
+    setFill({ key: fillKey, target: fillTarget, asked: live.nextCursor });
+    void loadMore();
+  }, [filling, loadingMore, live.nextCursor]);
 
   /** Drops deleted conversations from the list without reloading its pages. */
   const dropFromList = (gone: ReadonlySet<string>) => {
@@ -1171,6 +1302,7 @@ export function RequestRecords({
       return;
     }
     auditCacheRef.current.delete(requestId);
+    conversationCacheRef.current.clear();
     setOverlayRecords((current) =>
       Object.fromEntries(
         Object.entries(current).filter(
@@ -1259,6 +1391,7 @@ export function RequestRecords({
       else setError(message);
     } finally {
       auditCacheRef.current.clear();
+      conversationCacheRef.current.clear();
       setDeleting(false);
     }
   };
@@ -1320,6 +1453,7 @@ export function RequestRecords({
     try {
       const result = await purgeRequestRecords(input);
       auditCacheRef.current.clear();
+      conversationCacheRef.current.clear();
       setPurgeOpen(false);
       notify.success(
         i18n.t("records.purged", {
@@ -1327,12 +1461,7 @@ export function RequestRecords({
           blobs: result.deleted_audit_blobs,
         }),
       );
-      const page = await listRequestSessions({
-        limit: PAGE_LIMIT,
-        kind: kind === "all" ? undefined : kind,
-        local_access_token_ids: tokenFilter(),
-        ...failedQuery,
-      });
+      const page = await listRequestSessions(sessionQuery());
       if (listGenerationRef.current !== generation) return;
       setLive({
         items: page.items,
@@ -1454,6 +1583,7 @@ export function RequestRecords({
 
   const reloadAudit = () => {
     auditCacheRef.current.clear();
+    conversationCacheRef.current.clear();
     auditGenerationRef.current += 1;
     // The detail view fetches the content again. Away from it nothing would,
     // and reopening it would paint the old raw parts before that fetch.
@@ -1579,6 +1709,88 @@ export function RequestRecords({
     }
   };
 
+  const clearFilters = () => {
+    setFilters(EMPTY_FILTERS);
+    setModels([]);
+    setDateRange(null);
+    setCallStatus(null);
+  };
+  const advancedFilterCount =
+    Number(Boolean(filters.serviceId)) +
+    Number(Boolean(filters.protocol)) +
+    filters.localAccessTokenIds.length;
+  const activeChips: FilterChip[] = [];
+  const addChip = (
+    id: string,
+    label: string,
+    value: string,
+    onRemove: () => void,
+  ) => {
+    const text = `${label}: ${value}`;
+    activeChips.push({
+      id,
+      label: text,
+      removeLabel: t("records.clearFilterNamed", { label: text }),
+      onRemove,
+    });
+  };
+  if (filters.clientType)
+    addChip(
+      "client",
+      t("records.client"),
+      clientTypeName(filters.clientType),
+      () => setFilters((current) => ({ ...current, clientType: "" })),
+    );
+  if (dateRange !== null)
+    addChip(
+      "time",
+      t("records.time"),
+      isCustomUsageRange(dateRange)
+        ? customRangeLabel(dateRange, t("usageRange.today"))
+        : t(`overview.range.${dateRange}`),
+      () => setDateRange(null),
+    );
+  if (filters.status)
+    addChip("status", t("records.status"), statusLabel(filters.status), () =>
+      setFilters((current) => ({ ...current, status: "" })),
+    );
+  if (filters.serviceId)
+    addChip(
+      "service",
+      t("records.providerFilter"),
+      serviceLabel(filters.serviceId, services) ?? filters.serviceId,
+      () => setFilters((current) => ({ ...current, serviceId: "" })),
+    );
+  if (models.length > 0)
+    addChip(
+      "models",
+      t("records.model"),
+      models.length === 1
+        ? models[0]
+        : t("records.selectedModels", { count: models.length }),
+      () => setModels([]),
+    );
+  if (filters.protocol)
+    addChip(
+      "protocol",
+      t("records.protocol"),
+      protocolEntryPath(filters.protocol),
+      () => setFilters((current) => ({ ...current, protocol: "" })),
+    );
+  if (filters.localAccessTokenIds.length > 0)
+    addChip(
+      "tokens",
+      t("records.accessToken"),
+      filters.localAccessTokenIds.length === 1
+        ? (accessTokenOptions.find(
+            (option) => option.value === filters.localAccessTokenIds[0],
+          )?.label ?? t("records.selectedTokens", { count: 1 }))
+        : t("records.selectedTokens", {
+            count: filters.localAccessTokenIds.length,
+          }),
+      () => setFilters((current) => ({ ...current, localAccessTokenIds: [] })),
+    );
+
   return (
     <>
       <div className="flex h-full min-h-0 min-w-0 flex-1">
@@ -1590,9 +1802,11 @@ export function RequestRecords({
           onValueChange={(value) => {
             setKind(value as RecordsKind);
             setFilters((current) => ({ ...current, protocol: "" }));
-            // The tray counts model calls only. Kept on another list, the
-            // narrowing would add failed model discovery it never counted.
-            if (value !== "inference") setFailedWithin(null);
+            // The counts cover model calls only. Kept on another list, the
+            // narrowing would add model discovery they never counted.
+            if (value !== "inference") setCallStatus(null);
+            // Model discovery names no model, so a model filter empties it.
+            if (value === "discovery") setModels([]);
             setCheckedIds(new Set());
             setError(null);
           }}
@@ -1767,23 +1981,64 @@ export function RequestRecords({
                     }
                   />
                 ) : null}
-                <TabsList
-                  aria-label={t("records.kind")}
-                  className="w-full shrink-0 justify-start border-b"
-                  variant="line"
-                >
-                  <TabsTrigger className="flex-none" value="inference">
-                    <MessageSquare aria-hidden="true" />
-                    {t("records.inference")}
-                  </TabsTrigger>
-                  <TabsTrigger className="flex-none" value="discovery">
-                    <ListFilter aria-hidden="true" />
-                    {t("records.discovery")}
-                  </TabsTrigger>
-                  <TabsTrigger className="flex-none" value="all">
-                    {t("common.all")}
-                  </TabsTrigger>
-                </TabsList>
+                <div className="py-3 [@media(max-height:680px)]:py-2">
+                  <RequestActivityBoard
+                    coreSessionKey={coreSessionKey}
+                    isReady={isReady}
+                    onShowFailures={() =>
+                      setFilters((current) => ({
+                        ...current,
+                        status: "failed",
+                      }))
+                    }
+                  />
+                </div>
+                {/* The list's own actions share the tab line, so the filters
+                    below keep a full row of equal columns. */}
+                <div className="flex min-w-0 shrink-0 items-center gap-2 border-b">
+                  <TabsList
+                    aria-label={t("records.kind")}
+                    className="min-w-0 flex-1 justify-start"
+                    variant="line"
+                  >
+                    <TabsTrigger className="flex-none" value="inference">
+                      <MessageSquare aria-hidden="true" />
+                      {t("records.inference")}
+                    </TabsTrigger>
+                    <TabsTrigger className="flex-none" value="discovery">
+                      <ListFilter aria-hidden="true" />
+                      {t("records.discovery")}
+                    </TabsTrigger>
+                    <TabsTrigger className="flex-none" value="all">
+                      {t("common.all")}
+                    </TabsTrigger>
+                  </TabsList>
+                  {callStatus ? (
+                    // Set from a count elsewhere, so it reads as a filter in
+                    // force rather than one more control to pick from.
+                    <Button
+                      aria-label={t("records.clearFilterNamed", {
+                        label: callStatusLabel,
+                      })}
+                      onClick={() => setCallStatus(null)}
+                      size="sm"
+                      type="button"
+                      variant="secondary"
+                    >
+                      {callStatusLabel}
+                      <X aria-hidden="true" />
+                    </Button>
+                  ) : null}
+                  <IconButton
+                    variant="outline"
+                    disabled={!isReady || listStatus === "loading"}
+                    label={t("common.refresh")}
+                    onClick={() => manualPollRef.current?.()}
+                    type="button"
+                  >
+                    <RefreshCw aria-hidden="true" />
+                  </IconButton>
+                </div>
                 {error ? (
                   <FormMessage className="mt-2.5 shrink-0" tone="error">
                     {error}
@@ -1798,14 +2053,14 @@ export function RequestRecords({
                     {syncWarning}
                   </FormMessage>
                 ) : null}
-                <div className="flex w-full min-w-0 flex-wrap items-center gap-2 border-b bg-background py-2">
-                  <div className="grid min-w-0 flex-1 basis-72 grid-cols-3 gap-2 @[680px]:max-w-4xl @[680px]:grid-cols-[minmax(0,1.2fr)_auto_repeat(4,minmax(0,1fr))]">
-                    {/* The client scopes the list, so it leads and stands apart from the attribute filters. */}
+                <div className="w-full min-w-0 border-b bg-background py-2">
+                  <div className="grid min-w-0 grid-cols-6 gap-2 @[640px]:grid-cols-[minmax(0,1.2fr)_minmax(0,1.2fr)_minmax(0,1fr)_minmax(0,1fr)_auto]">
+                    {/* Keep the common scopes available while secondary filters live in the menu. */}
                     <FilterSelect
                       ariaLabel={t("records.filter", {
                         label: t("records.client"),
                       })}
-                      className="w-full"
+                      className="col-span-3 w-full @[640px]:col-span-1"
                       label={t("records.client")}
                       onChange={(clientType) =>
                         setFilters((current) => ({
@@ -1835,15 +2090,41 @@ export function RequestRecords({
                       value={filters.clientType}
                       variant="filled"
                     />
-                    <Separator
-                      className="mx-1 hidden self-center data-[orientation=vertical]:h-5 @[680px]:block"
-                      orientation="vertical"
+                    <MultiFilterSelect
+                      allLabel={t("common.all")}
+                      ariaLabel={t("records.filter", {
+                        label: t("records.model"),
+                      })}
+                      className="col-span-3 w-full @[640px]:col-span-1"
+                      clearLabel={t("records.clearModelFilter")}
+                      disabled={!isReady || kind === "discovery"}
+                      emptyMessage={t("records.noModelResults")}
+                      label={t("records.model")}
+                      onChange={setModels}
+                      options={modelOptions}
+                      searchPlaceholder={t("records.searchModels")}
+                      selectedCountLabel={(count) =>
+                        t("records.selectedModels", { count })
+                      }
+                      value={models}
+                    />
+                    <UsageRangePicker
+                      align="start"
+                      ariaLabel={t("records.filter", {
+                        label: t("records.time"),
+                      })}
+                      allLabel={t("common.all")}
+                      className="col-span-2 w-full @[640px]:col-span-1"
+                      label={t("records.time")}
+                      onChange={(next) => setDateRange(next)}
+                      presets={USAGE_RANGE_PRESETS}
+                      value={dateRange}
                     />
                     <FilterSelect
                       ariaLabel={t("records.filter", {
                         label: t("records.status"),
                       })}
-                      className="w-full"
+                      className="col-span-2 w-full @[640px]:col-span-1"
                       label={t("records.status")}
                       onChange={(status) =>
                         setFilters((current) => ({
@@ -1860,86 +2141,152 @@ export function RequestRecords({
                       ]}
                       value={filters.status}
                     />
-                    <ServiceSelect
-                      ariaLabel={t("records.filter", {
-                        label: t("records.providerFilter"),
-                      })}
-                      className="w-full"
-                      label={t("records.providerFilter")}
-                      onChange={(serviceId) =>
-                        setFilters((current) => ({ ...current, serviceId }))
-                      }
-                      allLabel={t("common.all")}
-                      services={services}
-                      value={filters.serviceId}
-                    />
-                    <FilterSelect
-                      ariaLabel={t("records.filter", {
-                        label: t("records.protocol"),
-                      })}
-                      className="w-full"
-                      label={t("records.protocol")}
-                      onChange={(protocol) =>
-                        setFilters((current) => ({ ...current, protocol }))
-                      }
-                      options={[
-                        { label: t("common.all"), value: "" },
-                        ...protocolOptions.map((protocol) => ({
-                          label: protocolEntryPath(protocol),
-                          value: protocol,
-                        })),
-                      ]}
-                      value={filters.protocol}
-                    />
-                    <MultiFilterSelect
-                      allLabel={t("common.all")}
-                      ariaLabel={t("records.filter", {
-                        label: t("records.accessToken"),
-                      })}
-                      className="w-full"
-                      clearLabel={t("records.clearTokenFilter")}
-                      disabled={!isReady || !accessTokensReady}
-                      emptyMessage={t("records.noAccessTokenResults")}
-                      label={t("records.accessToken")}
-                      onChange={(localAccessTokenIds) =>
-                        setFilters((current) => ({
-                          ...current,
-                          localAccessTokenIds,
-                        }))
-                      }
-                      options={accessTokenOptions}
-                      searchPlaceholder={t("records.searchAccessTokens")}
-                      selectAllLabel={t("records.selectAllTokens")}
-                      selectedCountLabel={(count) =>
-                        t("records.selectedTokens", { count })
-                      }
-                      value={filters.localAccessTokenIds}
-                    />
+                    <Popover>
+                      <PopoverTrigger asChild>
+                        <Button
+                          aria-label={t("records.moreFilters")}
+                          className="col-span-2 min-w-0 @[640px]:col-span-1"
+                          ref={moreFiltersTriggerRef}
+                          size="sm"
+                          type="button"
+                          variant={
+                            advancedFilterCount > 0 ? "secondary" : "outline"
+                          }
+                        >
+                          <ListFilter aria-hidden="true" />
+                          {t("records.moreFilters")}
+                          {advancedFilterCount > 0 ? (
+                            <Badge
+                              variant="secondary"
+                              className="px-1 text-micro tabular-nums"
+                            >
+                              {advancedFilterCount}
+                            </Badge>
+                          ) : null}
+                        </Button>
+                      </PopoverTrigger>
+                      <PopoverContent
+                        align="end"
+                        aria-label={t("records.moreFilters")}
+                        className="w-80 p-0"
+                      >
+                        <FilterMenu
+                          activeCount={advancedFilterCount}
+                          clearLabel={t("records.clearFilters")}
+                          onClear={() => {
+                            setFilters((current) => ({
+                              ...current,
+                              serviceId: "",
+                              protocol: "",
+                              localAccessTokenIds: [],
+                            }));
+                          }}
+                          selectedCountLabel={(count) =>
+                            t("records.filterCount", { count })
+                          }
+                          title={t("records.moreFilters")}
+                          groups={[
+                            {
+                              id: "service",
+                              label: t("records.providerFilter"),
+                              count: Number(Boolean(filters.serviceId)),
+                              content: (
+                                <ServiceSelect
+                                  ariaLabel={t("records.filter", {
+                                    label: t("records.providerFilter"),
+                                  })}
+                                  className="w-full"
+                                  label=""
+                                  onChange={(serviceId) =>
+                                    setFilters((current) => ({
+                                      ...current,
+                                      serviceId,
+                                    }))
+                                  }
+                                  allLabel={t("common.all")}
+                                  services={services}
+                                  value={filters.serviceId}
+                                />
+                              ),
+                            },
+                            {
+                              id: "protocol",
+                              label: t("records.protocol"),
+                              count: Number(Boolean(filters.protocol)),
+                              content: (
+                                <FilterSelect
+                                  ariaLabel={t("records.filter", {
+                                    label: t("records.protocol"),
+                                  })}
+                                  className="w-full"
+                                  label=""
+                                  onChange={(protocol) =>
+                                    setFilters((current) => ({
+                                      ...current,
+                                      protocol,
+                                    }))
+                                  }
+                                  options={[
+                                    { label: t("common.all"), value: "" },
+                                    ...protocolOptions.map((protocol) => ({
+                                      label: protocolEntryPath(protocol),
+                                      value: protocol,
+                                    })),
+                                  ]}
+                                  value={filters.protocol}
+                                />
+                              ),
+                            },
+                            {
+                              id: "tokens",
+                              label: t("records.accessToken"),
+                              count: filters.localAccessTokenIds.length,
+                              content: (
+                                <MultiFilterSelect
+                                  allLabel={t("common.all")}
+                                  ariaLabel={t("records.filter", {
+                                    label: t("records.accessToken"),
+                                  })}
+                                  className="w-full"
+                                  clearLabel={t("records.clearTokenFilter")}
+                                  disabled={!isReady || !accessTokensReady}
+                                  emptyMessage={t(
+                                    "records.noAccessTokenResults",
+                                  )}
+                                  label=""
+                                  onChange={(localAccessTokenIds) =>
+                                    setFilters((current) => ({
+                                      ...current,
+                                      localAccessTokenIds,
+                                    }))
+                                  }
+                                  options={accessTokenOptions}
+                                  searchPlaceholder={t(
+                                    "records.searchAccessTokens",
+                                  )}
+                                  selectAllLabel={t("records.selectAllTokens")}
+                                  selectedCountLabel={(count) =>
+                                    t("records.selectedTokens", { count })
+                                  }
+                                  value={filters.localAccessTokenIds}
+                                />
+                              ),
+                            },
+                          ]}
+                        />
+                      </PopoverContent>
+                    </Popover>
                   </div>
-                  {failedWithin ? (
-                    <Button
-                      aria-label={t("records.clearFilterNamed", {
-                        label: t("records.failedToday"),
-                      })}
-                      onClick={() => setFailedWithin(null)}
-                      size="xs"
-                      type="button"
-                      variant="outline"
-                    >
-                      {t("records.failedToday")}
-                      <X aria-hidden="true" />
-                    </Button>
-                  ) : null}
-                  <IconButton
-                    className="ml-auto"
-                    variant="outline"
-                    disabled={!isReady || listStatus === "loading"}
-                    label={t("common.refresh")}
-                    onClick={() => manualPollRef.current?.()}
-                    type="button"
-                  >
-                    <RefreshCw aria-hidden="true" />
-                  </IconButton>
+                  <FilterChips
+                    chips={activeChips}
+                    clearLabel={t("records.clearFilters")}
+                    fallbackFocusRef={moreFiltersTriggerRef}
+                    label={t("records.activeFilters")}
+                    onClear={clearFilters}
+                    overflowLabel={(count) =>
+                      t("records.moreActiveFilters", { count })
+                    }
+                  />
                 </div>
               </>
             }
@@ -1981,7 +2328,9 @@ export function RequestRecords({
                   title={t("records.readFailedTitle")}
                   description={listError}
                 />
-              ) : listStatus === "loading" && live.items.length === 0 ? (
+              ) : (listStatus === "loading" && live.items.length === 0) ||
+                // A narrowed list is not empty until earlier pages are read.
+                (visibleItems.length === 0 && (filling || loadingMore)) ? (
                 <RecordSkeleton />
               ) : visibleItems.length === 0 ? (
                 <EmptyState
@@ -1994,19 +2343,11 @@ export function RequestRecords({
                         : "records.empty",
                   )}
                   action={
-                    failedWithin ||
-                    filters.status ||
-                    filters.serviceId ||
-                    filters.protocol ||
-                    filters.clientType ||
-                    filters.localAccessTokenIds.length ? (
+                    callStatus && activeChips.length === 0 ? (
                       <Button
                         variant="outline"
                         size="sm"
-                        onClick={() => {
-                          setFilters(EMPTY_FILTERS);
-                          setFailedWithin(null);
-                        }}
+                        onClick={clearFilters}
                       >
                         {" "}
                         {t("records.clearFilters")}
@@ -2017,6 +2358,7 @@ export function RequestRecords({
               ) : (
                 <SessionStream
                   checkedIds={selecting ? checkedIds : null}
+                  coreSessionKey={coreSessionKey}
                   onOpen={selecting ? toggleChecked : openDetail}
                   selectedId={openingId ?? selectedId}
                   services={servicesById}
@@ -2029,7 +2371,7 @@ export function RequestRecords({
                   className="mx-auto my-3 flex"
                   variant="outline"
                   disabled={loadingMore}
-                  onClick={() => void loadMore()}
+                  onClick={loadEarlier}
                   type="button"
                 >
                   {loadingMore ? t("common.loading") : t("records.loadEarlier")}
@@ -2045,6 +2387,7 @@ export function RequestRecords({
             auditError={auditError}
             auditLoading={auditLoading}
             auditSettings={settings}
+            conversationCache={conversationCacheRef.current}
             deleting={deleting}
             initialTab={initialDetailTab}
             newerAvailable={
@@ -2253,13 +2596,17 @@ function useStatusColumnWidth() {
   return { ref, width };
 }
 
+const NO_CALLS: readonly RequestActivityCall[] = [];
+
 function SessionStream({
+  coreSessionKey,
   sessions,
   services,
   selectedId,
   checkedIds,
   onOpen,
 }: {
+  coreSessionKey: string | null;
   sessions: RequestSession[];
   services: RequestServiceMap;
   selectedId: string | null;
@@ -2268,9 +2615,16 @@ function SessionStream({
   onOpen: (sessionId: string) => void;
 }) {
   const t = i18n.t.bind(i18n);
+  // The live board's read of the last few minutes tells each lane its steps.
+  const recentCalls = useRequestActivityFeed(coreSessionKey)?.calls ?? NO_CALLS;
+  // Conversations in progress lead the list. One waiting between calls moves
+  // down into its day once its wait runs out, so the list re-reads the clock
+  // every second while any is in progress, even if no poll brings news.
+  const { active, rest } = splitActiveSessions(sessions, Date.now());
+  useLiveClock(active.length > 0, 1000);
   // Only the date buckets need "now", and those turn over once a day.
-  const groups = groupSessionsByDate(sessions);
-  let remaining = useProgressiveRowCount(sessions.length);
+  const groups = groupSessionsByDate(rest);
+  let remaining = useProgressiveRowCount(sessions.length) - active.length;
   const statusColumn = useStatusColumnWidth();
   return (
     <div
@@ -2300,6 +2654,31 @@ function SessionStream({
           </StatusBadge>
         ))}
       </span>
+      {active.length > 0 ? (
+        <section
+          className="mt-3 first:mt-0"
+          data-testid="active-sessions"
+          key="active"
+        >
+          <div className="flex items-center gap-2 px-3 pt-4 pb-2 text-xs font-medium text-muted-foreground">
+            <span>{t("records.activityInProgress")}</span>
+            <Badge className="font-normal tabular-nums" variant="secondary">
+              {t("records.countItems", { count: active.length })}
+            </Badge>
+          </div>
+          {active.map((session) => (
+            <SessionLane
+              checked={checkedIds?.has(session.id)}
+              key={session.id}
+              onOpen={onOpen}
+              recentCalls={recentCalls}
+              selected={session.id === selectedId}
+              services={services}
+              session={session}
+            />
+          ))}
+        </section>
+      ) : null}
       {groups.map((group) => {
         const rows = group.sessions.slice(0, remaining);
         remaining -= rows.length;
@@ -2564,8 +2943,9 @@ const SessionRow = memo(function SessionRow({
             {formatTime(session.last_started_at)}
           </time>
         </span>
+        {/* Capped by the list width, not a fixed size: a redirect shows two names. */}
         <ModelLabel
-          className="col-span-2 col-start-3 row-start-2 text-xs text-text-secondary @[560px]/request-list:col-span-1 @[560px]/request-list:col-start-4 @[560px]/request-list:row-start-1 @[560px]/request-list:max-w-60 @[560px]/request-list:justify-end"
+          className="col-span-2 col-start-3 row-start-2 text-xs text-text-secondary @[560px]/request-list:col-span-1 @[560px]/request-list:col-start-4 @[560px]/request-list:row-start-1 @[560px]/request-list:max-w-[50cqw] @[560px]/request-list:justify-end"
           fallback={t("records.unspecifiedModel")}
           model={session.requested_model}
           reasoningEffort={session.reasoning_effort}
@@ -2575,6 +2955,371 @@ const SessionRow = memo(function SessionRow({
     </DataRow>
   );
 });
+
+/**
+ * A conversation in progress, drawn like a worker on a job board: the model
+ * serving it on the left and the conversation in its slot. The slot sweeps
+ * while a call runs; between calls it shows how long the conversation has
+ * waited and how its last call ended.
+ */
+const SessionLane = memo(function SessionLane({
+  session,
+  services,
+  selected,
+  checked,
+  onOpen,
+  recentCalls,
+}: {
+  session: RequestSession;
+  services: RequestServiceMap;
+  selected: boolean;
+  /** Set in selection mode, where the lane is a checkbox. */
+  checked: boolean | undefined;
+  onOpen: (sessionId: string) => void;
+  /** Every conversation's calls of the last few minutes. */
+  recentCalls: readonly RequestActivityCall[];
+}) {
+  const t = useT();
+  const trail = useMemo(
+    () => laneTrail(recentCalls, session),
+    [recentCalls, session],
+  );
+  const calling = sessionRunning(session);
+  // A running call shows tenths of a second; a wait counts whole seconds.
+  const nowMs = useLiveClock(true, calling ? LIVE_CLOCK_INTERVAL_MS : 1000);
+  const since = conversationActivity(session, nowMs)?.since ?? nowMs;
+  const calls = Math.max(1, session.active_request_starts.length);
+  const service = requestServiceIdentity(session, services);
+  const behavior = rowBehavior(session, checked, selected, onOpen, t);
+  const title = compactTitle(session.title) || t("records.untitledSession");
+  const selecting = checked !== undefined;
+  const outcome =
+    !calling && session.status !== "succeeded" ? session.status : null;
+  return (
+    <DataRow
+      asChild
+      className={cn(
+        "grid items-center gap-x-3 gap-y-2 px-3 py-2.5",
+        selecting
+          ? "grid-cols-[1.25rem_minmax(0,1fr)] @[560px]/request-list:grid-cols-[1.25rem_minmax(0,11rem)_minmax(0,1fr)]"
+          : "grid-cols-1 @[560px]/request-list:grid-cols-[minmax(0,11rem)_minmax(0,1fr)]",
+      )}
+    >
+      <Button
+        {...behavior.props}
+        className="h-auto w-full rounded-none bg-transparent text-left font-normal whitespace-normal text-foreground hover:bg-muted/60 focus-visible:bg-accent focus-visible:ring-inset aria-checked:bg-accent aria-[current=true]:bg-accent"
+        data-activity={calling ? "calling" : "idle"}
+        data-session-id={session.id}
+        data-testid="request-session-row"
+        type="button"
+        variant="ghost"
+      >
+        {selecting ? (
+          <CheckboxMark
+            checked={checked}
+            className="row-span-2 justify-self-center @[560px]/request-list:row-span-1"
+            disabled={behavior.locked}
+          />
+        ) : null}
+        <span className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-0.5 @[560px]/request-list:flex-col @[560px]/request-list:items-start">
+          <ModelLabel
+            className="text-xs font-medium text-text-secondary"
+            fallback={t("records.unspecifiedModel")}
+            model={session.requested_model}
+            reasoningEffort={session.reasoning_effort}
+            redirectDisplay="target"
+            redirectedTo={session.model_redirect?.to}
+          />
+          <RequestServiceLabel
+            className="max-w-full text-micro text-muted-foreground"
+            label={
+              session.call_count > 1 ? t("records.latestProvider") : undefined
+            }
+            labelClassName="sr-only"
+            service={service}
+          />
+        </span>
+        <ActivitySlot
+          className="grid grid-cols-[1.25rem_minmax(0,1fr)_auto] items-center gap-x-2 gap-y-0.5 px-2.5 py-1.5"
+          state={calling ? "running" : "idle"}
+        >
+          <ClientTypeIcon clientType={session.client_type} />
+          <span className="flex min-w-0 items-center gap-2">
+            <strong
+              className="min-w-0 truncate text-sm font-medium"
+              title={session.title || title}
+            >
+              {title}
+            </strong>
+            {session.privacy_warned ? (
+              <StatusBadge
+                className="shrink-0"
+                data-testid="privacy-warned-marker"
+                title={t("records.privacyWarnedHint")}
+                tone="pending"
+              >
+                {t("records.privacyWarned")}
+              </StatusBadge>
+            ) : null}
+          </span>
+          {calling || !outcome ? (
+            <LaneActionLabel
+              action={laneAction(session)}
+              calls={calls}
+              elapsedMs={nowMs - since}
+            />
+          ) : (
+            <span
+              className="inline-flex items-center gap-1.5 justify-self-end text-xs whitespace-nowrap tabular-nums text-muted-foreground"
+              data-testid="lane-state"
+              title={t("records.laneIdleHint")}
+            >
+              <StatusBadge
+                tone={outcome === "cancelled" ? "neutral" : statusTone(outcome)}
+              >
+                {statusLabel(outcome)}
+              </StatusBadge>
+              {t("records.laneIdle", {
+                duration: formatWait(nowMs - since),
+              })}
+            </span>
+          )}
+          <span className="col-span-2 col-start-2 flex min-w-0 items-center justify-between gap-3 text-xs leading-5 text-muted-foreground">
+            <LaneTrail firstCall={session.call_count === 1} steps={trail} />
+            <span className="min-w-0 truncate tabular-nums">
+              {t(
+                session.turn_count === session.call_count
+                  ? "records.sessionMetaTurns"
+                  : "records.sessionMeta",
+                {
+                  count: session.turn_count,
+                  turns: session.turn_count,
+                  calls: session.call_count,
+                  duration: formatDuration(sessionRuntimeMs(session, nowMs)),
+                },
+              )}
+              {session.output_tokens_per_second != null ? (
+                <span title={t("records.outputSpeed")}>
+                  {` · ${session.output_tokens_per_second.toFixed(1)} tok/s`}
+                </span>
+              ) : null}
+            </span>
+          </span>
+        </ActivitySlot>
+      </Button>
+    </DataRow>
+  );
+});
+
+/**
+ * The steps before a lane's current action, one mark each, oldest first.
+ * Names and how long the tools ran are on hover and for screen readers.
+ */
+function LaneTrail({
+  firstCall,
+  steps,
+}: {
+  firstCall: boolean;
+  steps: readonly LaneStep[];
+}) {
+  const t = useT();
+  if (steps.length === 0) {
+    return firstCall ? (
+      <span className="shrink-0">{t("records.laneFirstCall")}</span>
+    ) : (
+      <span />
+    );
+  }
+  return (
+    <span
+      className="flex min-w-0 shrink-0 items-center gap-1.5"
+      data-testid="lane-trail"
+    >
+      {steps.map((step, index) => {
+        const name =
+          step.kind === "tool"
+            ? step.tool
+            : t(
+                step.kind === "reasoning"
+                  ? "records.laneStepThinking"
+                  : "records.laneStepAnswer",
+              );
+        const counted = step.count > 1 ? `${name} ×${step.count}` : name;
+        const label =
+          step.ranMs === null
+            ? counted
+            : t("records.laneStepRan", {
+                step: counted,
+                duration: formatDuration(step.ranMs),
+              });
+        return (
+          <span className="inline-flex items-center gap-1.5" key={index}>
+            {index > 0 ? (
+              <span aria-hidden className="size-1 rounded-full bg-border" />
+            ) : null}
+            <span
+              className="inline-flex items-center gap-0.5 text-text-secondary"
+              title={label}
+            >
+              {step.kind === "tool" ? (
+                <ToolKindIcon className="size-3.5" name={step.tool} />
+              ) : step.kind === "reasoning" ? (
+                <Brain
+                  animateOnHover={false}
+                  aria-hidden="true"
+                  className="size-3.5"
+                />
+              ) : (
+                <MessageSquare
+                  animateOnHover={false}
+                  aria-hidden="true"
+                  className="size-3.5"
+                />
+              )}
+              <span className="sr-only">{label}</span>
+              {step.count > 1 ? (
+                <span
+                  aria-hidden="true"
+                  className="text-micro tabular-nums text-muted-foreground"
+                >
+                  ×{step.count}
+                </span>
+              ) : null}
+            </span>
+          </span>
+        );
+      })}
+    </span>
+  );
+}
+
+/** A wait between calls in whole seconds, as minutes once tools run longer. */
+function formatWait(elapsedMs: number): string {
+  const waited = Math.max(0, elapsedMs);
+  return waited < 60_000
+    ? `${Math.floor(waited / 1000)} s`
+    : formatDuration(waited);
+}
+
+/**
+ * What a lane says its conversation is doing and for how long: a running
+ * call counts tenths of a second, a wait between calls whole seconds.
+ */
+function LaneActionLabel({
+  action,
+  calls,
+  elapsedMs,
+}: {
+  action: LaneAction;
+  calls: number;
+  elapsedMs: number;
+}) {
+  const t = useT();
+  const running =
+    action.kind === "waiting" ||
+    action.kind === "thinking" ||
+    action.kind === "writing" ||
+    action.kind === "calling";
+  const duration = running
+    ? formatDuration(Math.max(0, elapsedMs))
+    : formatWait(elapsedMs);
+  const iconClass = "size-3.5 shrink-0";
+  let icon: ReactNode = null;
+  let label: string;
+  let hint: string | undefined;
+  switch (action.kind) {
+    case "waiting":
+      icon = (
+        <LoaderCircle
+          animateOnHover={false}
+          aria-hidden="true"
+          className={cn(iconClass, "motion-safe:animate-spin")}
+        />
+      );
+      label = t("records.laneWaiting", { duration });
+      break;
+    case "thinking":
+      icon = (
+        <Brain
+          animateOnHover={false}
+          aria-hidden="true"
+          className={iconClass}
+        />
+      );
+      label = t("records.laneThinking", { duration });
+      break;
+    case "writing":
+      icon = (
+        <SquarePen
+          animateOnHover={false}
+          aria-hidden="true"
+          className={iconClass}
+        />
+      );
+      label = t("records.laneWriting", { duration });
+      break;
+    case "calling":
+      icon = <ToolKindIcon className={iconClass} name={action.tool} />;
+      label = action.tool
+        ? t("records.laneCallingTool", { tool: action.tool, duration })
+        : t("records.laneCallingAnyTool", { duration });
+      break;
+    case "running": {
+      // The conversation view joins tool names the same way.
+      const shown = action.tools.slice(0, 2);
+      const names = shown.join(" · ");
+      icon = <ToolKindIcon className={iconClass} name={action.tools[0]} />;
+      label = t("records.laneRunningTools", {
+        tools:
+          action.tools.length > shown.length
+            ? `${names} +${action.tools.length - shown.length}`
+            : names,
+        duration,
+      });
+      hint = t("records.laneRunningToolsHint");
+      break;
+    }
+    case "replied":
+      icon = (
+        <MessageSquare
+          animateOnHover={false}
+          aria-hidden="true"
+          className={iconClass}
+        />
+      );
+      label = t("records.laneReplied", { duration });
+      hint = t("records.laneRepliedHint");
+      break;
+    case "idle":
+      label = t("records.laneIdle", { duration });
+      hint = t("records.laneIdleHint");
+      break;
+  }
+  if (running && calls > 1) {
+    label = t("records.laneCallingMany", { count: calls, duration });
+  }
+  return (
+    <span
+      className={cn(
+        "inline-flex min-w-0 items-center gap-1.5 justify-self-end text-xs whitespace-nowrap tabular-nums",
+        running ? "font-medium text-primary" : "text-muted-foreground",
+      )}
+      data-action={action.kind}
+      data-testid="lane-state"
+      title={hint}
+    >
+      {icon}
+      <span
+        className={cn(
+          "min-w-0 truncate",
+          running && "shimmer motion-reduce:shimmer-none",
+        )}
+      >
+        {label}
+      </span>
+    </span>
+  );
+}
 
 function RecordDetail({
   serviceNames,
@@ -2587,6 +3332,7 @@ function RecordDetail({
   auditLoading,
   auditError,
   auditSettings,
+  conversationCache,
   deleting,
   rawSealing,
   initialTab,
@@ -2612,6 +3358,7 @@ function RecordDetail({
   auditLoading: boolean;
   auditError: string | null;
   auditSettings: AuditSettings | null;
+  conversationCache: ConversationContentCache;
   deleting: boolean;
   rawSealing: RawSealingState | null;
   initialTab: "conversation" | "trajectory";
@@ -2810,20 +3557,22 @@ function RecordDetail({
         }
         titleId="request-detail-heading"
         titlePrefix={<ClientTypeIcon clientType={record.client_type} />}
+        overline={
+          <StatusBadge
+            className="shrink-0"
+            data-testid="record-status"
+            tone={statusTone(session.status)}
+          >
+            {statusLabel(session.status)}
+            {session.status === "pending" ? (
+              <span className="ml-1.5 tabular-nums">
+                <SessionDuration session={session} />
+              </span>
+            ) : null}
+          </StatusBadge>
+        }
         titleSuffix={
           <>
-            <StatusBadge
-              className="shrink-0"
-              data-testid="record-status"
-              tone={statusTone(session.status)}
-            >
-              {statusLabel(session.status)}
-              {session.status === "pending" ? (
-                <span className="ml-1.5 tabular-nums">
-                  <SessionDuration session={session} />
-                </span>
-              ) : null}
-            </StatusBadge>
             <span aria-hidden="true" className="text-border">
               ·
             </span>
@@ -3191,6 +3940,7 @@ function RecordDetail({
               auditError={auditError}
               auditLoading={auditLoading}
               childrenByRoot={childrenByRoot}
+              contentCache={conversationCache}
               copyFeedback={copyFeedback}
               onSelectRequest={onSelectTurn}
               onUnlockRaw={onUnlockRaw}

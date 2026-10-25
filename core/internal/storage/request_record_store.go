@@ -15,7 +15,10 @@ type RequestRecordListOptions struct {
 	Protocol            *contract.ProtocolID
 	ServiceID           *contract.ServiceID
 	LocalAccessTokenIDs []contract.AccessTokenID
-	Status              *contract.RequestStatus
+	// Models keeps roots that name one of these models as the client's model,
+	// its redirect target, or the model a recovery served. Empty means any.
+	Models []string
+	Status *contract.RequestStatus
 	// Query matches root records whose input preview contains it as a
 	// literal, ASCII case-insensitive substring. Empty means no text filter.
 	Query string
@@ -61,7 +64,9 @@ type RequestSessionListOptions struct {
 	Protocol            *contract.ProtocolID
 	ServiceID           *contract.ServiceID
 	LocalAccessTokenIDs []contract.AccessTokenID
-	Status              *contract.RequestStatus
+	// Models matches roots as RequestRecordListOptions.Models does.
+	Models []string
+	Status *contract.RequestStatus
 }
 
 type RequestSessionPage struct {
@@ -115,4 +120,10 @@ type RequestRecordStore interface {
 	FindSessionLink(ctx context.Context, kind contract.SessionCursorKind, values []string, scope SessionCursorScope) (match SessionLinkMatch, ok bool, err error)
 	ListRequestSessions(context.Context, RequestSessionListOptions) (RequestSessionPage, error)
 	GetRequestSession(context.Context, string) (contract.RequestSessionDetail, error)
+	// ListRequestActivity returns the root model calls still running or
+	// ended at or after since, newest first, plus earlier calls whose tools
+	// the client may still be running: they ended on tool calls and their
+	// conversation made no later call before since. Model discovery is left
+	// out.
+	ListRequestActivity(ctx context.Context, since time.Time) ([]contract.RequestActivityCall, error)
 }

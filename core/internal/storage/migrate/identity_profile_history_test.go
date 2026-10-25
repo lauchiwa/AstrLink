@@ -10,7 +10,7 @@ import (
 )
 
 // Look migrations up by name. The fork's profile step has already been
-// renumbered three times by upstream claiming its version, and index-based fixtures
+// renumbered four times by upstream claiming its version, and index-based fixtures
 // silently seeded a different migration each time that happened.
 func migrationNamed(t *testing.T, migrations []Migration, name string) Migration {
 	t.Helper()
@@ -45,6 +45,9 @@ const (
 	configSyncStep = "config_sync"
 	ignoredStep    = "request_privacy_ignored"
 	standInsStep   = "privacy_stand_ins"
+	cursorStep     = "session_cursor_lookup_order"
+	tokenSyncStep  = "access_token_sync"
+	activityStep   = "request_output_activity"
 )
 
 // legacyProfileVersionStep names the upstream step each fork fixture recorded
@@ -54,6 +57,7 @@ var legacyProfileVersionStep = map[string]string{
 	"fork_48": timingStep,
 	"fork_49": chunksStep,
 	"fork_50": configSyncStep,
+	"fork_53": cursorStep,
 }
 
 // configSyncObjects are the 27 schema objects upstream's config_sync creates:
@@ -70,11 +74,30 @@ var configSyncObjects = []string{
 	"config_change_pricing_configs", "config_change_pricing_configs_update", "config_change_pricing_configs_delete",
 }
 
+// cursorLookupObjects are the eight schema objects upstream's
+// session_cursor_lookup_order creates: six indexes and two triggers.
+var cursorLookupObjects = []string{
+	"request_record_cursors_latest_idx", "request_record_cursors_principal_latest_idx",
+	"request_records_output_latest_idx", "request_records_previous_latest_idx",
+	"request_records_output_principal_latest_idx", "request_records_previous_principal_latest_idx",
+	"request_cursor_fill_order", "request_cursor_update_order",
+}
+
 func countConfigSyncObjects(t *testing.T, database *sql.DB) int {
 	t.Helper()
-	placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(configSyncObjects)), ", ")
-	arguments := make([]any, len(configSyncObjects))
-	for index, name := range configSyncObjects {
+	return countSchemaObjects(t, database, configSyncObjects)
+}
+
+func countCursorLookupObjects(t *testing.T, database *sql.DB) int {
+	t.Helper()
+	return countSchemaObjects(t, database, cursorLookupObjects)
+}
+
+func countSchemaObjects(t *testing.T, database *sql.DB, objects []string) int {
+	t.Helper()
+	placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(objects)), ", ")
+	arguments := make([]any, len(objects))
+	for index, name := range objects {
 		arguments[index] = name
 	}
 	var present int
@@ -92,22 +115,31 @@ func countConfigSyncObjects(t *testing.T, database *sql.DB) int {
 //	upstream_timing    upstream through 48
 //	upstream_chunks    upstream through 49, never carried fork profiles
 //	upstream_sync      upstream through 50
-//	upstream_stand_ins upstream through 52, an upstream user switching over
+//	upstream_stand_ins upstream through 52
+//	upstream_cursor    upstream through 53, an upstream user switching over
 //	fork_48            fork profiles recorded at 48, upstream's first claim
 //	fork_49            fork profiles recorded at 49, upstream's second claim
 //	fork_50            fork profiles recorded at 50, upstream's third claim
+//	fork_53            fork profiles recorded at 53, upstream's fourth claim
 //	fork_48_applied    profiles at 48, upstream's 48 schema already present
 //	fork_49_applied    profiles at 49, upstream's 49 schema already present
 //	fork_50_applied    profiles at 50, upstream's 50 schema already present
+//	fork_53_applied    profiles at 53, upstream's 53 schema already present
 //	fork_50_partial    profiles at 50, one config_sync object out of band;
 //	                   must fail closed
+//	fork_53_partial    profiles at 53, upstream's 53 stopped after its first
+//	                   index out of band; must fail closed
 //	fork_50_successor  profiles at 50 followed by a later version no build
 //	                   produced; must fail closed
+//	fork_53_successor  profiles at 53 followed by a later version; must fail
+//	                   closed
 //	unknown            an unrecognized fork step at 48; must fail closed
 //	unknown_50         an unrecognized fork step at 50; must fail closed
 //	fork_missing_table profiles recorded at 48 without their table
 //	fork_50_missing_table
 //	                   profiles recorded at 50 without their table
+//	fork_53_missing_table
+//	                   profiles recorded at 53 without their table
 func identityHistoryDatabase(t *testing.T, kind string) *sql.DB {
 	t.Helper()
 	database, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "history.db"))
@@ -126,6 +158,8 @@ func identityHistoryDatabase(t *testing.T, kind string) *sql.DB {
 	configSync := migrationNamed(t, migrations, configSyncStep)
 	ignored := migrationNamed(t, migrations, ignoredStep)
 	standIns := migrationNamed(t, migrations, standInsStep)
+	cursor := migrationNamed(t, migrations, cursorStep)
+	tokenSync := migrationNamed(t, migrations, tokenSyncStep)
 	seed := migrationsBelow(t, migrations, timingStep)
 
 	// The legacy step keeps the fork's name and statements at the version
@@ -149,6 +183,8 @@ func identityHistoryDatabase(t *testing.T, kind string) *sql.DB {
 		seed = append(seed, timing, chunks, configSync)
 	case "upstream_stand_ins":
 		seed = append(seed, timing, chunks, configSync, ignored, standIns)
+	case "upstream_cursor":
+		seed = append(seed, timing, chunks, configSync, ignored, standIns, cursor)
 	case "fork_48", "fork_48_applied":
 		seed = append(seed, legacyAt(timing.Version, false))
 		seeded = true
@@ -166,6 +202,14 @@ func identityHistoryDatabase(t *testing.T, kind string) *sql.DB {
 		seed = append(seed, timing, chunks, legacyAt(configSync.Version, false), Migration{Version: ignored.Version, Name: ignored.Name})
 	case "fork_50_missing_table":
 		seed = append(seed, timing, chunks, legacyAt(configSync.Version, true))
+	case "fork_53", "fork_53_applied", "fork_53_partial":
+		// The earlier reconciliations already handed 48, 49, and 50 back.
+		seed = append(seed, timing, chunks, configSync, ignored, standIns, legacyAt(cursor.Version, false))
+		seeded = true
+	case "fork_53_successor":
+		seed = append(seed, timing, chunks, configSync, ignored, standIns, legacyAt(cursor.Version, false), Migration{Version: tokenSync.Version, Name: tokenSync.Name})
+	case "fork_53_missing_table":
+		seed = append(seed, timing, chunks, configSync, ignored, standIns, legacyAt(cursor.Version, true))
 	case "unknown":
 		seed = append(seed, Migration{Version: timing.Version, Name: "unknown_fork_schema"})
 	case "unknown_50":
@@ -215,6 +259,23 @@ func identityHistoryDatabase(t *testing.T, kind string) *sql.DB {
 		if _, err := database.Exec(configSync.Statements[0]); err != nil {
 			t.Fatal(err)
 		}
+	case "fork_53_applied":
+		for _, statement := range cursor.Statements {
+			if _, err := database.Exec(statement); err != nil {
+				t.Fatal(err)
+			}
+		}
+	case "fork_53_partial":
+		// Columns and backfill, then the first index only: replaying would fail
+		// on the duplicate column and renaming would skip the other seven.
+		for _, statement := range cursor.Statements {
+			if _, err := database.Exec(statement); err != nil {
+				t.Fatal(err)
+			}
+			if strings.HasPrefix(strings.TrimSpace(statement), "CREATE INDEX") {
+				break
+			}
+		}
 	}
 	return database
 }
@@ -222,9 +283,9 @@ func identityHistoryDatabase(t *testing.T, kind string) *sql.DB {
 func TestIdentityProfileHistoryConvergesWithoutLosingProfiles(t *testing.T) {
 	kinds := []string{
 		"fresh", "previous", "upstream_timing", "upstream_chunks",
-		"upstream_sync", "upstream_stand_ins",
+		"upstream_sync", "upstream_stand_ins", "upstream_cursor",
 		"fork_48", "fork_48_applied", "fork_49", "fork_49_applied",
-		"fork_50", "fork_50_applied",
+		"fork_50", "fork_50_applied", "fork_53", "fork_53_applied",
 	}
 	for _, kind := range kinds {
 		t.Run(kind, func(t *testing.T) {
@@ -250,7 +311,7 @@ func TestIdentityProfileHistoryConvergesWithoutLosingProfiles(t *testing.T) {
 			}
 			// Every claimed version ends up recorded under upstream's name,
 			// and the fork's step sits at its current version.
-			for _, step := range []string{timingStep, chunksStep, configSyncStep, ignoredStep, standInsStep, profilesStep} {
+			for _, step := range []string{timingStep, chunksStep, configSyncStep, ignoredStep, standInsStep, cursorStep, tokenSyncStep, activityStep, profilesStep} {
 				want := migrationNamed(t, migrations, step)
 				var name string
 				if err := database.QueryRow(`SELECT name FROM schema_migrations WHERE version = ?`, want.Version).Scan(&name); err != nil || name != want.Name {
@@ -275,6 +336,17 @@ func TestIdentityProfileHistoryConvergesWithoutLosingProfiles(t *testing.T) {
 			var standInTables int
 			if err := database.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'privacy_stand_ins'`).Scan(&standInTables); err != nil || standInTables != 1 {
 				t.Fatalf("privacy stand-in tables = %d, %v", standInTables, err)
+			}
+			if present := countCursorLookupObjects(t, database); present != len(cursorLookupObjects) {
+				t.Fatalf("cursor lookup objects = %d, want %d", present, len(cursorLookupObjects))
+			}
+			var cursorColumns int
+			if err := database.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('request_record_cursors') WHERE name IN ('started_at', 'local_access_token_id')`).Scan(&cursorColumns); err != nil || cursorColumns != 2 {
+				t.Fatalf("cursor lookup columns = %d, %v", cursorColumns, err)
+			}
+			var activityColumns int
+			if err := database.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('request_records') WHERE name = 'output_json'`).Scan(&activityColumns); err != nil || activityColumns != 1 {
+				t.Fatalf("output activity columns = %d, %v", activityColumns, err)
 			}
 			if strings.HasPrefix(kind, "fork_") {
 				var document string
@@ -309,6 +381,9 @@ func TestIdentityProfileHistoryRejectsUnknownOrIncompleteSchema(t *testing.T) {
 		"fork_50_missing_table": {configSyncStep, configSyncStep},
 		"fork_50_partial":       {configSyncStep, configSyncStep},
 		"fork_50_successor":     {configSyncStep, ignoredStep},
+		"fork_53_missing_table": {cursorStep, cursorStep},
+		"fork_53_partial":       {cursorStep, cursorStep},
+		"fork_53_successor":     {cursorStep, tokenSyncStep},
 	}
 	for kind, want := range cases {
 		t.Run(kind, func(t *testing.T) {
@@ -324,6 +399,7 @@ func TestIdentityProfileHistoryRejectsUnknownOrIncompleteSchema(t *testing.T) {
 				t.Fatal(err)
 			}
 			objectsBefore := countConfigSyncObjects(t, database)
+			cursorObjectsBefore := countCursorLookupObjects(t, database)
 			runner, err := New(SQLDatabase{DB: database}, migrations)
 			if err != nil {
 				t.Fatal(err)
@@ -336,20 +412,24 @@ func TestIdentityProfileHistoryRejectsUnknownOrIncompleteSchema(t *testing.T) {
 				t.Fatalf("version %d after rejection = %q, %v; want %q", affected.Version, after, err, before)
 			}
 			assertLegacyIdentityHistoryUnchanged(t, database, latest.Version, latestName)
-			// Nothing was replayed: a partial config_sync stays partial.
+			// Nothing was replayed: a partial step stays partial.
 			if objectsAfter := countConfigSyncObjects(t, database); objectsAfter != objectsBefore {
 				t.Fatalf("config_sync objects after rejection = %d, want %d", objectsAfter, objectsBefore)
+			}
+			if objectsAfter := countCursorLookupObjects(t, database); objectsAfter != cursorObjectsBefore {
+				t.Fatalf("cursor lookup objects after rejection = %d, want %d", objectsAfter, cursorObjectsBefore)
 			}
 		})
 	}
 }
 
 func TestIdentityProfileHistoryReconciliationRollsBackWithLaterFailure(t *testing.T) {
-	for _, kind := range []string{"fork_48", "fork_49", "fork_50"} {
+	for _, kind := range []string{"fork_48", "fork_49", "fork_50", "fork_53"} {
 		t.Run(kind, func(t *testing.T) {
 			database := identityHistoryDatabase(t, kind)
 			migrations := DefaultMigrations()
 			objectsBefore := countConfigSyncObjects(t, database)
+			cursorObjectsBefore := countCursorLookupObjects(t, database)
 			for index := range migrations {
 				if migrations[index].Name == profilesStep {
 					migrations[index].Statements = append(
@@ -369,10 +449,13 @@ func TestIdentityProfileHistoryReconciliationRollsBackWithLaterFailure(t *testin
 			// must leave the recorded history and the profiles untouched.
 			claimed := migrationNamed(t, migrations, legacyProfileVersionStep[kind]).Version
 			assertLegacyIdentityHistoryUnchanged(t, database, claimed, profilesStep)
-			// fork_50 had config_sync replayed during reconciliation; the
-			// rollback must remove it again.
+			// fork_50 and fork_53 had their claimed step replayed during
+			// reconciliation; the rollback must remove it again.
 			if objectsAfter := countConfigSyncObjects(t, database); objectsAfter != objectsBefore {
 				t.Fatalf("config_sync objects after rollback = %d, want %d", objectsAfter, objectsBefore)
+			}
+			if objectsAfter := countCursorLookupObjects(t, database); objectsAfter != cursorObjectsBefore {
+				t.Fatalf("cursor lookup objects after rollback = %d, want %d", objectsAfter, cursorObjectsBefore)
 			}
 			var document string
 			if err := database.QueryRow(`SELECT document_json FROM service_identity_profiles WHERE id = 'identity_legacy'`).Scan(&document); err != nil || document != `{"preserve":"original profile"}` {

@@ -155,7 +155,7 @@ const (
 	DefaultMaxConcurrentInspections    = 16
 	MinMaxConcurrentInspections        = 4
 	MaxMaxConcurrentInspections        = 128
-	DefaultResponseStartTimeoutSeconds = 0
+	DefaultResponseStartTimeoutSeconds = 600
 	MaxResponseStartTimeoutSeconds     = 86400
 )
 
@@ -178,10 +178,10 @@ func ValidateMaxConcurrentInspections(n int) error {
 }
 
 func ValidateResponseStartTimeoutSeconds(n int) error {
-	if n < DefaultResponseStartTimeoutSeconds || n > MaxResponseStartTimeoutSeconds {
+	if n < 0 || n > MaxResponseStartTimeoutSeconds {
 		return fmt.Errorf(
 			"response start timeout must be between %d and %d seconds",
-			DefaultResponseStartTimeoutSeconds,
+			0,
 			MaxResponseStartTimeoutSeconds,
 		)
 	}
@@ -201,6 +201,26 @@ const ReachabilityPath = "/astrlink/reachability"
 // gateway rather than from an intercepting proxy.
 const ReachabilityHeader = "X-AstrLink-Reachable"
 
+// ServiceHeader names the one API provider a client wants, such as a terminal
+// the desktop opened for that provider. Routing then uses no other provider,
+// so the request fails rather than moves on. The forwarder strips it with
+// the rest of the X-AstrLink-* namespace.
+const ServiceHeader = "X-AstrLink-Service"
+
+// requestedService reads ServiceHeader. A blank value names no provider;
+// ok is false when the value is not a provider ID or the header repeats.
+func requestedService(request *http.Request) (contract.ServiceID, bool) {
+	values := request.Header.Values(ServiceHeader)
+	if len(values) > 1 {
+		return "", false
+	}
+	if len(values) == 0 || strings.TrimSpace(values[0]) == "" {
+		return "", true
+	}
+	id := contract.ServiceID(strings.TrimSpace(values[0]))
+	return id, id.Validate() == nil
+}
+
 type accessTokenIDContextKey struct{}
 
 // AccessTokenIDFromContext returns the stable identifier of the persistent
@@ -211,7 +231,9 @@ func AccessTokenIDFromContext(ctx context.Context) (contract.AccessTokenID, bool
 }
 
 func New() *Handler {
-	return NewWithDependencies(Dependencies{})
+	return NewWithDependencies(Dependencies{
+		ResponseStartTimeout: time.Duration(DefaultResponseStartTimeoutSeconds) * time.Second,
+	})
 }
 
 // NewProduction requires the complete minimum loopback gate before a resolver
@@ -230,9 +252,9 @@ func NewProduction(dependencies Dependencies) (*Handler, error) {
 
 // NewNetworkProduction is the server edition's inference gate. Its listener
 // is reached from other machines by IP, hostname or container name, so any
-// Host is accepted; the access token stays mandatory and browser origins
-// stay refused. Requests rejected before their token is accepted are not
-// recorded, so whoever can reach the port cannot fill the request records.
+// Host is accepted; the access token stays mandatory for browser callers too.
+// Requests rejected before their token is accepted are not recorded, so
+// whoever can reach the port cannot fill the request records.
 func NewNetworkProduction(dependencies Dependencies) (*Handler, error) {
 	if err := validateProductionDependencies(dependencies); err != nil {
 		return nil, err
@@ -294,6 +316,14 @@ func (handler *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 	// The policy warning header is owned by this local response boundary.
 	// Strip any client-supplied value so it cannot be spoofed upstream.
 	request.Header.Del(PolicyWarningHeader)
+	if builtinInternalFrom(request.Context()) == nil {
+		writer.Header().Set("Access-Control-Allow-Origin", "*")
+		writer.Header().Set("Access-Control-Expose-Headers", "*")
+		if request.Method == http.MethodOptions {
+			handler.servePreflight(writer, request)
+			return
+		}
+	}
 	if builtinInternalFrom(request.Context()) == nil && request.URL.Path == ReachabilityPath {
 		handler.serveReachability(writer, request)
 		return
@@ -363,6 +393,9 @@ func (handler *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 		}
 		// Never delay or fail the client response on persistence errors.
 		session.finish(context.Background(), handler.requestRecords, handler.auditBlobs, handler.recordLogger)
+		if mode := builtinInternalFrom(request.Context()); mode != nil {
+			mode.Status, mode.Error = session.status, session.errorSummary
+		}
 	}()
 
 	// One read serves model redirects, channel binding and discovery.
@@ -404,13 +437,26 @@ func (handler *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 	if handler.tryBuiltinTools(outWriter, request, classified, routingSettings) {
 		return
 	}
-	session.channelBinding = handler.prepareChannelBinding(session, routingSettings, routingSettingsLoaded)
+	pinned, ok := requestedService(request)
+	if !ok {
+		session.captureUnreadRequestBody(request)
+		message := ServiceHeader + " must hold one API provider ID"
+		writeInferenceError(outWriter, http.StatusBadRequest, "invalid_request", message, false, nil)
+		session.noteFailed(errorSummaryFromInference("invalid_request", message, false))
+		return
+	}
+	// A named provider serves every turn of the session, so a binding has
+	// nothing to choose.
+	if pinned == "" {
+		session.channelBinding = handler.prepareChannelBinding(session, routingSettings, routingSettingsLoaded)
+	}
 	candidates, err := handler.resolveCandidates(request.Context(), endpoint.ResolveRequest{
 		Protocol:      classified.Protocol,
 		Model:         classified.routingModel(),
 		Streaming:     classified.Streaming,
 		Continuation:  classified.PreviousResponseID != "",
 		AllCandidates: session.channelBinding != nil || responsesWSTurnFromContext(request.Context()) != nil || builtinInternalFrom(request.Context()) != nil,
+		Service:       pinned,
 	})
 	if err != nil {
 		// No attempt will read the body, so capture it for the audit now.
@@ -452,6 +498,9 @@ func (handler *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 		session.noteFailed(errorSummaryFromInference("response_affinity_unavailable", err.Error(), false))
 		return
 	}
+	// The client's choice explains the provider better than a connection or
+	// response it implies.
+	session.noteRoutingPin(contract.RoutingSelectionClientPin, pinned)
 	if classified.Protocol.IsModelDiscovery() {
 		handler.aggregateModelDiscovery(outWriter, request, classified, candidates, routingSettings.ModelRedirects)
 		return
@@ -826,10 +875,6 @@ func (handler *Handler) hostAllowed(host string) bool {
 }
 
 func (handler *Handler) allowLocalCaller(writer http.ResponseWriter, request *http.Request) bool {
-	if hasBrowserOrigin(request.Header) {
-		handler.writeBoundaryError(writer, request, http.StatusForbidden, "origin_forbidden", "browser origins cannot call the inference plane")
-		return false
-	}
 	if !handler.hostAllowed(request.Host) {
 		handler.writeBoundaryError(writer, request, http.StatusMisdirectedRequest, "host_forbidden", "request Host does not match the inference listener")
 		return false
@@ -937,6 +982,7 @@ func (handler *Handler) writeBoundaryError(writer http.ResponseWriter, request *
 // writeRecordedInferenceError writes a local inference-plane error and, when
 // the path maps to a known protocol, persists a failed request record so
 // boundary failures such as invalid_access_token appear in the operator list.
+// A HEAD request only probes the endpoint, so it gets the answer unrecorded.
 func (handler *Handler) writeRecordedInferenceError(
 	writer http.ResponseWriter,
 	request *http.Request,
@@ -946,7 +992,7 @@ func (handler *Handler) writeRecordedInferenceError(
 	details []errorDetail,
 ) {
 	classified, ok := classifyFromPath(request)
-	if !ok {
+	if !ok || request.Method == http.MethodHead {
 		writeInferenceError(writer, status, code, message, retryable, details)
 		return
 	}
@@ -958,15 +1004,6 @@ func (handler *Handler) writeRecordedInferenceError(
 		session.noteFailed(errorSummaryFromInference(code, message, retryable))
 	}
 	session.finish(context.Background(), handler.requestRecords, handler.auditBlobs, handler.recordLogger)
-}
-
-func hasBrowserOrigin(header http.Header) bool {
-	for _, value := range header.Values("Origin") {
-		if value != "" {
-			return true
-		}
-	}
-	return false
 }
 
 func localClientCredential(header http.Header) (string, bool) {
@@ -1086,7 +1123,12 @@ func (handler *Handler) writeResolveError(writer http.ResponseWriter, request *h
 	}
 	session := recordSessionFromContext(request.Context())
 	var capabilityErr *endpoint.CapabilityUnavailableError
+	var pinnedErr *endpoint.PinnedServiceError
 	switch {
+	case errors.As(err, &pinnedErr):
+		message := pinnedServiceMessage(pinnedErr, classified)
+		writeInferenceError(writer, http.StatusUnprocessableEntity, "api_provider_unavailable", message, false, nil)
+		session.noteFailed(errorSummaryFromInference("api_provider_unavailable", message, false))
 	case errors.As(err, &capabilityErr):
 		message := writeMissingCapability(
 			writer,
@@ -1123,6 +1165,30 @@ func (handler *Handler) writeResolveError(writer http.ResponseWriter, request *h
 			Protocol: string(classified.Protocol), RequiredPlanTypes: []string{string(contract.PlanTypeNative), string(contract.PlanTypeDelegated)},
 		}})
 		session.noteFailed(errorSummaryFromInference("endpoint_resolver_unavailable", "upstream endpoint resolution failed", true))
+	}
+}
+
+// pinnedServiceMessage tells the client why the provider it named in
+// ServiceHeader cannot serve the request, since no other provider will.
+func pinnedServiceMessage(err *endpoint.PinnedServiceError, classified Request) string {
+	if err.Name == "" {
+		return fmt.Sprintf("API provider %q named in %s does not exist", err.Service, ServiceHeader)
+	}
+	switch err.Reason {
+	case contract.RoutingSkipDisabled:
+		return fmt.Sprintf("API provider %q is turned off", err.Name)
+	case contract.RoutingSkipNotConnected:
+		return fmt.Sprintf("API provider %q is not signed in", err.Name)
+	case contract.RoutingSkipRiskPaused:
+		return fmt.Sprintf("API provider %q is paused after its upstream reported a risk", err.Name)
+	case contract.RoutingSkipModelNotListed:
+		return fmt.Sprintf("API provider %q does not serve model %q", err.Name, classified.Model)
+	case contract.RoutingSkipStreamingUnsupported:
+		return fmt.Sprintf("API provider %q cannot stream model %q", err.Name, classified.Model)
+	case contract.RoutingSkipConversionUnavailable:
+		return fmt.Sprintf("API provider %q serves model %q in a format this request cannot be converted to", err.Name, classified.Model)
+	default:
+		return fmt.Sprintf("API provider %q does not accept %s requests", err.Name, classified.Protocol)
 	}
 }
 
@@ -1230,9 +1296,9 @@ type errorDetail struct {
 	RetryAfterSeconds int      `json:"retry_after_seconds,omitempty"`
 }
 
-// writeRateLimited reports that every route is waiting out the delay its
-// upstream asked for with HTTP 429, so nothing was sent upstream. The record
-// keeps the same text the client received.
+// writeRateLimited reports that every route is cooling after an upstream
+// rate limit or overload, so nothing was sent upstream. The record keeps
+// the same text the client received.
 func writeRateLimited(
 	writer http.ResponseWriter,
 	classified Request,
@@ -1252,7 +1318,7 @@ func writeRateLimited(
 			details = append(details, errorDetail{
 				Protocol:          string(classified.Protocol),
 				ServiceID:         string(limit.Service),
-				Reason:            fmt.Sprintf("upstream answered HTTP 429 for model %q", limit.Model),
+				Reason:            fmt.Sprintf("upstream reported a rate limit or overload for model %q", limit.Model),
 				RetryAfterSeconds: seconds,
 			})
 			routes = append(routes, fmt.Sprintf("%s (model %q, %ds left)", name, limit.Model, seconds))
@@ -1266,7 +1332,7 @@ func writeRateLimited(
 		subject = fmt.Sprintf("model %q", classified.Model)
 	}
 	message := fmt.Sprintf(
-		"every provider for %s answered HTTP 429 and is waiting out the retry delay it asked for; nothing was sent upstream",
+		"every provider for %s is waiting out an upstream rate limit or overload cooldown; nothing was sent upstream",
 		subject,
 	)
 	if len(routes) > 0 {

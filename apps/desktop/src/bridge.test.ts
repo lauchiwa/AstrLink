@@ -87,7 +87,11 @@ import {
 } from "./bridge";
 import { defaultPrivacyKindRules } from "./privacy-policy-model";
 import { emptyPrivacyTotals } from "./privacy-summary-model";
-import { emptyUsageTotals, resolveUsageWindow } from "./usage-range";
+import {
+  emptyUsageStatusCounts,
+  emptyUsageTotals,
+  resolveUsageWindow,
+} from "./usage-range";
 
 function validSnapshot(): Record<string, unknown> {
   return {
@@ -373,6 +377,7 @@ describe("desktop bridge contract", () => {
     const window = resolveUsageWindow("1d", new Date(2026, 8, 19, 12));
     invokeMock.mockResolvedValueOnce({
       totals: emptyUsageTotals(),
+      status_counts: emptyUsageStatusCounts(),
       by_day: [],
       by_hour: [],
       by_service: [],
@@ -389,6 +394,40 @@ describe("desktop bridge contract", () => {
     });
     expect(result.by_hour).toHaveLength(24);
     expect(result.capped).toBe(false);
+  });
+
+  it("shares simultaneous usage reads and allows immediate refresh and retry", async () => {
+    const window = resolveUsageWindow("7d", new Date(2026, 8, 19, 12));
+    const empty = {
+      totals: emptyUsageTotals(),
+      status_counts: emptyUsageStatusCounts(),
+      by_day: [],
+      by_hour: [],
+      by_service: [],
+      by_model: [],
+      by_token: [],
+      scanned_records: 0,
+    };
+    invokeMock.mockResolvedValue(empty);
+    const first = getUsageSummary(window);
+    const second = getUsageSummary(window);
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+    await Promise.all([first, second]);
+    await getUsageSummary(window);
+    expect(invokeMock).toHaveBeenCalledTimes(2);
+    invokeMock.mockRejectedValueOnce(new Error("temporary failure"));
+    const failures = Promise.allSettled([
+      getUsageSummary(window),
+      getUsageSummary(window),
+    ]);
+    expect(invokeMock).toHaveBeenCalledTimes(3);
+    expect(
+      (await failures).every((result) => result.status === "rejected"),
+    ).toBe(true);
+    await expect(getUsageSummary(window)).resolves.toMatchObject({
+      scanned_records: 0,
+    });
+    expect(invokeMock).toHaveBeenCalledTimes(4);
   });
   it("asks Core for a privacy summary in the usage window's buckets", async () => {
     const window = resolveUsageWindow("7d", new Date(2026, 8, 19, 12));
@@ -1061,6 +1100,7 @@ describe("desktop bridge contract", () => {
       error: null,
       label_mapping: {},
       installed_at: null,
+      preparation: null,
     };
 
     invokeMock.mockResolvedValueOnce({ items: [policy], next_cursor: null });

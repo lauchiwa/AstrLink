@@ -52,8 +52,9 @@ export function macOSSigningMode(env = process.env) {
   return mode;
 }
 
+const adhocHeading = "## macOS installation notice: not notarized";
 const adhocNotice = [
-  "## macOS installation notice: not notarized",
+  adhocHeading,
   "The macOS downloads are ad-hoc signed, not Developer ID signed or notarized by Apple. Apple has not performed a notarization malware scan. Update packages still require independent Tauri signatures and checksum verification.",
   "Only install downloads you trust. After attempting to open the app, use System Settings > Privacy & Security > Open Anyway if macOS blocks it. Managed Macs may prohibit this exception. Do not disable Gatekeeper system-wide. Updates may require approval again.",
 ].join("\n\n");
@@ -386,8 +387,9 @@ export function collectRelease(
   const assets = releaseAssets(files);
   const manifest = {
     version,
+    // Notes written ahead of CI may carry the notice already; add it once.
     notes:
-      macosSigningMode === "adhoc"
+      macosSigningMode === "adhoc" && !notes.includes(adhocHeading)
         ? `${adhocNotice}\n\n${notes}`.trim()
         : notes,
     pub_date: now.toISOString(),
@@ -459,13 +461,13 @@ export function extendRelease(
   return manifest;
 }
 
-function gh(args) {
+function runGh(args) {
   return execFileSync("gh", args, {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   });
 }
-function uploadAssets(repository, tag, assets) {
+function uploadAssets(repository, tag, assets, gh) {
   gh(["release", "upload", tag, "--repo", repository, "--clobber", ...assets]);
   const remote = JSON.parse(
     gh(["release", "view", tag, "--repo", repository, "--json", "assets"]),
@@ -480,19 +482,46 @@ function uploadAssets(repository, tag, assets) {
       `Release upload incomplete: ${path.basename(asset)}`,
     );
 }
-export function publishRelease(input, output, tag, env = process.env) {
+/**
+ * Release uploads latest.json after every package it lists, so a public
+ * release that lists latest.json is complete, even one published before
+ * Release ran.
+ */
+function releaseComplete(draft, assets) {
+  return !draft && assets.some((asset) => asset.name === "latest.json");
+}
+export function publishRelease(
+  input,
+  output,
+  tag,
+  env = process.env,
+  gh = runGh,
+) {
   const repository = publishingRepository(env);
   const { prerelease } = releaseVersion(tag);
-  const notes = JSON.parse(
-    gh([
-      "api",
-      `repos/${repository}/releases/generate-notes`,
-      "-f",
-      `tag_name=${tag}`,
-      "-f",
-      `target_commitish=${env.GITHUB_SHA}`,
-    ]),
-  ).body;
+  const releases = JSON.parse(
+    gh(["api", `repos/${repository}/releases`, "--paginate", "--slurp"]),
+  ).flat();
+  // A release written ahead of CI, as a draft or published, keeps its title
+  // and notes and gets the packages. One listing latest.json is never replaced.
+  const existing = releases.find((release) => release.tag_name === tag);
+  requireValue(
+    !existing || !releaseComplete(existing.draft, existing.assets),
+    "Refusing to overwrite an already published release",
+  );
+  const written = existing?.body?.trim() ? existing.body : undefined;
+  const notes =
+    written ??
+    JSON.parse(
+      gh([
+        "api",
+        `repos/${repository}/releases/generate-notes`,
+        "-f",
+        `tag_name=${tag}`,
+        "-f",
+        `target_commitish=${env.GITHUB_SHA}`,
+      ]),
+    ).body;
   const manifest = collectRelease(
     input,
     output,
@@ -505,14 +534,6 @@ export function publishRelease(input, output, tag, env = process.env) {
   );
   const notesFile = path.join(output, "release-notes.txt");
   writeFileSync(notesFile, manifest.notes);
-  const releases = JSON.parse(
-    gh(["api", `repos/${repository}/releases`, "--paginate", "--slurp"]),
-  ).flat();
-  const existing = releases.find((release) => release.tag_name === tag);
-  requireValue(
-    !existing || existing.draft,
-    "Refusing to overwrite an already published release",
-  );
   if (!existing)
     gh([
       "release",
@@ -528,13 +549,17 @@ export function publishRelease(input, output, tag, env = process.env) {
       notesFile,
     ]);
   // A temporary draft keeps incomplete uploads invisible. No human approval is required.
+  // A release published ahead of CI is public already, so latest.json goes
+  // up after the packages it lists.
   uploadAssets(
     repository,
     tag,
     readdirSync(output)
-      .filter((name) => name !== "release-notes.txt")
+      .filter((name) => !["latest.json", "release-notes.txt"].includes(name))
       .map((name) => path.join(output, name)),
+    gh,
   );
+  uploadAssets(repository, tag, [path.join(output, "latest.json")], gh);
   gh([
     "release",
     "edit",
@@ -544,18 +569,37 @@ export function publishRelease(input, output, tag, env = process.env) {
     "--draft=false",
     `--prerelease=${prerelease}`,
     `--latest=${newestStable(tag, releases)}`,
-    "--notes-file",
-    notesFile,
+    // Deliberate fork deviation: upstream leaves written notes alone. An
+    // ad-hoc release must still carry the not-notarized notice on its page,
+    // so notes the notice was prepended to are written back.
+    ...(written === manifest.notes ? [] : ["--notes-file", notesFile]),
   ]);
 }
 
-export function attachRelease(input, output, tag, target, env = process.env) {
+export function attachRelease(
+  input,
+  output,
+  tag,
+  target,
+  env = process.env,
+  gh = runGh,
+) {
   const repository = publishingRepository(env);
-  // Only Release itself writes to a draft; it may still be uploading.
+  // Release may still be uploading, to its draft or to a release published
+  // ahead of CI.
+  const { isDraft, assets } = JSON.parse(
+    gh([
+      "release",
+      "view",
+      tag,
+      "--repo",
+      repository,
+      "--json",
+      "isDraft,assets",
+    ]),
+  );
   requireValue(
-    !JSON.parse(
-      gh(["release", "view", tag, "--repo", repository, "--json", "isDraft"]),
-    ).isDraft,
+    releaseComplete(isDraft, assets),
     "Release is not published yet",
   );
   const published = mkdtempSync(path.join(os.tmpdir(), "astrlink-release-"));
@@ -590,11 +634,13 @@ export function attachRelease(input, output, tag, target, env = process.env) {
     readdirSync(output)
       .filter((name) => !manifests.includes(name))
       .map((name) => path.join(output, name)),
+    gh,
   );
   uploadAssets(
     repository,
     tag,
     manifests.map((name) => path.join(output, name)),
+    gh,
   );
 }
 

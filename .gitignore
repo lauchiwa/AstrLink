@@ -17,6 +17,7 @@ core/coverage.out
 apps/desktop/node_modules/
 apps/desktop/dist/
 apps/desktop/src-tauri/icons/.branding-hash
+apps/desktop/src-tauri/icons/dev/.branding-hash
 apps/desktop/src-tauri/icons/tray/.branding-hash
 
 # Local desktop installers (unsigned debug/dev DMGs)
@@ -40,6 +41,7 @@ apps/desktop/src-tauri/binaries/vc_redist.x64.nsh
 apps/desktop/src-tauri/binaries/vc_redist.x64.exe.*.download
 apps/desktop/src-tauri/binaries/onnxruntime-*-LICENSE.txt
 apps/desktop/src-tauri/binaries/onnxruntime-*-ThirdPartyNotices.txt
+apps/desktop/src-tauri/binaries/tauri.onnxruntime.conf.json
 apps/privacy-worker/target/
 apps/classifier-worker/target/
 apps/classifier-worker/.venv/

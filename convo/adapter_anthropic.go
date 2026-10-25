@@ -36,6 +36,24 @@ func (anthropicAdapter) ExplicitCursors(fields map[string]json.RawMessage) []str
 
 func (anthropicAdapter) IsStateful(map[string]json.RawMessage) bool { return false }
 
+func (anthropicAdapter) inspectItem(item json.RawMessage) requestItem {
+	message, ok := jsonx.Object(item)
+	if !ok {
+		return requestItem{}
+	}
+	role, _ := jsonx.String(message["role"])
+	result := requestItem{assistant: role == "assistant", echoIDs: anthropicInboundEchoIDs(message)}
+	if role == "user" {
+		// anthropicSkipTypes holds only tool_result, so a skipped block is a
+		// tool result and the text pass answers both without a second decode.
+		texts, hasMedia, toolResult := scanTextParts(message["content"], anthropicTextTypes, anthropicSkipTypes)
+		result.userText = joinVisible(texts, "\n")
+		result.user = hasMedia || result.userText != ""
+		result.toolResult = toolResult
+	}
+	return result
+}
+
 func (anthropicAdapter) IsUserTurn(item json.RawMessage) bool {
 	message, ok := jsonx.Object(item)
 	if !ok {
@@ -48,11 +66,43 @@ func (anthropicAdapter) IsUserTurn(item json.RawMessage) bool {
 	return hasMedia || joinVisible(texts, "\n") != ""
 }
 
+func (anthropicAdapter) IsToolResult(item json.RawMessage) bool {
+	message, ok := jsonx.Object(item)
+	if !ok {
+		return false
+	}
+	role, _ := jsonx.String(message["role"])
+	return role == "user" && anthropicHasToolResult(message)
+}
+
+// anthropicHasToolResult reports whether a user message carries tool_result
+// blocks, whatever text sits beside them.
+func anthropicHasToolResult(message map[string]json.RawMessage) bool {
+	blocks, ok := jsonx.Array(message["content"])
+	if !ok {
+		return false
+	}
+	for _, raw := range blocks {
+		block, ok := jsonx.Object(raw)
+		if !ok {
+			continue
+		}
+		if blockType, _ := jsonx.String(block["type"]); blockType == "tool_result" {
+			return true
+		}
+	}
+	return false
+}
+
 func (anthropicAdapter) InboundEchoIDs(item json.RawMessage) []string {
 	message, ok := jsonx.Object(item)
 	if !ok {
 		return nil
 	}
+	return anthropicInboundEchoIDs(message)
+}
+
+func anthropicInboundEchoIDs(message map[string]json.RawMessage) []string {
 	blocks, ok := jsonx.Array(message["content"])
 	if !ok {
 		return nil

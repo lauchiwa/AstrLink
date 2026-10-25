@@ -255,7 +255,7 @@ func TestServicesAreTheOnlyServiceControlSurface(t *testing.T) {
 
 func newServiceHandler(t *testing.T, ids ...contract.ServiceID) (*sqlite.Store, *Handler) {
 	t.Helper()
-	store, err := sqlite.Open(context.Background(), t.TempDir()+"/astrlink.db")
+	store, err := openControlTestStore(t, context.Background(), t.TempDir()+"/astrlink.db")
 	if err != nil {
 		t.Fatalf("sqlite.Open() = %v", err)
 	}

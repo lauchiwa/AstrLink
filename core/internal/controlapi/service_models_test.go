@@ -14,7 +14,6 @@ import (
 	"github.com/QuantumNous/astrlink/core/internal/accountauth"
 	"github.com/QuantumNous/astrlink/core/internal/servicemodel"
 	"github.com/QuantumNous/astrlink/core/internal/storage"
-	"github.com/QuantumNous/astrlink/core/internal/storage/sqlite"
 	"github.com/QuantumNous/astrlink/core/internal/subscription"
 )
 
@@ -25,7 +24,7 @@ func (function controlRoundTripFunc) RoundTrip(request *http.Request) (*http.Res
 }
 
 func TestServiceModelProbesUsePersistedAndDraftHTTPConfiguration(t *testing.T) {
-	store, err := sqlite.Open(context.Background(), t.TempDir()+"/astrlink.db")
+	store, err := openControlTestStore(t, context.Background(), t.TempDir()+"/astrlink.db")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +133,7 @@ func TestServiceModelProbesUsePersistedAndDraftHTTPConfiguration(t *testing.T) {
 // A New API list names each model's endpoint types; the probe reports the
 // format of a model served in exactly one.
 func TestDraftModelProbeReportsListedFormats(t *testing.T) {
-	store, err := sqlite.Open(context.Background(), t.TempDir()+"/astrlink.db")
+	store, err := openControlTestStore(t, context.Background(), t.TempDir()+"/astrlink.db")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +170,7 @@ func TestDraftModelProbeReportsListedFormats(t *testing.T) {
 }
 
 func TestDraftServiceModelProbeRejectsUnsupportedProtocol(t *testing.T) {
-	store, err := sqlite.Open(context.Background(), t.TempDir()+"/astrlink.db")
+	store, err := openControlTestStore(t, context.Background(), t.TempDir()+"/astrlink.db")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +197,7 @@ func TestDraftServiceModelProbeRejectsUnsupportedProtocol(t *testing.T) {
 }
 
 func TestSavedCodexModelProbeRequiresConnectedSubscription(t *testing.T) {
-	store, err := sqlite.Open(context.Background(), t.TempDir()+"/astrlink.db")
+	store, err := openControlTestStore(t, context.Background(), t.TempDir()+"/astrlink.db")
 	if err != nil {
 		t.Fatal(err)
 	}
