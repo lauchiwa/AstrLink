@@ -83,6 +83,9 @@ func cloneCachedServiceRecord(record storagecontract.ServiceRecord) storagecontr
 	service.ResponsesWebSocketEnabled = cloneServicePointer(service.ResponsesWebSocketEnabled)
 	service.HTTP = cloneServicePointer(service.HTTP)
 	cloneForkHTTPConnection(service.HTTP)
+	if service.HTTP != nil {
+		service.HTTP.Vertex = cloneServicePointer(service.HTTP.Vertex)
+	}
 	service.FailurePolicy = cloneServicePointer(service.FailurePolicy)
 	if policy := service.FailurePolicy; policy != nil {
 		policy.HTTPStatus = maps.Clone(policy.HTTPStatus)

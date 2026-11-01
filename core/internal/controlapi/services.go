@@ -19,10 +19,12 @@ import (
 	"github.com/QuantumNous/astrlink/core/contract"
 	"github.com/QuantumNous/astrlink/core/internal/accountauth"
 	"github.com/QuantumNous/astrlink/core/internal/codingplan"
+	"github.com/QuantumNous/astrlink/core/internal/providerapi"
 	"github.com/QuantumNous/astrlink/core/internal/secretstore"
 	"github.com/QuantumNous/astrlink/core/internal/servicemodel"
 	"github.com/QuantumNous/astrlink/core/internal/storage"
 	"github.com/QuantumNous/astrlink/core/internal/subscription"
+	"github.com/QuantumNous/astrlink/core/internal/vertexauth"
 )
 
 type ServiceModelProber interface {
@@ -46,10 +48,11 @@ type serviceCreateRequest struct {
 }
 
 type serviceHTTPInput struct {
-	BaseURL       string          `json:"base_url"`
-	Auth          json.RawMessage `json:"auth"`
-	Credential    json.RawMessage `json:"credential,omitempty"`
-	ModelListPath string          `json:"model_list_path,omitempty"`
+	BaseURL       string                     `json:"base_url"`
+	Auth          json.RawMessage            `json:"auth"`
+	Credential    json.RawMessage            `json:"credential,omitempty"`
+	ModelListPath string                     `json:"model_list_path,omitempty"`
+	Vertex        *contract.VertexConnection `json:"vertex,omitempty"`
 	// ExtraHeaders and ModelRules are optional. Omitted keeps the saved value on
 	// patch and stays unset on create; an explicit empty object or array clears
 	// the configuration. contract.ValidateRequestRules refuses any header the
@@ -104,6 +107,9 @@ func (handler *Handler) serviceDetail(request *http.Request, service contract.Se
 	if requestRole(request) < RoleOperator || service.HTTP == nil || service.HTTP.CredentialRef == "" {
 		return service
 	}
+	if service.HTTP.Auth.Scheme == contract.AuthSchemeGoogleServiceAccount && service.HTTP.Vertex != nil {
+		return service
+	}
 	secrets, ok := handler.serviceStore.(secretstore.SecretStore)
 	if !ok {
 		return service
@@ -111,6 +117,16 @@ func (handler *Handler) serviceDetail(request *http.Request, service contract.Se
 	secret, err := secrets.Get(request.Context(), secretstore.Ref(service.HTTP.CredentialRef))
 	defer clear(secret)
 	if err != nil {
+		return service
+	}
+	if service.Kind == contract.ServiceKindVertex && service.HTTP.Auth.Scheme == contract.AuthSchemeGoogleServiceAccount {
+		vertex := &contract.VertexConnection{ProjectID: vertexauth.ProjectID(secret), Location: contract.VertexLocation(service.HTTP.BaseURL)}
+		base, _ := url.Parse(service.HTTP.BaseURL)
+		if base != nil && vertex.Validate() == nil && strings.TrimRight(providerapi.BaseURL(service.Kind, contract.ProtocolGoogleGenerateContent, base).String(), "/") == vertex.BaseURL() {
+			connection := *service.HTTP
+			connection.Vertex, connection.BaseURL = vertex, vertex.BaseURL()
+			service.HTTP = &connection
+		}
 		return service
 	}
 	hint := credentialHint(secret)
@@ -806,8 +822,8 @@ func (handler *Handler) probeDraftServiceModels(writer http.ResponseWriter, requ
 	// discovery in the editor matches discovery after saving.
 	connection := contract.HTTPConnection{
 		BaseURL: httpInput.BaseURL, Auth: auth,
-		ModelListPath: httpInput.ModelListPath,
-		ExtraHeaders:  httpInput.ExtraHeaders, ModelRules: httpInput.ModelRules,
+		ModelListPath: httpInput.ModelListPath, Vertex: httpInput.Vertex,
+		ExtraHeaders: httpInput.ExtraHeaders, ModelRules: httpInput.ModelRules,
 		IdentityProfileID: httpInput.IdentityProfileID,
 	}
 	if err := contract.ValidateRequestRules(connection.ExtraHeaders, connection.ModelRules, auth); err != nil {
@@ -1183,8 +1199,8 @@ func decodeServiceHTTP(
 	}
 	connection = contract.HTTPConnection{
 		BaseURL: input.BaseURL, Auth: auth,
-		ModelListPath: input.ModelListPath,
-		ExtraHeaders:  input.ExtraHeaders, ModelRules: input.ModelRules,
+		ModelListPath: input.ModelListPath, Vertex: input.Vertex,
+		ExtraHeaders: input.ExtraHeaders, ModelRules: input.ModelRules,
 		IdentityProfileID: input.IdentityProfileID,
 	}
 	if input.Credential != nil {
@@ -1290,7 +1306,7 @@ func applyServicePatch(
 		}
 		for name := range fields {
 			switch name {
-			case "base_url", "auth", "credential", "model_list_path",
+			case "base_url", "auth", "credential", "model_list_path", "vertex",
 				"extra_headers", "model_rules", "identity_profile_id":
 			default:
 				return service, credential, fmt.Errorf("unknown http field %q", name)
@@ -1339,6 +1355,13 @@ func applyServicePatch(
 				return service, credential, err
 			}
 			service.HTTP.Auth = auth
+		}
+		if value, ok := fields["vertex"]; ok {
+			if isJSONNull(value) {
+				service.HTTP.Vertex = nil
+			} else if strictUnmarshal(value, &service.HTTP.Vertex) != nil {
+				return service, credential, fmt.Errorf("invalid vertex configuration")
+			}
 		}
 		if value, ok := fields["model_list_path"]; ok {
 			service.HTTP.ModelListPath = ""

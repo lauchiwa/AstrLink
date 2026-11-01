@@ -10,7 +10,7 @@ import (
 )
 
 // Look migrations up by name. The fork's profile step has already been
-// renumbered four times by upstream claiming its version, and index-based fixtures
+// renumbered five times by upstream claiming its version, and index-based fixtures
 // silently seeded a different migration each time that happened.
 func migrationNamed(t *testing.T, migrations []Migration, name string) Migration {
 	t.Helper()
@@ -48,6 +48,7 @@ const (
 	cursorStep     = "session_cursor_lookup_order"
 	tokenSyncStep  = "access_token_sync"
 	activityStep   = "request_output_activity"
+	installStep    = "install_defaults_biometric_subagent_links"
 )
 
 // legacyProfileVersionStep names the upstream step each fork fixture recorded
@@ -58,6 +59,49 @@ var legacyProfileVersionStep = map[string]string{
 	"fork_49": chunksStep,
 	"fork_50": configSyncStep,
 	"fork_53": cursorStep,
+	"fork_56": installStep,
+}
+
+// installEndStates counts the three end states upstream's
+// install_defaults_biometric_subagent_links leaves, the same ones the
+// reconciliation probes.
+func installEndStates(t *testing.T, database *sql.DB) int {
+	t.Helper()
+	present := 0
+	for _, query := range []string{
+		`SELECT COUNT(*) FROM pragma_table_info('request_records') WHERE name = 'parent_session_id'`,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'request_records_parent_session_idx'`,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'raw_key_envelopes' AND sql LIKE '%''biometric''%'`,
+	} {
+		var count int
+		if err := database.QueryRow(query).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count > 0 {
+			present++
+		}
+	}
+	return present
+}
+
+// installSchema is the schema SQL of what install_defaults_biometric_subagent_links
+// leaves behind, plus the privacy policy it rewrites, so a reconciled database
+// can be compared with a fresh one.
+func installSchema(t *testing.T, database *sql.DB) []string {
+	t.Helper()
+	var state []string
+	for _, name := range []string{"raw_key_envelopes", "request_records_parent_session_idx", "config_change_policies_update"} {
+		var schema string
+		if err := database.QueryRow(`SELECT sql FROM sqlite_master WHERE name = ?`, name).Scan(&schema); err != nil {
+			t.Fatalf("schema of %s: %v", name, err)
+		}
+		state = append(state, schema)
+	}
+	var policy string
+	if err := database.QueryRow(`SELECT document_json FROM policies WHERE id = 'policy_privacy_default'`).Scan(&policy); err != nil {
+		t.Fatalf("privacy policy: %v", err)
+	}
+	return append(state, policy)
 }
 
 // configSyncObjects are the 27 schema objects upstream's config_sync creates:
@@ -133,6 +177,17 @@ func countSchemaObjects(t *testing.T, database *sql.DB, objects []string) int {
 //	                   produced; must fail closed
 //	fork_53_successor  profiles at 53 followed by a later version; must fail
 //	                   closed
+//	upstream_install   upstream through 56, an upstream user switching over
+//	fork_56            fork profiles recorded at 56, upstream's fifth claim
+//	fork_56_applied    profiles at 56, upstream's 56 schema already present
+//	fork_56_partial_1  profiles at 56, only the parent_session_id column out of
+//	                   band; must fail closed
+//	fork_56_partial_2  profiles at 56, the column and its index out of band but
+//	                   not the biometric envelope table; must fail closed
+//	fork_56_successor  profiles at 56 followed by a later version; must fail
+//	                   closed
+//	fork_56_missing_table
+//	                   profiles recorded at 56 without their table
 //	unknown            an unrecognized fork step at 48; must fail closed
 //	unknown_50         an unrecognized fork step at 50; must fail closed
 //	fork_missing_table profiles recorded at 48 without their table
@@ -160,6 +215,7 @@ func identityHistoryDatabase(t *testing.T, kind string) *sql.DB {
 	standIns := migrationNamed(t, migrations, standInsStep)
 	cursor := migrationNamed(t, migrations, cursorStep)
 	tokenSync := migrationNamed(t, migrations, tokenSyncStep)
+	install := migrationNamed(t, migrations, installStep)
 	seed := migrationsBelow(t, migrations, timingStep)
 
 	// The legacy step keeps the fork's name and statements at the version
@@ -210,6 +266,17 @@ func identityHistoryDatabase(t *testing.T, kind string) *sql.DB {
 		seed = append(seed, timing, chunks, configSync, ignored, standIns, legacyAt(cursor.Version, false), Migration{Version: tokenSync.Version, Name: tokenSync.Name})
 	case "fork_53_missing_table":
 		seed = append(seed, timing, chunks, configSync, ignored, standIns, legacyAt(cursor.Version, true))
+	case "upstream_install":
+		seed = migrationsBelow(t, migrations, profilesStep)
+	case "fork_56", "fork_56_applied", "fork_56_partial_1", "fork_56_partial_2":
+		// The earlier reconciliations already handed 48 through 53 back, and
+		// the fork built 54 and 55 from upstream unchanged.
+		seed = append(migrationsBelow(t, migrations, installStep), legacyAt(install.Version, false))
+		seeded = true
+	case "fork_56_successor":
+		seed = append(migrationsBelow(t, migrations, installStep), legacyAt(install.Version, false), Migration{Version: install.Version + 1, Name: "unknown_later_schema"})
+	case "fork_56_missing_table":
+		seed = append(migrationsBelow(t, migrations, installStep), legacyAt(install.Version, true))
 	case "unknown":
 		seed = append(seed, Migration{Version: timing.Version, Name: "unknown_fork_schema"})
 	case "unknown_50":
@@ -276,6 +343,22 @@ func identityHistoryDatabase(t *testing.T, kind string) *sql.DB {
 				break
 			}
 		}
+	case "fork_56_applied":
+		for _, statement := range install.Statements {
+			if _, err := database.Exec(statement); err != nil {
+				t.Fatal(err)
+			}
+		}
+	case "fork_56_partial_1", "fork_56_partial_2":
+		statements := []string{`ALTER TABLE request_records ADD COLUMN parent_session_id TEXT`}
+		if kind == "fork_56_partial_2" {
+			statements = append(statements, `CREATE INDEX request_records_parent_session_idx ON request_records(parent_session_id) WHERE parent_session_id IS NOT NULL`)
+		}
+		for _, statement := range statements {
+			if _, err := database.Exec(statement); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 	return database
 }
@@ -286,7 +369,18 @@ func TestIdentityProfileHistoryConvergesWithoutLosingProfiles(t *testing.T) {
 		"upstream_sync", "upstream_stand_ins", "upstream_cursor",
 		"fork_48", "fork_48_applied", "fork_49", "fork_49_applied",
 		"fork_50", "fork_50_applied", "fork_53", "fork_53_applied",
+		"upstream_install", "fork_56", "fork_56_applied",
 	}
+	// A fresh install is the reference for upstream 56's end state.
+	freshDatabase := identityHistoryDatabase(t, "fresh")
+	freshRunner, err := New(SQLDatabase{DB: freshDatabase}, DefaultMigrations())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := freshRunner.Up(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	freshInstall := installSchema(t, freshDatabase)
 	for _, kind := range kinds {
 		t.Run(kind, func(t *testing.T) {
 			database := identityHistoryDatabase(t, kind)
@@ -311,7 +405,7 @@ func TestIdentityProfileHistoryConvergesWithoutLosingProfiles(t *testing.T) {
 			}
 			// Every claimed version ends up recorded under upstream's name,
 			// and the fork's step sits at its current version.
-			for _, step := range []string{timingStep, chunksStep, configSyncStep, ignoredStep, standInsStep, cursorStep, tokenSyncStep, activityStep, profilesStep} {
+			for _, step := range []string{timingStep, chunksStep, configSyncStep, ignoredStep, standInsStep, cursorStep, tokenSyncStep, activityStep, installStep, profilesStep} {
 				want := migrationNamed(t, migrations, step)
 				var name string
 				if err := database.QueryRow(`SELECT name FROM schema_migrations WHERE version = ?`, want.Version).Scan(&name); err != nil || name != want.Name {
@@ -347,6 +441,25 @@ func TestIdentityProfileHistoryConvergesWithoutLosingProfiles(t *testing.T) {
 			var activityColumns int
 			if err := database.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('request_records') WHERE name = 'output_json'`).Scan(&activityColumns); err != nil || activityColumns != 1 {
 				t.Fatalf("output activity columns = %d, %v", activityColumns, err)
+			}
+			// Upstream 56 ends exactly as on a fresh install: the column, the
+			// index, the widened envelope CHECK, the restored policy trigger,
+			// and the privacy policy it rewrites.
+			if got := installSchema(t, database); strings.Join(got, "\n") != strings.Join(freshInstall, "\n") {
+				t.Fatalf("install defaults end state = %q, want %q", got, freshInstall)
+			}
+			if _, err := database.Exec(`INSERT INTO raw_sealing_keys (id, public_key, pk_mac, created_at) VALUES (900, zeroblob(32), zeroblob(32), '2026-11-01')`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := database.Exec(`INSERT INTO raw_key_envelopes (key_id, kind, kdf_json, salt, nonce, wrapped, created_at) VALUES (900, 'biometric', '{}', zeroblob(16), zeroblob(12), x'00', '2026-11-01')`); err != nil {
+				t.Fatalf("biometric envelope rejected: %v", err)
+			}
+			if _, err := database.Exec(`UPDATE policies SET updated_at = updated_at WHERE id = 'policy_privacy_default'`); err != nil {
+				t.Fatal(err)
+			}
+			var policyChanges int
+			if err := database.QueryRow(`SELECT COUNT(*) FROM config_change_log WHERE entity_kind = 'policy' AND entity_id = 'policy_privacy_default'`).Scan(&policyChanges); err != nil || policyChanges == 0 {
+				t.Fatalf("policy change log rows = %d, %v", policyChanges, err)
 			}
 			if strings.HasPrefix(kind, "fork_") {
 				var document string
@@ -384,6 +497,12 @@ func TestIdentityProfileHistoryRejectsUnknownOrIncompleteSchema(t *testing.T) {
 		"fork_53_missing_table": {cursorStep, cursorStep},
 		"fork_53_partial":       {cursorStep, cursorStep},
 		"fork_53_successor":     {cursorStep, tokenSyncStep},
+		"fork_56_missing_table": {installStep, installStep},
+		"fork_56_partial_1":     {installStep, installStep},
+		"fork_56_partial_2":     {installStep, installStep},
+		// The later row sits at the profile step's current version under a name
+		// no build wrote; latest only names that version.
+		"fork_56_successor": {installStep, profilesStep},
 	}
 	for kind, want := range cases {
 		t.Run(kind, func(t *testing.T) {
@@ -400,6 +519,7 @@ func TestIdentityProfileHistoryRejectsUnknownOrIncompleteSchema(t *testing.T) {
 			}
 			objectsBefore := countConfigSyncObjects(t, database)
 			cursorObjectsBefore := countCursorLookupObjects(t, database)
+			installBefore := installEndStates(t, database)
 			runner, err := New(SQLDatabase{DB: database}, migrations)
 			if err != nil {
 				t.Fatal(err)
@@ -419,17 +539,21 @@ func TestIdentityProfileHistoryRejectsUnknownOrIncompleteSchema(t *testing.T) {
 			if objectsAfter := countCursorLookupObjects(t, database); objectsAfter != cursorObjectsBefore {
 				t.Fatalf("cursor lookup objects after rejection = %d, want %d", objectsAfter, cursorObjectsBefore)
 			}
+			if installAfter := installEndStates(t, database); installAfter != installBefore {
+				t.Fatalf("install defaults end states after rejection = %d, want %d", installAfter, installBefore)
+			}
 		})
 	}
 }
 
 func TestIdentityProfileHistoryReconciliationRollsBackWithLaterFailure(t *testing.T) {
-	for _, kind := range []string{"fork_48", "fork_49", "fork_50", "fork_53"} {
+	for _, kind := range []string{"fork_48", "fork_49", "fork_50", "fork_53", "fork_56"} {
 		t.Run(kind, func(t *testing.T) {
 			database := identityHistoryDatabase(t, kind)
 			migrations := DefaultMigrations()
 			objectsBefore := countConfigSyncObjects(t, database)
 			cursorObjectsBefore := countCursorLookupObjects(t, database)
+			installBefore := installEndStates(t, database)
 			for index := range migrations {
 				if migrations[index].Name == profilesStep {
 					migrations[index].Statements = append(
@@ -456,6 +580,9 @@ func TestIdentityProfileHistoryReconciliationRollsBackWithLaterFailure(t *testin
 			}
 			if objectsAfter := countCursorLookupObjects(t, database); objectsAfter != cursorObjectsBefore {
 				t.Fatalf("cursor lookup objects after rollback = %d, want %d", objectsAfter, cursorObjectsBefore)
+			}
+			if installAfter := installEndStates(t, database); installAfter != installBefore {
+				t.Fatalf("install defaults end states after rollback = %d, want %d", installAfter, installBefore)
 			}
 			var document string
 			if err := database.QueryRow(`SELECT document_json FROM service_identity_profiles WHERE id = 'identity_legacy'`).Scan(&document); err != nil || document != `{"preserve":"original profile"}` {

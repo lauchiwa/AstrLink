@@ -37,6 +37,7 @@ const (
 	ServiceKindOpenAI                  ServiceKind = "openai"
 	ServiceKindAnthropic               ServiceKind = "anthropic"
 	ServiceKindGemini                  ServiceKind = "gemini"
+	ServiceKindVertex                  ServiceKind = "vertex"
 	ServiceKindOpenAICompatible        ServiceKind = "openai_compatible"
 	ServiceKindDeepSeek                ServiceKind = "deepseek"
 	ServiceKindQwen                    ServiceKind = "qwen"
@@ -51,7 +52,7 @@ const (
 func (kind ServiceKind) Valid() bool {
 	switch kind {
 	case ServiceKindCodexSubscription, ServiceKindNewAPI, ServiceKindMagpie, ServiceKindOpenAI,
-		ServiceKindAnthropic, ServiceKindGemini, ServiceKindOpenAICompatible,
+		ServiceKindAnthropic, ServiceKindGemini, ServiceKindVertex, ServiceKindOpenAICompatible,
 		ServiceKindCustom, ServiceKindClaudeSubscription, ServiceKindGrokSubscription, ServiceKindAntigravitySubscription,
 		ServiceKindCopilotSubscription, ServiceKindDroidSubscription, ServiceKindOpenCodeGo,
 		ServiceKindOpenCodeZen, ServiceKindKimiCoding, ServiceKindGLMCoding, ServiceKindMiniMaxCoding,
@@ -94,10 +95,11 @@ func (kind ServiceKind) IsHTTP() bool {
 // HTTPConnection contains non-secret transport configuration for an HTTP API
 // service. Credential bytes remain in the dedicated local credential table.
 type HTTPConnection struct {
-	BaseURL       string      `json:"base_url"`
-	Auth          ServiceAuth `json:"auth"`
-	CredentialRef string      `json:"credential_ref,omitempty"`
-	ModelListPath string      `json:"model_list_path,omitempty"`
+	BaseURL       string            `json:"base_url"`
+	Auth          ServiceAuth       `json:"auth"`
+	CredentialRef string            `json:"credential_ref,omitempty"`
+	ModelListPath string            `json:"model_list_path,omitempty"`
+	Vertex        *VertexConnection `json:"vertex,omitempty"`
 	// ExtraHeaders applies to every model this service forwards, unless a
 	// ModelRules entry matches. A nil map keeps the current behavior; an empty
 	// map clears the configuration.
@@ -131,6 +133,14 @@ func ValidateModelListPath(path string) error {
 }
 
 func (connection HTTPConnection) Validate(serviceID ServiceID) error {
+	if connection.Vertex != nil {
+		if err := connection.Vertex.Validate(); err != nil {
+			return err
+		}
+		if connection.BaseURL != connection.Vertex.BaseURL() || connection.Auth.Scheme != AuthSchemeGoogleServiceAccount {
+			return fmt.Errorf("vertex requires its official regional base_url and service account authentication")
+		}
+	}
 	if err := connection.Auth.Validate(); err != nil {
 		return fmt.Errorf("auth: %w", err)
 	}
@@ -312,9 +322,9 @@ func (service Service) ModelProtocol(model string) ProtocolID {
 }
 
 // ResponsesWebSocket reports the effective per-channel transport setting.
-// The Copilot API and Factory's gateway serve Responses over HTTP only.
+// Copilot, Droid and Vertex do not expose native Responses WebSockets.
 func (service Service) ResponsesWebSocket() bool {
-	if service.Kind == ServiceKindCopilotSubscription || service.Kind == ServiceKindDroidSubscription {
+	if service.Kind == ServiceKindCopilotSubscription || service.Kind == ServiceKindDroidSubscription || service.Kind == ServiceKindVertex {
 		return false
 	}
 	if service.ResponsesWebSocketEnabled != nil {
@@ -349,6 +359,13 @@ func (service Service) Validate() error {
 		if err := service.HTTP.Validate(service.ID); err != nil {
 			return fmt.Errorf("http: %w", err)
 		}
+		if service.Kind == ServiceKindVertex {
+			if service.HTTP.Auth.Scheme != AuthSchemeGoogleServiceAccount && service.HTTP.Auth.Scheme != AuthSchemeGoogleAPIKey {
+				return fmt.Errorf("vertex requires a service account or Express API key")
+			}
+		} else if service.HTTP.Vertex != nil || service.HTTP.Auth.Scheme == AuthSchemeGoogleServiceAccount {
+			return fmt.Errorf("vertex configuration and service accounts require a vertex service")
+		}
 		if service.HTTP.ModelListPath != "" && service.Kind != ServiceKindCustom {
 			return fmt.Errorf("http: model_list_path is only supported for custom services")
 		}
@@ -375,6 +392,13 @@ func (service Service) Validate() error {
 	if err := ValidateModelProtocols(service.Kind, service.ModelProtocols); err != nil {
 		return err
 	}
+	if service.VertexExpress() {
+		for _, model := range service.ModelProtocols {
+			if model.Protocol != ProtocolGoogleGenerateContent {
+				return fmt.Errorf("Vertex Express only supports Gemini upstream models")
+			}
+		}
+	}
 	if service.Kind.IsSubscription() {
 		if err := service.Kind.SubscriptionProvider().ValidateCapabilities(service.Capabilities); err != nil {
 			return err
@@ -382,6 +406,26 @@ func (service Service) Validate() error {
 	}
 	seen := make(map[string]struct{}, len(service.Capabilities))
 	for index, capability := range service.Capabilities {
+		if service.Kind == ServiceKindVertex {
+			if service.VertexExpress() && capability.Protocol.IsModelFormat() {
+				upstream := capability.Protocol
+				if capability.ConvertTo != "" {
+					upstream = capability.ConvertTo
+				}
+				if upstream != ProtocolGoogleGenerateContent {
+					return fmt.Errorf("Vertex Express entries must use or convert to Gemini")
+				}
+			}
+			if capability.Protocol == ProtocolOpenAIResponses && capability.ConvertTo == "" {
+				return fmt.Errorf("Vertex Responses entry requires a conversion target")
+			}
+			if !capability.Protocol.IsModelFormat() && !capability.Protocol.IsModelDiscovery() {
+				return fmt.Errorf("vertex only supports chat and model discovery protocols")
+			}
+			if capability.ConvertTo != "" && !slices.Contains(service.Kind.ModelFormats(), capability.ConvertTo) {
+				return fmt.Errorf("unsupported Vertex upstream protocol")
+			}
+		}
 		if err := capability.Validate(); err != nil {
 			return fmt.Errorf("capabilities[%d]: %w", index, err)
 		}

@@ -4,6 +4,7 @@ import {
   compatibilityInput,
   type CompatibilityDraft,
 } from "./request-compatibility-model";
+import { KeyFileInput } from "./components/KeyFileInput";
 import { useWorkspaceSnapshot } from "./workspace-snapshots";
 import { ServiceProxyFields } from "./components/ServiceProxyFields";
 import {
@@ -26,6 +27,7 @@ import { ServiceOrderHelp } from "./ServiceOrderHelp";
 import { ServiceRiskBadge } from "./ServiceRiskBadge";
 import { ProtocolModeHelp } from "./ProtocolModeHelp";
 import { ServiceEditorTour } from "./ServiceEditorTour";
+import { HelpPopover } from "./components/HelpPopover";
 import { OrderedList } from "./components/OrderedList";
 import { ClientTypeIcons } from "./components/ClientTypeIcon";
 import { useGatewayResponseTimeout } from "./use-gateway-response-timeout";
@@ -163,6 +165,7 @@ import {
   serviceAuthLabels,
   serviceSiteForBaseURL,
   supportsLocalConversion,
+  vertexExpressCapabilities,
   type HTTPServicePresetID,
   type ProtocolDescriptor,
   type ServiceSiteID,
@@ -177,6 +180,10 @@ import {
 } from "./ServiceModelsEditor";
 import {
   activeServiceRisk,
+  validVertexConnection,
+  vertexBaseURL,
+  vertexLocation,
+  serviceAccountSummary,
   responsesWebSocketEnabled,
   serviceBuiltinRedirects,
   withClaudeCodeRedirects,
@@ -288,6 +295,9 @@ type Draft = {
   capabilities: ServiceCapability[];
   authorizationFlow: AuthorizationFlow | null;
   modelListPath: string;
+  vertexProjectID: string;
+  vertexLocation: string;
+  vertexImplicitProject: boolean;
 };
 
 type ConfirmAction =
@@ -573,6 +583,8 @@ type ModelPreview = {
 };
 
 function modelDiscoveryProtocols(draft: Draft): ModelDiscoveryProtocol[] {
+  if (draft.kind === "vertex")
+    return draft.authScheme === "google_api_key" ? [] : ["openai.models"];
   if (isSubscriptionKind(draft.kind)) return ["openai.models"];
   return (["openai.models", "google.models"] as const).filter((protocol) =>
     draft.capabilities.some((capability) => capability.protocol === protocol),
@@ -586,6 +598,10 @@ function modelDiscoveryKey(draft: Draft): string {
     draft.baseURL.trim(),
     authForDraft(draft),
     draft.secret,
+    draft.removeCredential,
+    draft.proxy,
+    draft.modelListPath,
+    vertexForDraft(draft),
     draft.compatibility,
     modelDiscoveryProtocols(draft),
   ]);
@@ -618,6 +634,9 @@ function draftForKind(
       })),
       authorizationFlow: defaultAuthorizationFlow(kind),
       modelListPath: "",
+      vertexProjectID: "",
+      vertexLocation: "global",
+      vertexImplicitProject: false,
     };
   }
   const preset = httpServicePreset(
@@ -644,6 +663,9 @@ function draftForKind(
     capabilities: preset.capabilities.map((capability) => ({ ...capability })),
     authorizationFlow: null,
     modelListPath: "",
+    vertexProjectID: "",
+    vertexLocation: "global",
+    vertexImplicitProject: false,
   };
 }
 
@@ -697,6 +719,13 @@ function draftFromRecord(record: ServiceRecord): Draft {
       wireCapability(capability),
     ),
     modelListPath: service.http.model_list_path ?? "",
+    vertexProjectID: service.http.vertex?.project_id ?? "",
+    vertexLocation:
+      service.http.vertex?.location ?? vertexLocation(service.http.base_url),
+    vertexImplicitProject:
+      service.kind === "vertex" &&
+      service.http.auth.scheme === "google_service_account" &&
+      !service.http.vertex,
   };
 }
 
@@ -762,10 +791,57 @@ function authForDraft(draft: Draft) {
     : { scheme: draft.authScheme };
 }
 
+function vertexForDraft(draft: Draft) {
+  return draft.kind === "vertex" &&
+    draft.authScheme === "google_service_account" &&
+    !draft.vertexImplicitProject
+    ? {
+        vertex: {
+          project_id: draft.vertexProjectID.trim(),
+          location: draft.vertexLocation.trim(),
+        },
+      }
+    : {};
+}
+
+function vertexDraftIssue(draft: Draft): string | null {
+  if (draft.kind !== "vertex") return null;
+  if (draft.authScheme === "google_api_key") {
+    return draft.secret.trim().startsWith("{")
+      ? i18n.t("services.vertexUseServiceAccount")
+      : null;
+  }
+  if (
+    !draft.vertexImplicitProject &&
+    !validVertexConnection(vertexForDraft(draft).vertex!)
+  )
+    return i18n.t("services.vertexInvalidConfig");
+  if (draft.secret.trim()) {
+    try {
+      const json = JSON.parse(draft.secret);
+      if (
+        json?.type !== "service_account" ||
+        typeof json.project_id !== "string" ||
+        !json.project_id ||
+        typeof json.client_email !== "string" ||
+        !json.client_email ||
+        typeof json.private_key !== "string" ||
+        !json.private_key
+      )
+        return i18n.t("services.vertexInvalidCredential");
+    } catch {
+      return i18n.t("services.vertexInvalidCredential");
+    }
+  }
+  return null;
+}
+
 function validateDraft(
   draft: Draft,
   editing: ServiceRecord | null,
 ): string | null {
+  const vertexIssue = vertexDraftIssue(draft);
+  if (vertexIssue) return vertexIssue;
   if (!validProxyDraft(draft.proxy)) return i18n.t("serviceProxy.invalid");
   if (draft.name.trim().length === 0 || [...draft.name.trim()].length > 128) {
     return i18n.t("services.nameInvalid");
@@ -808,13 +884,20 @@ function validateDraft(
   if (draft.authScheme === "custom_header" && draft.headerName.trim() === "") {
     return i18n.t("services.headerRequired");
   }
-  const hasStoredCredential = Boolean(editing?.service.http?.credential_ref);
+  const hasStoredCredential = Boolean(
+    editing?.service.http?.credential_ref &&
+      editing.service.http.auth.scheme === draft.authScheme,
+  );
   if (
     draft.authScheme !== "none" &&
     draft.secret.trim() === "" &&
     !hasStoredCredential
   ) {
-    return i18n.t("services.keyRequired");
+    return i18n.t(
+      draft.kind === "vertex"
+        ? "services.vertexInvalidCredential"
+        : "services.keyRequired",
+    );
   }
   if (draft.capabilities.length === 0) {
     return i18n.t("services.capabilityRequired");
@@ -1129,6 +1212,8 @@ export function ServiceManager({
   const [probingModels, setProbingModels] = useState(false);
   const [modelPreview, setModelPreview] = useState<ModelPreview | null>(null);
   const [modelPreviewQuery, setModelPreviewQuery] = useState("");
+  const currentDiscoveryKey = useRef("");
+  currentDiscoveryKey.current = modelDiscoveryKey(draft);
   const [upstreamModels, setUpstreamModels] = useState<{
     key: string;
     snapshot: UpstreamModelSnapshot;
@@ -1612,6 +1697,24 @@ export function ServiceManager({
   };
 
   const discoverModels = async () => {
+    const key = currentDiscoveryKey.current;
+    const generation = loadGeneration.current;
+    const isCurrent = () =>
+      currentDiscoveryKey.current === key &&
+      loadGeneration.current === generation;
+    const vertexIssue = vertexDraftIssue(draft);
+    if (vertexIssue) {
+      setError(vertexIssue);
+      return;
+    }
+    if (
+      draft.kind === "vertex" &&
+      draft.removeCredential &&
+      !draft.secret.trim()
+    ) {
+      setError(t("services.vertexInvalidCredential"));
+      return;
+    }
     if (isSubscriptionKind(draft.kind) && !editing) {
       setError(t("services.saveBeforeFetch"));
       return;
@@ -1630,6 +1733,7 @@ export function ServiceManager({
           kind: draft.kind,
           http: {
             base_url: draft.baseURL.trim(),
+            ...vertexForDraft(draft),
             auth: authForDraft(draft),
             ...(draft.secret.trim()
               ? { credential: { secret: draft.secret } }
@@ -1637,6 +1741,7 @@ export function ServiceManager({
             model_list_path: draft.modelListPath.trim(),
           },
         });
+        if (!isCurrent()) return;
         const models = [
           ...new Set([...draft.models, ...result.model_ids]),
         ].sort();
@@ -1652,6 +1757,7 @@ export function ServiceManager({
           warnings: result.warnings ?? [],
         });
       } catch (cause) {
+        if (!isCurrent()) return;
         setError(
           t("services.fetchFailedDetail", {
             warnings: errorMessage(cause, t("services.fetchFailed")),
@@ -1691,6 +1797,7 @@ export function ServiceManager({
             kind: draft.kind as HTTPServiceKind,
             http: {
               base_url: draft.baseURL.trim(),
+              ...vertexForDraft(draft),
               auth: authForDraft(draft),
               ...compatibility,
               ...(draft.secret.trim()
@@ -1701,6 +1808,7 @@ export function ServiceManager({
           });
         }),
       );
+      if (!isCurrent()) return;
       const discovered: string[] = [];
       const discoveredProtocols: ModelProtocol[] = [];
       const warnings: string[] = [];
@@ -1824,6 +1932,10 @@ export function ServiceManager({
         if (!isSubscriptionKind(draft.kind)) {
           patch.http = {
             base_url: draft.baseURL.trim(),
+            ...vertexForDraft(draft),
+            ...(draft.kind === "vertex" && draft.authScheme === "google_api_key"
+              ? { vertex: null }
+              : {}),
             auth: authForDraft(draft),
             ...compatibilityInput(
               draft.compatibility,
@@ -1890,6 +2002,7 @@ export function ServiceManager({
               : {}),
             http: {
               base_url: draft.baseURL.trim(),
+              ...vertexForDraft(draft),
               auth: authForDraft(draft),
               ...compatibilityInput(draft.compatibility, authForDraft(draft)),
               ...(draft.secret.trim()
@@ -3165,7 +3278,16 @@ export function ServiceManager({
   }
 
   const editingKind = editing?.service.kind;
-  const canKeepCredential = Boolean(editing?.service.http?.credential_ref);
+  const canKeepCredential = Boolean(
+    editing?.service.http?.credential_ref &&
+      editing.service.http.auth.scheme === draft.authScheme,
+  );
+  const vertexExpress =
+    draft.kind === "vertex" && draft.authScheme === "google_api_key";
+  const loadedVertexKey =
+    draft.kind === "vertex" && !vertexExpress
+      ? serviceAccountSummary(draft.secret)
+      : null;
   const savedKeyHint = editing?.service.http?.credential_hint;
   const selectedPreset = isSubscriptionKind(draft.kind)
     ? null
@@ -3198,48 +3320,51 @@ export function ServiceManager({
     />
   );
   const modelsEditor = (
-    <ServiceModelsEditor
-      key={editingServiceID ?? "create"}
-      builtinProtocol={(model) =>
-        serviceBuiltinModelProtocol(draft.kind, model)
-      }
-      formats={serviceModelFormats(draft.kind)}
-      modelEditor={modelEditor}
-      modelProtocols={draft.modelProtocols}
-      models={draft.models}
-      probingModels={probingModels}
-      onAddModels={addModels}
-      onClearModels={() =>
-        setDraft((current) => ({
-          ...current,
-          models: [],
-          modelProtocols: [],
-        }))
-      }
-      onDiscoverModels={
-        modelDiscoveryProtocols(draft).length > 0 ||
-        (draft.kind === "custom" && draft.modelListPath.trim() !== "")
-          ? () => void discoverModels()
-          : undefined
-      }
-      onModelEditorChange={setModelEditor}
-      onModelProtocolsChange={(models, protocol) =>
-        setDraft((current) => ({
-          ...current,
-          modelProtocols: withModelProtocols(
-            current.modelProtocols,
-            models,
-            protocol,
-          ),
-        }))
-      }
-      onRemoveModels={removeDraftModels}
-      upstream={
-        upstreamModels?.key === modelDiscoveryKey(draft)
-          ? upstreamModels.snapshot
-          : null
-      }
-    />
+    <>
+      <ServiceModelsEditor
+        key={editingServiceID ?? "create"}
+        compact={draft.kind === "vertex"}
+        builtinProtocol={(model) =>
+          serviceBuiltinModelProtocol(draft.kind, model)
+        }
+        formats={serviceModelFormats(draft.kind, draft.authScheme)}
+        modelEditor={modelEditor}
+        modelProtocols={draft.modelProtocols}
+        models={draft.models}
+        probingModels={probingModels}
+        onAddModels={addModels}
+        onClearModels={() =>
+          setDraft((current) => ({
+            ...current,
+            models: [],
+            modelProtocols: [],
+          }))
+        }
+        onDiscoverModels={
+          modelDiscoveryProtocols(draft).length > 0 ||
+          (draft.kind === "custom" && draft.modelListPath.trim() !== "")
+            ? () => void discoverModels()
+            : undefined
+        }
+        onModelEditorChange={setModelEditor}
+        onModelProtocolsChange={(models, protocol) =>
+          setDraft((current) => ({
+            ...current,
+            modelProtocols: withModelProtocols(
+              current.modelProtocols,
+              models,
+              protocol,
+            ),
+          }))
+        }
+        onRemoveModels={removeDraftModels}
+        upstream={
+          upstreamModels?.key === modelDiscoveryKey(draft)
+            ? upstreamModels.snapshot
+            : null
+        }
+      />
+    </>
   );
   // Subscriptions keep their native protocols fixed; any other entry protocol
   // must convert into one of the provider's egress formats.
@@ -3249,13 +3374,17 @@ export function ServiceManager({
       ? subscriptionNativeCapabilities[subscriptionKind].map(
           ({ protocol }) => protocol,
         )
-      : [],
+      : vertexExpress
+        ? ["google.generate_content"]
+        : [],
   );
   const egressTargets = subscriptionKind
     ? subscriptionConversionTargets[subscriptionKind]
-    : null;
+    : vertexExpress
+      ? ["google.generate_content"]
+      : null;
   // Every OpenCode model has an upstream format. Its chat entry rows decide
-  // which clients get in, and the model's format decides what OpenCode gets.
+  // which clients get in, and the model decides the upstream format.
   const formatRoutedKind =
     draft.kind === "opencode_go" || draft.kind === "opencode_zen";
   // Re-enabling a protocol the preset's upstream serves natively passes it through.
@@ -3268,7 +3397,14 @@ export function ServiceManager({
     ? descriptors.filter(
         ({ id }) => nativeProtocols.has(id) || supportsLocalConversion(id),
       )
-    : descriptors;
+    : draft.kind === "vertex"
+      ? descriptors.filter(
+          ({ id }) =>
+            supportsLocalConversion(id) ||
+            id === "openai.models" ||
+            id === "google.models",
+        )
+      : descriptors;
   const protocolEditor = (
     <Panel asChild>
       <section aria-labelledby="service-capabilities-heading">
@@ -3313,14 +3449,30 @@ export function ServiceManager({
             const targets = convertible
               ? localConversionTargets(descriptor.id, conversionEngine).filter(
                   (target) =>
-                    egressTargets === null || egressTargets.includes(target.id),
+                    (egressTargets === null ||
+                      egressTargets.includes(target.id)) &&
+                    (draft.kind !== "vertex" ||
+                      serviceModelFormats("vertex", draft.authScheme).some(
+                        (format) => format === target.id,
+                      )),
                 )
               : [];
             const selected = targets.find(
               (target) => target.id === capability?.convert_to,
             );
-            const defaultTarget = egressTargets
-              ? targets.find((target) => target.enabled)?.id
+            const passthroughAllowed =
+              egressTargets === null &&
+              !(
+                draft.kind === "vertex" && descriptor.id === "openai.responses"
+              );
+            const defaultTarget = !passthroughAllowed
+              ? ((draft.kind === "vertex"
+                  ? targets.find(
+                      (target) =>
+                        target.id === "google.generate_content" &&
+                        target.enabled,
+                    )?.id
+                  : undefined) ?? targets.find((target) => target.enabled)?.id)
               : followsModelFormat || presetUpstreamProtocols.has(descriptor.id)
                 ? undefined
                 : bestConversionTarget(
@@ -3331,8 +3483,7 @@ export function ServiceManager({
                     conversionEngine,
                   );
             const locked =
-              native ||
-              (egressTargets !== null && !capability && !defaultTarget);
+              native || (!passthroughAllowed && !capability && !defaultTarget);
             return (
               <DataRow
                 className="grid grid-cols-1 gap-3 py-3 @[640px]:grid-cols-[minmax(0,1fr)_232px]"
@@ -3403,11 +3554,11 @@ export function ServiceManager({
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
-                      {egressTargets ? null : (
+                      {passthroughAllowed ? (
                         <SelectItem value={localConversionPassthrough}>
                           {t("services.passthrough")}
                         </SelectItem>
-                      )}
+                      ) : null}
                       {targets.map((target) => (
                         <SelectItem
                           disabled={!target.enabled}
@@ -3669,7 +3820,104 @@ export function ServiceManager({
             </>
           ) : (
             <>
-              {presetSites.length > 0 ? (
+              {draft.kind === "vertex" ? (
+                <>
+                  <Field
+                    group
+                    label={t("services.authScheme")}
+                    hint={
+                      vertexExpress
+                        ? t("services.vertexExpressHint")
+                        : undefined
+                    }
+                  >
+                    <SegmentedControl<ServiceAuthScheme>
+                      label={t("services.authScheme")}
+                      value={draft.authScheme}
+                      options={[
+                        {
+                          value: "google_service_account",
+                          label: t("services.vertexServiceAccount"),
+                        },
+                        { value: "google_api_key", label: "Express API Key" },
+                      ]}
+                      onValueChange={(authScheme) =>
+                        setDraft((current) => ({
+                          ...current,
+                          authScheme,
+                          vertexImplicitProject: false,
+                          secret: "",
+                          removeCredential: false,
+                          baseURL: vertexBaseURL(
+                            authScheme === "google_api_key"
+                              ? "global"
+                              : current.vertexLocation,
+                          ),
+                          capabilities:
+                            authScheme === "google_api_key"
+                              ? vertexExpressCapabilities(conversionEngine)
+                              : httpServicePreset(
+                                  "vertex",
+                                  protocols,
+                                  conversionEngine,
+                                ).capabilities,
+                          modelProtocols:
+                            authScheme === "google_api_key"
+                              ? current.modelProtocols.filter(
+                                  (entry) =>
+                                    entry.protocol ===
+                                    "google.generate_content",
+                                )
+                              : current.modelProtocols,
+                        }))
+                      }
+                    />
+                  </Field>
+                  {!vertexExpress ? (
+                    draft.vertexImplicitProject ? (
+                      <Field label={t("services.apiAddress")}>
+                        {baseURLInput}
+                      </Field>
+                    ) : (
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <Field label={t("services.vertexProject")}>
+                          <Input
+                            aria-label={t("services.vertexProject")}
+                            maxLength={254}
+                            value={draft.vertexProjectID}
+                            onChange={(event) =>
+                              setDraft((current) => ({
+                                ...current,
+                                vertexProjectID: event.target.value,
+                              }))
+                            }
+                          />
+                        </Field>
+                        <Field
+                          label={t("services.vertexLocation")}
+                          hint={t("services.vertexLocationHint")}
+                        >
+                          <Input
+                            aria-label={t("services.vertexLocation")}
+                            maxLength={64}
+                            value={draft.vertexLocation}
+                            placeholder="global"
+                            onChange={(event) =>
+                              setDraft((current) => ({
+                                ...current,
+                                vertexLocation: event.target.value,
+                                baseURL: vertexBaseURL(
+                                  event.target.value.trim(),
+                                ),
+                              }))
+                            }
+                          />
+                        </Field>
+                      </div>
+                    )
+                  ) : null}
+                </>
+              ) : presetSites.length > 0 ? (
                 <Field
                   group
                   label={t("services.apiAddress")}
@@ -3721,13 +3969,15 @@ export function ServiceManager({
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
-                        {Object.entries(serviceAuthLabels).map(
-                          ([scheme, label]) => (
+                        {Object.entries(serviceAuthLabels)
+                          .filter(
+                            ([scheme]) => scheme !== "google_service_account",
+                          )
+                          .map(([scheme, label]) => (
                             <SelectItem key={scheme} value={scheme}>
                               {label}
                             </SelectItem>
-                          ),
-                        )}
+                          ))}
                       </SelectContent>
                     </Select>
                   </Field>
@@ -3748,7 +3998,65 @@ export function ServiceManager({
                   ) : null}
                 </>
               ) : null}
-              {draft.authScheme !== "none" ? (
+              {draft.kind === "vertex" && !vertexExpress ? (
+                <Field
+                  group
+                  label={t("services.vertexCredential")}
+                  hint={
+                    canKeepCredential
+                      ? t("services.vertexCredentialKeep")
+                      : t("services.vertexCredentialHint")
+                  }
+                >
+                  <KeyFileInput
+                    label={t("services.vertexCredential")}
+                    accept=".json,application/json"
+                    chooseLabel={t("services.keyFileChoose")}
+                    replaceLabel={t("services.keyFileReplace")}
+                    loaded={
+                      loadedVertexKey ? (
+                        <div className="grid min-w-0 gap-0.5">
+                          <span className="truncate">
+                            {loadedVertexKey.email}
+                          </span>
+                          <span className="text-xs text-muted-foreground">
+                            {t("services.vertexKeyProject", {
+                              project: loadedVertexKey.project,
+                            })}
+                          </span>
+                        </div>
+                      ) : null
+                    }
+                    saved={
+                      canKeepCredential && !draft.removeCredential
+                        ? t("services.vertexCredentialSaved")
+                        : null
+                    }
+                    maxLength={16_384}
+                    value={draft.secret}
+                    placeholder={
+                      canKeepCredential
+                        ? t("services.vertexCredentialKeep")
+                        : t("services.vertexCredential")
+                    }
+                    onChange={(secret) => {
+                      let project = "";
+                      try {
+                        const account = JSON.parse(secret);
+                        if (typeof account?.project_id === "string")
+                          project = account.project_id;
+                      } catch {
+                        /* Incomplete pasted JSON is validated on save. */
+                      }
+                      setDraft((current) => ({
+                        ...current,
+                        secret,
+                        vertexProjectID: current.vertexProjectID || project,
+                      }));
+                    }}
+                  />
+                </Field>
+              ) : draft.authScheme !== "none" ? (
                 <Field
                   label={
                     editingKind
@@ -3799,7 +4107,14 @@ export function ServiceManager({
                       }))
                     }
                   />
-                  <span>{t("services.removeStoredKey")}</span>
+                  <span>
+                    {t(
+                      editing?.service.http?.auth.scheme ===
+                        "google_service_account"
+                        ? "services.vertexRemoveCredential"
+                        : "services.removeStoredKey",
+                    )}
+                  </span>
                 </Label>
               ) : null}
             </>
@@ -3872,6 +4187,7 @@ export function ServiceManager({
         title={view.kind === "edit" ? t("services.edit") : t("services.add")}
         titleId="service-editor-heading"
         variant="compact"
+        className="[@media(max-height:680px)]:mb-1"
       />
       {riskConfirm}
       {!isReady ? (
@@ -4003,6 +4319,19 @@ export function ServiceManager({
                     {t("failure.title")}
                   </TabsTrigger>
                 </TabsList>
+                {draft.kind === "vertex" && editorTab === "models" ? (
+                  <HelpPopover label={t("services.vertexModelsHelp")}>
+                    <p>{t("models.hint")}</p>
+                    <p className="mt-2">
+                      {t(
+                        vertexExpress
+                          ? "services.vertexExpressHint"
+                          : "services.vertexCatalogHint",
+                      )}
+                    </p>
+                    <p className="mt-2">{t("models.formatHint")}</p>
+                  </HelpPopover>
+                ) : null}
                 <ServiceEditorTour
                   modelCount={draft.models.length}
                   protocols={draft.capabilities.map(
@@ -4124,7 +4453,7 @@ export function ServiceManager({
               </TabsContent>
             </Tabs>
           </fieldset>
-          <div className="mt-3 flex shrink-0 items-center justify-between gap-3 border-t pt-3 pb-1">
+          <div className="mt-3 flex shrink-0 items-center justify-between gap-3 border-t pt-3 pb-1 [@media(max-height:680px)]:mt-2 [@media(max-height:680px)]:pt-2">
             <span className="text-xs text-muted-foreground">
               {dirty ? t("services.unsavedChanges") : t("services.saveHint")}
             </span>

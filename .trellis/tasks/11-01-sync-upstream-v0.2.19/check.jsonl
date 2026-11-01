@@ -1,0 +1,4 @@
+{"file": "AGENTS.md", "reason": "Quality gates, upstream forwarding identity, migration rules"}
+{"file": ".trellis/spec/guides/upstream-sync-thinking-guide.md", "reason": "Preserve upstream logic, indirection bypass checks, migration collision reconciliation, environment blockers"}
+{"file": ".trellis/spec/guides/version-naming-guide.md", "reason": "Preview default channel and fork release versioning"}
+{"file": ".trellis/tasks/11-01-sync-upstream-v0.2.19/research/conflicts.md", "reason": "Per-file conflict resolutions, migration v56 collision, Vertex rule decision, post-merge check results"}

@@ -108,6 +108,7 @@ function rawSealing(overrides: Partial<RawSealingState> = {}): RawSealingState {
     password_min_length: 8,
     password_max_length: 128,
     key_replaced: false,
+    biometric_available: false,
     ...overrides,
   };
 }
@@ -242,7 +243,7 @@ function sessionFromRecord(
   record: RequestRecord,
   overrides: Partial<RequestSession> = {},
 ): RequestSession {
-  return {
+  const session: RequestSession = {
     id: record.session_id ?? record.id,
     title: record.input_preview ?? record.requested_model ?? "",
     started_at: record.started_at,
@@ -253,6 +254,7 @@ function sessionFromRecord(
       (record.completed_at
         ? Date.parse(record.completed_at) - Date.parse(record.started_at)
         : 0),
+    running_since: null,
     active_request_starts:
       record.status === "pending" &&
       record.latency_ms === null &&
@@ -268,6 +270,15 @@ function sessionFromRecord(
     local_access_token_id: record.local_access_token_id,
     ...overrides,
   };
+  // The client adds the time since the one merged running block, so fixtures
+  // that only name the starts begin it at the earliest one.
+  if (
+    session.active_request_starts.length > 0 &&
+    session.running_since === null
+  ) {
+    session.running_since = session.active_request_starts[0]!;
+  }
+  return session;
 }
 
 function sessionDetail(record: RequestRecord) {
@@ -914,6 +925,7 @@ describe("RequestRecords", () => {
           status: "succeeded",
           completed_at: "2026-07-28T12:00:11Z",
           duration_ms: 23_000,
+          running_since: null,
           active_request_starts: [],
         },
       ],
@@ -976,7 +988,12 @@ describe("RequestRecords", () => {
       board
         .querySelector('[data-testid="activity-clients"]')
         ?.getAttribute("aria-label"),
-    ).toBe("Codex 1 个、Claude Code 1 个");
+    ).toBe(
+      new Intl.ListFormat("zh-CN", { style: "narrow" }).format([
+        "Codex 1 个",
+        "Claude Code 1 个",
+      ]),
+    );
     // The list below holds none of these; the board does not follow it.
     expect(
       container.querySelector('[data-testid="active-sessions"]'),
@@ -4126,6 +4143,7 @@ describe("RequestRecords", () => {
       id: "token_01",
       name: "VS Code",
       hint: "astr_…K8Q2",
+      source: "user" as const,
       created_at: "2026-07-24T10:30:00Z",
     };
     await act(async () => {
@@ -4251,6 +4269,7 @@ describe("RequestRecords", () => {
               id: "token_01",
               name: "VS Code",
               hint: "astr_…K8Q2",
+              source: "user",
               created_at: "2026-07-24T10:30:00Z",
             },
           ]}
@@ -4314,6 +4333,7 @@ describe("RequestRecords", () => {
               id: "token_01",
               name: "VS Code",
               hint: "astr_…K8Q2",
+              source: "user",
               created_at: "2026-07-24T10:30:00Z",
             },
           ]}
@@ -4361,12 +4381,14 @@ describe("RequestRecords", () => {
               id: "token_01",
               name: "VS Code",
               hint: "astr_…K8Q2",
+              source: "user",
               created_at: "2026-07-24T10:30:00Z",
             },
             {
               id: "token_02",
               name: "Terminal",
               hint: "astr_…H5Z8",
+              source: "user",
               created_at: "2026-07-24T10:30:00Z",
             },
           ]}
@@ -5524,6 +5546,65 @@ describe("RequestRecords", () => {
     expect(notifyMocks.success).toHaveBeenCalledWith("原文已锁定");
     expect(bridgeMocks.getRequestAuditContent).toHaveBeenCalledTimes(3);
     expect(container.querySelector('[data-slot="raw-unlocked"]')).toBeNull();
+  });
+
+  it("points a part dropped for lack of a raw password at the setup", async () => {
+    bridgeMocks.getRequestAuditContent.mockResolvedValue({
+      request_id: firstRecord.id,
+      http_meta: null,
+      request_body: null,
+      response_content: null,
+      upstream_http_meta: null,
+      upstream_request_body: null,
+      upstream_response_content: null,
+      withheld: {
+        request_body: {
+          reason: "raw_not_kept",
+          raw_available: false,
+          media_type: "application/json",
+          truncated: false,
+          captured_bytes: 2048,
+        },
+      },
+    });
+    // A legacy install: capture is on, and no password was ever set.
+    bridgeMocks.getRawSealingStatus.mockResolvedValue(
+      rawSealing({
+        raw_available: false,
+        configured: false,
+        password_set: false,
+        envelopes: [],
+      }),
+    );
+    await renderRecords();
+    await act(async () => {
+      (
+        container.querySelector(
+          `[data-session-id="${firstRecord.id}"]`,
+        ) as HTMLButtonElement
+      ).click();
+    });
+    await flush();
+    await act(async () => exactButton("内容").click());
+    await flush(1);
+
+    expect(
+      container.querySelector('[data-slot="audit-part-withheld"]')?.textContent,
+    ).toContain("未保存");
+    const hint = container.querySelector<HTMLElement>(
+      '[data-slot="raw-not-kept"]',
+    );
+    expect(hint?.textContent).toContain(
+      "设置原文保护后，新请求的原文会加密保存。",
+    );
+    // Nothing opens until asked: the content stays readable meanwhile.
+    expect(proofDialog()).toBeNull();
+
+    await act(async () => exactButton("开始设置", hint!).click());
+    await flush();
+    expect(proofDialog()?.textContent).toContain("保护请求原文");
+    expect(exactButton("取消", proofDialog()!)).toBeTruthy();
+    expect(bridgeMocks.setRawPassword).not.toHaveBeenCalled();
   });
 
   it("never caches unlocked raw parts and drops them when the unlock ends", async () => {

@@ -10,15 +10,16 @@ import (
 )
 
 // The fork shipped identity profiles before upstream assigned the same versions
-// to its own steps, four times: 48 went to answer timing, 49 to privacy token
-// kinds and audit chunks, 50 to config sync, and 53 to session cursor lookup
-// order. Profiles therefore moved 48 -> 49 -> 50 -> 53 -> 56.
+// to its own steps, five times: 48 went to answer timing, 49 to privacy token
+// kinds and audit chunks, 50 to config sync, 53 to session cursor lookup order,
+// and 56 to install defaults, biometric envelopes, and subagent links. Profiles
+// therefore moved 48 -> 49 -> 50 -> 53 -> 56 -> 57.
 //
 // A database carrying any earlier numbering records a name this Core no longer
 // expects at that version, which verifyHistory would reject. Reconcile only
-// these four known collisions, in Up's existing transaction: apply the
+// these five known collisions, in Up's existing transaction: apply the
 // upstream schema that version is now supposed to carry, then rename the
-// recorded name. Version 56 afterwards adopts the existing profile table
+// recorded name. Version 57 afterwards adopts the existing profile table
 // without changing any profile row. All other history mismatches still fail
 // closed.
 func (runner *Runner) reconcileIdentityProfileHistory(ctx context.Context, transaction Transaction) error {
@@ -35,17 +36,19 @@ func (runner *Runner) reconcileIdentityProfileHistory(ctx context.Context, trans
 			claimed[50] = migration
 		case migration.Version == 53 && migration.Name == "session_cursor_lookup_order":
 			claimed[53] = migration
-		case migration.Version == 56 && migration.Name == "service_identity_profiles":
+		case migration.Version == 56 && migration.Name == "install_defaults_biometric_subagent_links":
+			claimed[56] = migration
+		case migration.Version == 57 && migration.Name == "service_identity_profiles":
 			profiles = true
 		}
 	}
 	if !profiles {
 		return nil
 	}
-	// Ascending: a database at 49, 50, or 53 was reconciled through the lower
-	// versions first, so each must hold its upstream schema before the next
-	// one is touched.
-	for _, version := range []int64{48, 49, 50, 53} {
+	// Ascending: a database at 49, 50, 53, or 56 was reconciled through the
+	// lower versions first, so each must hold its upstream schema before the
+	// next one is touched.
+	for _, version := range []int64{48, 49, 50, 53, 56} {
 		upstream := claimed[version]
 		if upstream == nil {
 			continue
@@ -136,6 +139,8 @@ func (runner *Runner) claimedVersionApplied(
 		// whether the step ran; a replay over a half-altered table would still
 		// fail on the first duplicate column rather than succeed silently.
 		return createdObjectsApplied(ctx, transaction, upstream, []string{"ALTER TABLE ", "UPDATE ", "DROP INDEX "})
+	case 56:
+		return installDefaultsApplied(ctx, transaction, upstream)
 	case 48:
 		query = `SELECT COUNT(*) FROM pragma_table_info('request_records') WHERE name = 'first_answer_ms'`
 	case 49:
@@ -148,6 +153,38 @@ func (runner *Runner) claimedVersionApplied(
 		return false, fmt.Errorf("check reclaimed schema for version %d: %w", version, err)
 	}
 	return present > 0, nil
+}
+
+// installDefaultsApplied probes install_defaults_biometric_subagent_links by
+// the three end states it leaves. Its statements cannot be probed by name: the
+// policy trigger exists before and after the step, raw_key_envelopes_new is
+// renamed away inside it, and the rest are UPDATE and ALTER TABLE. The step
+// runs in one transaction, so a mix of present and absent states is an
+// out-of-band edit and fails closed.
+func installDefaultsApplied(ctx context.Context, transaction Transaction, upstream *Migration) (bool, error) {
+	probes := []string{
+		`SELECT COUNT(*) FROM pragma_table_info('request_records') WHERE name = 'parent_session_id'`,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'request_records_parent_session_idx'`,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'raw_key_envelopes' AND sql LIKE '%''biometric''%'`,
+	}
+	present := 0
+	for _, query := range probes {
+		var count int
+		if err := transaction.QueryRowContext(ctx, query).Scan(&count); err != nil {
+			return false, fmt.Errorf("check reclaimed schema for version %d: %w", upstream.Version, err)
+		}
+		if count > 0 {
+			present++
+		}
+	}
+	switch present {
+	case 0:
+		return false, nil
+	case len(probes):
+		return true, nil
+	default:
+		return false, fmt.Errorf("%w: migration %d (%s) is partially applied: %d of %d end states present", ErrMigrationHistory, upstream.Version, upstream.Name, present, len(probes))
+	}
 }
 
 // createdObjectPattern matches a plain CREATE of a named schema object. A

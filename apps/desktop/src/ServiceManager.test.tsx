@@ -15,6 +15,7 @@ const bridgeMocks = vi.hoisted(() => ({
   }),
   beginServiceAuthorization: vi.fn(),
   cancelServiceAuthorization: vi.fn(),
+  cancelServiceTest: vi.fn(),
   clearServiceRisk: vi.fn(),
   completeServiceAuthorization: vi.fn(),
   createService: vi.fn(),
@@ -37,6 +38,9 @@ const bridgeMocks = vi.hoisted(() => ({
   probeServiceModels: vi.fn(),
   probeServiceProxy: vi.fn(),
   testService: vi.fn(),
+  SERVICE_TEST_CANCELLED_ERROR: "service_test_cancelled",
+  SERVICE_TEST_ALREADY_RUNNING_ERROR: "service_test_already_running",
+  SERVICE_TEST_INVALID_ID_ERROR: "service_test_invalid_id",
   updateService: vi.fn(),
   listTerminalApps: vi.fn(),
   getClientConfigStatus: vi.fn(),
@@ -498,12 +502,17 @@ describe("ServiceManager", () => {
       start.click();
     });
     expect(bridgeMocks.testService).toHaveBeenCalledTimes(1);
-    expect(bridgeMocks.testService).toHaveBeenCalledWith("service_gateway", {
-      protocol: "openai.responses",
-      model: "gpt-5",
-      stream: true,
-    });
-    expect(start.disabled).toBe(true);
+    expect(bridgeMocks.testService).toHaveBeenCalledWith(
+      "service_gateway",
+      {
+        protocol: "openai.responses",
+        model: "gpt-5",
+        stream: true,
+      },
+      expect.any(String),
+    );
+    expect(start.textContent).toBe("取消测试");
+    expect(start.disabled).toBe(false);
     expect(
       dialog.querySelector<HTMLInputElement>('input[aria-label="测试模型"]')!
         .disabled,
@@ -4199,12 +4208,14 @@ describe("ServiceManager", () => {
   });
 
   async function typeInto(
-    input: HTMLInputElement,
+    input: HTMLInputElement | HTMLTextAreaElement,
     value: string,
   ): Promise<void> {
     await act(async () => {
       Object.getOwnPropertyDescriptor(
-        HTMLInputElement.prototype,
+        input instanceof HTMLTextAreaElement
+          ? HTMLTextAreaElement.prototype
+          : HTMLInputElement.prototype,
         "value",
       )!.set!.call(input, value);
       input.dispatchEvent(new Event("input", { bubbles: true }));
@@ -4276,6 +4287,689 @@ describe("ServiceManager", () => {
       ?.querySelector('[data-testid="service-model-format"]')
       ?.textContent?.trim();
   }
+
+  const vertexService: Service = {
+    ...gatewayService,
+    kind: "vertex",
+    name: "Vertex AI",
+    models: ["gemini-test"],
+    http: {
+      base_url: "https://aiplatform.googleapis.com",
+      auth: { scheme: "google_service_account" },
+      vertex: { project_id: "vertex-test", location: "global" },
+      credential_ref: "local://service/service_gateway",
+    },
+    capabilities: httpServicePreset("vertex").capabilities,
+  };
+  const vertexJSON = JSON.stringify(
+    {
+      type: "service_account",
+      project_id: "vertex-test",
+      client_email: "test@vertex-test.iam.gserviceaccount.com",
+      private_key: "synthetic-key-for-ui-only",
+    },
+    null,
+    2,
+  );
+
+  it("saves and reopens Vertex entry choices and cleared model formats without catalog repinning", async () => {
+    let saved: Service = {
+      ...vertexService,
+      model_protocols: [
+        { model: "gemini-test", protocol: "google.generate_content" },
+      ],
+    };
+    bridgeMocks.getService.mockImplementation(async () => ({
+      service: saved,
+      etag,
+    }));
+    bridgeMocks.updateService.mockImplementation(async (_id, _etag, patch) => {
+      saved = { ...saved, ...patch, http: { ...saved.http, ...patch.http } };
+      return { service: saved, etag };
+    });
+    bridgeMocks.probeDraftServiceModels.mockResolvedValue({
+      protocol: "openai.models",
+      model_ids: ["gemini-test", "claude-test"],
+      model_protocols: [
+        { model: "gemini-test", protocol: "google.generate_content" },
+        { model: "claude-test", protocol: "anthropic.messages" },
+      ],
+    });
+    const formats = [
+      "openai.responses",
+      "anthropic.messages",
+      "openai.chat",
+      "google.generate_content",
+    ];
+    const render = async (key: string) => {
+      await act(async () =>
+        root.render(
+          <ServiceManager
+            key={key}
+            catalogError={null}
+            catalogStatus="ready"
+            isReady
+            conversionEngine={{
+              name: "relaykit",
+              version: null,
+              available: true,
+              edges: formats.flatMap((from) =>
+                formats
+                  .filter((to) => to !== from)
+                  .map((to) => ({
+                    from,
+                    to,
+                    quality: "good" as const,
+                    streaming: true,
+                  })),
+              ),
+            }}
+            protocols={[]}
+            services={[saved]}
+            view={{ kind: "edit", serviceId: saved.id }}
+            onDirtyChange={() => {}}
+            onRefresh={() => {}}
+            onServiceRemoved={() => {}}
+            onServiceSaved={() => {}}
+            onViewChange={() => {}}
+          />,
+        ),
+      );
+    };
+    await render("initial");
+    await openEditorTab("models");
+    expect(document.body.textContent).not.toContain("从官方目录拉取");
+    await act(async () =>
+      container
+        .querySelector<HTMLButtonElement>('[aria-label="Vertex 模型配置说明"]')!
+        .click(),
+    );
+    expect(document.body.textContent).toContain("从官方目录拉取");
+    await act(async () =>
+      document.activeElement!.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+      ),
+    );
+    await settleClosedLayer();
+    await chooseFormat("gemini-test", "按入口协议设置");
+    await addModelsByHand(["meta/llama-test-maas"]);
+    expect(formatShown("meta/llama-test-maas")).toBeUndefined();
+    await clickButton("获取模型列表");
+    await clickButton("全选");
+    await act(async () => applySelectedButton().click());
+    await settleClosedLayer();
+    expect(formatShown("gemini-test")).toBeUndefined();
+    expect(formatShown("claude-test")).toBeUndefined();
+    await chooseFormat("claude-test", "Messages");
+    await openEditorTab("protocols");
+    const responses = [
+      ...container.querySelectorAll<HTMLElement>(
+        '[data-testid="service-capability-row"]',
+      ),
+    ].find((row) => row.textContent?.includes("/v1/responses"))!;
+    await act(async () =>
+      responses.querySelector<HTMLButtonElement>('[role="switch"]')!.click(),
+    );
+    expect(responses.textContent).toContain("转换为 Gemini Generate Content");
+    for (const [target, label] of [
+      ["google.generate_content", "Gemini Generate Content"],
+      ["anthropic.messages", "Anthropic Messages"],
+      ["openai.chat", "OpenAI Chat Completions"],
+    ]) {
+      await chooseOption("OpenAI Responses 本地转换", `转换为 ${label}`);
+      await settleClosedLayer();
+      await submitServiceForm();
+      expect(
+        saved.capabilities.find((row) => row.protocol === "openai.responses")
+          ?.convert_to,
+      ).toBe(target);
+      await render(`saved-${target}`);
+      await openEditorTab("protocols");
+      expect(
+        container.querySelector('[aria-label="OpenAI Responses 本地转换"]')
+          ?.textContent,
+      ).toContain(`转换为 ${label}`);
+    }
+    await chooseOption(
+      "OpenAI Chat Completions 本地转换",
+      "转换为 Gemini Generate Content",
+    );
+    await settleClosedLayer();
+    await chooseOption("OpenAI Chat Completions 本地转换", "原样转发");
+    await settleClosedLayer();
+    await submitServiceForm();
+    expect(saved.model_protocols).toEqual([
+      { model: "claude-test", protocol: "anthropic.messages" },
+    ]);
+    expect(
+      saved.capabilities.find((row) => row.protocol === "openai.chat")
+        ?.convert_to,
+    ).toBeUndefined();
+    await render("reopened");
+    await openEditorTab("protocols");
+    expect(
+      container.querySelector('[aria-label="OpenAI Responses 本地转换"]')
+        ?.textContent,
+    ).toContain("转换为 OpenAI Chat Completions");
+    expect(
+      container.querySelector('[aria-label="OpenAI Chat Completions 本地转换"]')
+        ?.textContent,
+    ).toContain("原样转发");
+    await openEditorTab("models");
+    expect(formatShown("gemini-test")).toBeUndefined();
+    expect(formatShown("claude-test")).toBe("Messages 格式");
+    await clickButton("获取模型列表");
+    await act(async () => applySelectedButton().click());
+    await settleClosedLayer();
+    await submitServiceForm();
+    expect(saved.model_protocols).toEqual([
+      { model: "claude-test", protocol: "anthropic.messages" },
+    ]);
+  });
+
+  it("restricts Vertex conversion choices to available native targets", async () => {
+    bridgeMocks.getService.mockResolvedValue({ service: vertexService, etag });
+    await act(async () =>
+      root.render(
+        <ServiceManager
+          catalogError={null}
+          catalogStatus="ready"
+          isReady
+          conversionEngine={{
+            name: "relaykit",
+            version: null,
+            available: true,
+            edges: [
+              {
+                from: "openai.responses",
+                to: "google.generate_content",
+                quality: "good",
+                streaming: true,
+              },
+              {
+                from: "openai.chat",
+                to: "openai.responses",
+                quality: "good",
+                streaming: true,
+              },
+            ],
+          }}
+          protocols={[]}
+          services={[vertexService]}
+          view={{ kind: "edit", serviceId: vertexService.id }}
+          onDirtyChange={() => {}}
+          onRefresh={() => {}}
+          onServiceRemoved={() => {}}
+          onServiceSaved={() => {}}
+          onViewChange={() => {}}
+        />,
+      ),
+    );
+    await openEditorTab("protocols");
+    const responses = [
+      ...container.querySelectorAll<HTMLElement>(
+        '[data-testid="service-capability-row"]',
+      ),
+    ].find((row) => row.textContent?.includes("/v1/responses"))!;
+    await act(async () =>
+      responses.querySelector<HTMLButtonElement>('[role="switch"]')!.click(),
+    );
+    await act(async () =>
+      responses
+        .querySelector<HTMLButtonElement>('[role="combobox"]')!
+        .dispatchEvent(
+          new PointerEvent("pointerdown", {
+            bubbles: true,
+            button: 0,
+            pointerType: "mouse",
+          }),
+        ),
+    );
+    const options = [
+      ...document.querySelectorAll<HTMLElement>('[role="option"]'),
+    ];
+    expect(options).toHaveLength(3);
+    expect(
+      options.some((option) => option.textContent?.includes("原样转发")),
+    ).toBe(false);
+    expect(
+      options
+        .filter((option) => option.getAttribute("aria-disabled") !== "true")
+        .map((option) => option.textContent),
+    ).toEqual(["转换为 Gemini Generate Content"]);
+    await act(async () =>
+      options
+        .find((option) => option.getAttribute("aria-disabled") !== "true")!
+        .click(),
+    );
+    await settleClosedLayer();
+    await act(async () =>
+      container
+        .querySelector<HTMLButtonElement>(
+          '[aria-label="OpenAI Chat Completions 本地转换"]',
+        )!
+        .dispatchEvent(
+          new PointerEvent("pointerdown", {
+            bubbles: true,
+            button: 0,
+            pointerType: "mouse",
+          }),
+        ),
+    );
+    expect(
+      [...document.querySelectorAll('[role="option"]')].some((option) =>
+        option.textContent?.includes("Responses"),
+      ),
+    ).toBe(false);
+  });
+
+  it.each(["paste", "file"])(
+    "creates Vertex with a service account from %s and a generated regional URL",
+    async (source) => {
+      bridgeMocks.createService.mockResolvedValue({
+        service: vertexService,
+        etag,
+      });
+      await act(async () =>
+        root.render(
+          <ServiceManager
+            catalogError={null}
+            catalogStatus="ready"
+            isReady
+            protocols={[]}
+            services={[]}
+            view={{ kind: "create", serviceKind: "vertex" }}
+            onDirtyChange={() => {}}
+            onRefresh={() => {}}
+            onServiceRemoved={() => {}}
+            onServiceSaved={() => {}}
+            onViewChange={() => {}}
+          />,
+        ),
+      );
+      await openEditorTab("connection");
+      expect(container.querySelector('input[type="url"]')).toBeNull();
+      const secret = container.querySelector<HTMLTextAreaElement>(
+        'textarea[aria-label="服务账号 JSON"]',
+      )!;
+      await typeInto(secret, "{broken");
+      await submitServiceForm();
+      expect(bridgeMocks.createService).not.toHaveBeenCalled();
+      if (source === "paste") {
+        await typeInto(secret, vertexJSON);
+      } else {
+        const fileInput =
+          container.querySelector<HTMLInputElement>('input[type="file"]')!;
+        Object.defineProperty(fileInput, "files", {
+          value: [
+            new File([vertexJSON], "service-account.json", {
+              type: "application/json",
+            }),
+          ],
+        });
+        await act(async () => {
+          fileInput.dispatchEvent(new Event("change", { bubbles: true }));
+        });
+      }
+      expect(
+        container.querySelector('textarea[aria-label="服务账号 JSON"]'),
+      ).toBeNull();
+      expect(container.textContent).toContain(
+        "test@vertex-test.iam.gserviceaccount.com",
+      );
+      expect(container.textContent).not.toContain("synthetic-key-for-ui-only");
+      expect(
+        container.querySelector<HTMLInputElement>(
+          'input[aria-label="Google Cloud 项目 ID"]',
+        )!.value,
+      ).toBe("vertex-test");
+      await typeInto(
+        container.querySelector<HTMLInputElement>('input[aria-label="地区"]')!,
+        "eu",
+      );
+      await openEditorTab("models");
+      expect(
+        container.querySelector('[aria-label="Vertex 模型配置说明"]'),
+      ).not.toBeNull();
+      await addModelsByHand([
+        "gemini-test",
+        "claude-test@20250101",
+        "meta/llama-test-maas",
+      ]);
+      await submitServiceForm();
+      expect(bridgeMocks.createService).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: "vertex",
+          http: {
+            base_url: "https://aiplatform.eu.rep.googleapis.com",
+            auth: { scheme: "google_service_account" },
+            vertex: { project_id: "vertex-test", location: "eu" },
+            credential: { secret: vertexJSON },
+          },
+        }),
+      );
+    },
+  );
+
+  it("keeps the URL and implicit project when editing a saved Vertex proxy", async () => {
+    const legacy: Service = {
+      ...vertexService,
+      http: {
+        base_url: "https://proxy.example/vertex",
+        auth: { scheme: "google_service_account" },
+        credential_ref: "local://service/service_gateway",
+      },
+    };
+    bridgeMocks.getService.mockResolvedValue({ service: legacy, etag });
+    bridgeMocks.updateService.mockResolvedValue({ service: legacy, etag });
+    await act(async () =>
+      root.render(
+        <ServiceManager
+          catalogError={null}
+          catalogStatus="ready"
+          isReady
+          protocols={[]}
+          services={[legacy]}
+          view={{ kind: "edit", serviceId: legacy.id }}
+          onDirtyChange={() => {}}
+          onRefresh={() => {}}
+          onServiceRemoved={() => {}}
+          onServiceSaved={() => {}}
+          onViewChange={() => {}}
+        />,
+      ),
+    );
+    await openEditorTab("connection");
+    expect(
+      container.querySelector<HTMLInputElement>('input[type="url"]')!.value,
+    ).toBe("https://proxy.example/vertex");
+    expect(
+      container.querySelector('[aria-label="Google Cloud 项目 ID"]'),
+    ).toBeNull();
+    await submitServiceForm();
+    expect(bridgeMocks.updateService).toHaveBeenCalledWith(
+      legacy.id,
+      etag,
+      expect.objectContaining({
+        http: {
+          base_url: "https://proxy.example/vertex",
+          auth: { scheme: "google_service_account" },
+        },
+      }),
+    );
+  });
+
+  it.each(["create", "edit"] as const)(
+    "%s Express providers require a new key and use Gemini conversions",
+    async (mode) => {
+      bridgeMocks.getService.mockResolvedValue({
+        service: vertexService,
+        etag,
+      });
+      bridgeMocks.updateService.mockResolvedValue({
+        service: vertexService,
+        etag,
+      });
+      bridgeMocks.createService.mockResolvedValue({
+        service: vertexService,
+        etag,
+      });
+      await act(async () =>
+        root.render(
+          <ServiceManager
+            catalogError={null}
+            catalogStatus="ready"
+            isReady
+            protocols={[]}
+            conversionEngine={{
+              name: "relaykit",
+              version: null,
+              available: true,
+              edges: [
+                {
+                  from: "openai.responses",
+                  to: "google.generate_content",
+                  quality: "good",
+                  streaming: true,
+                },
+                {
+                  from: "openai.chat",
+                  to: "google.generate_content",
+                  quality: "good",
+                  streaming: true,
+                },
+              ],
+            }}
+            services={mode === "edit" ? [vertexService] : []}
+            view={
+              mode === "edit"
+                ? { kind: "edit", serviceId: vertexService.id }
+                : { kind: "create", serviceKind: "vertex" }
+            }
+            onDirtyChange={() => {}}
+            onRefresh={() => {}}
+            onServiceRemoved={() => {}}
+            onServiceSaved={() => {}}
+            onViewChange={() => {}}
+          />,
+        ),
+      );
+      await openEditorTab("connection");
+      await clickButton("Express API Key");
+      expect(
+        container.querySelector('[aria-label="Google Cloud 项目 ID"]'),
+      ).toBeNull();
+      expect(container.querySelector('[aria-label="地区"]')).toBeNull();
+      await submitServiceForm();
+      expect(bridgeMocks.updateService).not.toHaveBeenCalled();
+      expect(bridgeMocks.createService).not.toHaveBeenCalled();
+      await typeInto(
+        container.querySelector<HTMLInputElement>('input[type="password"]')!,
+        "express-test-key",
+      );
+      await openEditorTab("models");
+      expect(container.textContent).not.toContain("获取模型列表");
+      if (mode === "create") await addModelsByHand(["gemini-test"]);
+      await submitServiceForm();
+      const payload =
+        mode === "edit"
+          ? bridgeMocks.updateService.mock.calls[0]?.[2]
+          : bridgeMocks.createService.mock.calls[0]?.[0];
+      expect(payload.http).toEqual({
+        base_url: "https://aiplatform.googleapis.com",
+        auth: { scheme: "google_api_key" },
+        credential: { secret: "express-test-key" },
+        ...(mode === "edit" ? { vertex: null } : {}),
+      });
+      expect(payload.capabilities).toEqual([
+        {
+          protocol: "google.generate_content",
+          mode: "native",
+          streaming: true,
+        },
+        {
+          protocol: "openai.responses",
+          mode: "native",
+          streaming: true,
+          convert_to: "google.generate_content",
+        },
+        {
+          protocol: "openai.chat",
+          mode: "native",
+          streaming: true,
+          convert_to: "google.generate_content",
+        },
+      ]);
+    },
+  );
+
+  it("discovers Vertex models with saved credentials and edits or removes them without exposing JSON", async () => {
+    bridgeMocks.getService.mockResolvedValue({ service: vertexService, etag });
+    bridgeMocks.updateService.mockResolvedValue({
+      service: vertexService,
+      etag,
+    });
+    bridgeMocks.probeDraftServiceModels.mockResolvedValue({
+      protocol: "openai.models",
+      model_ids: ["gemini-test"],
+    });
+    await act(async () => {
+      root.render(
+        <ServiceManager
+          catalogError={null}
+          catalogStatus="ready"
+          isReady
+          protocols={[]}
+          services={[vertexService]}
+          view={{ kind: "edit", serviceId: vertexService.id }}
+          onDirtyChange={() => {}}
+          onRefresh={() => {}}
+          onServiceRemoved={() => {}}
+          onServiceSaved={() => {}}
+          onViewChange={() => {}}
+        />,
+      );
+      await Promise.resolve();
+    });
+    await openEditorTab("connection");
+    expect(
+      container.querySelector('textarea[aria-label="服务账号 JSON"]'),
+    ).toBeNull();
+    expect(container.textContent).toContain("已保存服务账号密钥");
+    await typeInto(
+      container.querySelector<HTMLInputElement>('input[aria-label="地区"]')!,
+      "us-east5",
+    );
+    await openEditorTab("models");
+    await clickButton("获取模型列表");
+    expect(bridgeMocks.probeDraftServiceModels).toHaveBeenCalledWith({
+      service_id: vertexService.id,
+      kind: "vertex",
+      protocol: "openai.models",
+      http: {
+        base_url: "https://us-east5-aiplatform.googleapis.com",
+        auth: { scheme: "google_service_account" },
+        vertex: { project_id: "vertex-test", location: "us-east5" },
+      },
+    });
+    await act(async () => applySelectedButton().click());
+    await settleClosedLayer();
+    await submitServiceForm();
+    expect(bridgeMocks.updateService).toHaveBeenLastCalledWith(
+      vertexService.id,
+      etag,
+      expect.objectContaining({
+        http: {
+          base_url: "https://us-east5-aiplatform.googleapis.com",
+          auth: { scheme: "google_service_account" },
+          vertex: { project_id: "vertex-test", location: "us-east5" },
+        },
+      }),
+    );
+    await act(async () => {
+      root.render(
+        <ServiceManager
+          key="reopened"
+          catalogError={null}
+          catalogStatus="ready"
+          isReady
+          protocols={[]}
+          services={[vertexService]}
+          view={{ kind: "edit", serviceId: vertexService.id }}
+          onDirtyChange={() => {}}
+          onRefresh={() => {}}
+          onServiceRemoved={() => {}}
+          onServiceSaved={() => {}}
+          onViewChange={() => {}}
+        />,
+      );
+      await Promise.resolve();
+    });
+    await openEditorTab("connection");
+    const removal = [...container.querySelectorAll("label")]
+      .find((label) => label.textContent?.includes("删除已保存的服务账号凭据"))!
+      .querySelector<HTMLButtonElement>('[role="checkbox"]')!;
+    await act(async () => removal.click());
+    await submitServiceForm();
+    expect(bridgeMocks.updateService).toHaveBeenLastCalledWith(
+      vertexService.id,
+      etag,
+      expect.objectContaining({
+        http: expect.objectContaining({ credential: null }),
+      }),
+    );
+  });
+
+  it.each(["project", "location", "proxy", "replace", "remove"])(
+    "discards an in-flight Vertex catalog after changing %s",
+    async (changed) => {
+      let finish!: (value: { protocol: string; model_ids: string[] }) => void;
+      bridgeMocks.getService.mockResolvedValue({
+        service: vertexService,
+        etag,
+      });
+      bridgeMocks.probeDraftServiceModels.mockReturnValue(
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+      );
+      await act(async () =>
+        root.render(
+          <ServiceManager
+            catalogError={null}
+            catalogStatus="ready"
+            isReady
+            protocols={[]}
+            services={[vertexService]}
+            view={{ kind: "edit", serviceId: vertexService.id }}
+            onDirtyChange={() => {}}
+            onRefresh={() => {}}
+            onServiceRemoved={() => {}}
+            onServiceSaved={() => {}}
+            onViewChange={() => {}}
+          />,
+        ),
+      );
+      await openEditorTab("models");
+      await clickButton("获取模型列表");
+      await openEditorTab("connection");
+      if (changed === "proxy") {
+        await chooseOption("代理模式", "强制直连");
+      } else if (changed === "remove") {
+        const removal = [...container.querySelectorAll("label")]
+          .find((label) =>
+            label.textContent?.includes("删除已保存的服务账号凭据"),
+          )!
+          .querySelector<HTMLButtonElement>('[role="checkbox"]')!;
+        await act(async () => removal.click());
+      } else {
+        if (changed === "replace") await clickButton("更换");
+        const label =
+          changed === "project"
+            ? "Google Cloud 项目 ID"
+            : changed === "location"
+              ? "地区"
+              : "服务账号 JSON";
+        await typeInto(
+          container.querySelector<HTMLInputElement | HTMLTextAreaElement>(
+            `[aria-label="${label}"]`,
+          )!,
+          changed === "project"
+            ? "other-project"
+            : changed === "location"
+              ? "us-east5"
+              : vertexJSON,
+        );
+      }
+      await act(async () =>
+        finish({ protocol: "openai.models", model_ids: ["gemini-stale"] }),
+      );
+      expect(document.body.textContent).not.toContain(
+        "选择 API 提供商支持的模型",
+      );
+      expect(document.body.textContent).not.toContain("gemini-stale");
+    },
+  );
 
   it("saves a new provider's upstream formats for the models it keeps", async () => {
     const preset = httpServicePreset("opencode_go");
@@ -4510,9 +5204,7 @@ describe("ServiceManager", () => {
       await Promise.resolve();
     });
     await openEditorTab("protocols");
-    expect(container.textContent).toContain(
-      "请求会按各模型的上游格式发给 OpenCode。",
-    );
+    expect(container.textContent).toContain("请求会按各模型的上游格式转发。");
     const row = (label: string) =>
       [
         ...container.querySelectorAll<HTMLElement>(

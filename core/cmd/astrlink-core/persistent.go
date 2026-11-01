@@ -25,6 +25,7 @@ import (
 	"github.com/QuantumNous/astrlink/core/internal/servicetest"
 	"github.com/QuantumNous/astrlink/core/internal/storage/sqlite"
 	syncengine "github.com/QuantumNous/astrlink/core/internal/sync"
+	"github.com/QuantumNous/astrlink/core/internal/vertexauth"
 )
 
 // installOutboundProxy configures the outbound proxy once per process,
@@ -64,6 +65,10 @@ type persistentOptions struct {
 	// rawBackoffCap raises the raw vault's wrong-password backoff cap;
 	// zero keeps the desktop's.
 	rawBackoffCap time.Duration
+	// rawUnlockUntilLock keeps the operator's raw unlock open until the
+	// desktop locks it, with no idle deadline; see
+	// controlapi.RawVaultOptions.UnlockUntilLock.
+	rawUnlockUntilLock bool
 	// testNetwork is set only by tests; production leaves it nil.
 	testNetwork *testNetwork
 	shutdown    context.CancelFunc
@@ -123,7 +128,9 @@ func openPersistentCore(ctx context.Context, options persistentOptions) (*persis
 	} else if recovered > 0 {
 		logf("recovered %d interrupted request record(s)", recovered)
 	}
-	rawVault := controlapi.NewRawVault(store, controlapi.RawVaultOptions{Logf: logf, BackoffCap: options.rawBackoffCap})
+	rawVault := controlapi.NewRawVault(store, controlapi.RawVaultOptions{
+		Logf: logf, BackoffCap: options.rawBackoffCap, UnlockUntilLock: options.rawUnlockUntilLock,
+	})
 	// The server edition sets the password on its web page and says so once
 	// it listens; the offline command this warning names is the desktop's.
 	if options.consoleSessions == nil {
@@ -232,11 +239,12 @@ func openPersistentCore(ctx context.Context, options persistentOptions) (*persis
 	}
 	resolver.WithRuntimeProfile(contract.RuntimeProfile{RelayKitAvailable: true, Edges: conversionEngine.Edges()})
 	resolver.WithSubscriptionBaseURL(subscriptionManager.APIBaseURL())
+	vertexTokens := vertexauth.New(nil)
 	gatewayDependencies := ingress.Dependencies{
 		ProxyCredentials: store,
 		Resolver:         resolver,
 		Authorizer: endpoint.NewServiceAuthorizer(store, subscriptionManager, subscriptionManager.Provider().IdentityPolicy()).
-			WithRoutingSettings(store).WithIdentities(identities),
+			WithRoutingSettings(store).WithIdentities(identities).WithVertexTokens(vertexTokens),
 		AccessTokenAuthenticator: ingress.AccessTokenAuthenticatorFunc(
 			func(ctx context.Context, raw string) (contract.AccessTokenID, error) {
 				return accessTokenManager.Authenticate(ctx, raw)
@@ -290,7 +298,7 @@ func openPersistentCore(ctx context.Context, options persistentOptions) (*persis
 		Subscriptions:      subscriptionManager,
 		RateLimits:         resolver,
 		CodingPlans:        codingplan.New(store, nil),
-		ServiceModels:      persistentServiceModels(store, subscriptionManager),
+		ServiceModels:      persistentServiceModels(store, subscriptionManager).WithVertexTokens(vertexTokens),
 		ServiceTester:      servicetest.NewWithDependencies(gatewayDependencies, subscriptionManager.APIBaseURLFor),
 		BuiltinToolTester:  ingress.NewWithDependencies(gatewayDependencies),
 		ControlToken:       options.controlToken,
