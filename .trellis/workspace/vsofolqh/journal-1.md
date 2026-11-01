@@ -55,3 +55,26 @@ STL 工具集耦合、磁盘耗尽伪装成编译错误；另记 Windows `core.a
 ### Status
 
 [OK] **Completed**
+
+
+## Session 2: 同步上游 v0.2.19
+<!-- trellis-session: v=2 fp=d092258e8f31fb6a -->
+
+**Date**: 2026-11-01
+**Task**: 同步上游 v0.2.19
+**Branch**: `main`
+
+### Summary
+
+合并上游正式版 v0.2.19（752791a），解决 12 个冲突；fork 档案迁移移到 v57 并协调 fork-56 数据库；Vertex 目录探测应用 fork 请求规则；同步指南补充本轮经验。src-tauri Rust 检查因缺 sidecar 未运行。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `b0b8e01` | merge(upstream): 同步上游 v0.2.19 |
+| `577570d` | docs(trellis): 同步指南补充 v0.2.19 经验 |
+
+### Status
+
+[OK] **Completed**
