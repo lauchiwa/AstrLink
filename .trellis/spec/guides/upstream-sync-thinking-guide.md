@@ -72,6 +72,13 @@ expired, not an upstream regression.
       stale ref. Check the fetch's own exit code, then verify the ref matches
       upstream's newest release:
       `gh api repos/Calcium-Ion/AstrLink/commits/<tag> --jq .sha`.
+- [ ] If HTTPS to github.com times out while `gh api` works, fetch the same
+      repository over SSH (`git@github.com:Calcium-Ion/AstrLink.git`) into
+      `refs/remotes/upstream/main` and `refs/tags/*` instead of retrying.
+- [ ] Fetch `origin` and compare it with local `main`. A sync may already have
+      been pushed from another machine. In the v0.2.19 sync, local `main` was 95
+      commits behind `origin/main`, which already held v0.2.18. Fast-forward
+      (`git merge --ff-only origin/main`) before measuring anything.
 - [ ] Quantify the conflict surface first:
       `git diff --name-only HEAD...upstream/main`
 - [ ] Trial-merge in a disposable worktree, never by stashing the working tree
@@ -141,6 +148,22 @@ Found in the v0.2.10 sync:
 `switching_only_the_mirror_leaves_the_retry_to_its_caller` switched to `Preview`
 from what upstream assumed was `Stable`, and failed on all four desktop CI jobs.
 
+### After merging: new upstream branches that skip a fork feature
+
+A new upstream provider often gets its own branch that returns early. The fork's
+hook further down that function is never reached, and the merge is clean.
+
+- [ ] For each fork hook in a shared function (request rules in
+      `servicemodel/prober.go`, for example), check whether upstream added a
+      `return` above it for a new kind.
+- [ ] Ask the user whether the fork feature should cover the new provider. If it
+      should, move the hook into a fork-owned helper and call it from both
+      branches. Keep the upstream edit to one call plus a signature change.
+
+Found in the v0.2.19 sync: the Vertex catalog probe returned before the fork
+applied `extra_headers` and identity profiles, while Vertex inference applied
+them. Fixed with `servicemodel/fork_request_rules.go` `applyDiscoveryRules`.
+
 ### After merging: new upstream outbound paths
 
 The `X-AstrLink-*` strip lives in `transport/forwarder.go`. A new upstream
@@ -162,8 +185,8 @@ Found in the v0.2.10 sync: `subscription/droid.go` `droidUsage` sent
 ### Schema migrations
 
 The fork and upstream both append migrations, so they collide on version
-numbers. This has already happened three times for `service_identity_profiles`
-(48 → 49 → 50 → 53).
+numbers. This has already happened five times for `service_identity_profiles`
+(48 → 49 → 50 → 53 → 56 → 57).
 
 - [ ] Upstream keeps its number. The fork's migration moves up.
 - [ ] A database that already applied the fork's old number needs
@@ -177,6 +200,12 @@ numbers. This has already happened three times for `service_identity_profiles`
       27), derive the expected names from that step's own statements. None
       present means replay, all present means rename only, and anything in
       between fails closed.
+- [ ] Probe by end state when object names cannot tell. Upstream v56 drops and
+      recreates a trigger that exists before and after, and rebuilds a table
+      under a temporary name that is gone when the step ends. A name probe would
+      read it as applied. `installDefaultsApplied` checks three end states (new
+      column, new index, `'biometric'` in the rebuilt table's SQL) with the same
+      none/all/partial rule. Compare the replayed schema with a fresh database.
 - [ ] Reject a fork-named row that is followed by later versions. Every fork
       build recorded the profile step as its newest, so that shape is not a
       known collision.
@@ -279,6 +308,14 @@ On a rustup-managed install, `cargo-fmt` and `cargo-clippy` shims can resolve on
 `cargo clippy --version` rather than `command -v`, and install with
 `rustup component add rustfmt clippy` before concluding a format gate is
 unrunnable.
+
+### CRLF checkouts break line-sensitive tests
+
+With `core.autocrlf=true`, `scripts/release-updates.test.ts` fails because its
+regular expressions expect LF shell continuations in
+`.github/workflows/macos-package.yml`. `git ls-files --eol` shows `i/lf w/crlf`.
+If the merge did not touch either file, record the failure as an environment
+blocker. CI checks out LF.
 
 ### `git status` noise on Windows
 
